@@ -257,6 +257,30 @@ class TestNormalizer:
         assert "TORCH_LIBRARY" in out and "int x = 1;" in out
 
 
+class TestConfigurationErrors:
+    def test_an_error_in_an_undecided_conditional_is_not_reported(self):
+        """A feature flag being unset is not a fault in the kernel."""
+        source = (
+            "#if !defined(VLLM_ENABLE_TURBOQUANT)" + nl
+            + '#error "needs the 950 build"' + nl
+            + "#endif" + nl
+            + "int x = 1;" + nl
+        )
+        result = preprocess_source("t.cpp", source)
+        assert not result.errors
+        assert "int x = 1;" in result.text
+
+    def test_the_guarded_code_is_still_analyzable(self):
+        source = (
+            "#if !defined(SOME_FLAG)" + nl
+            + '#error "unset"' + nl
+            + "#else" + nl
+            + "int enabled = 1;" + nl
+            + "#endif" + nl
+        )
+        assert "int enabled = 1;" in preprocess_source("t.cpp", source).text
+
+
 class TestGracefulDegradation:
     def test_a_frontend_fault_returns_the_unexpanded_source(self, monkeypatch):
         """A partial result beats none - but it has to be reported."""

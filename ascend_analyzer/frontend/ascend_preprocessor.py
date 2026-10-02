@@ -506,6 +506,13 @@ class AscendCPreprocessor(Preprocessor):
         elif name == "endif":
             if self._conditional_passthru and self._conditional_passthru.pop():
                 raise OutputDirective(Action.IgnoreAndPassThrough)
+        elif name in ("error", "warning"):
+            # A build-configuration ``#error`` inside a conditional we chose
+            # not to decide is not a fault in the file.  Reporting it would
+            # tell the reader their kernel failed to preprocess when all that
+            # happened is that a feature flag is unset.
+            if any(self._conditional_passthru):
+                raise OutputDirective(Action.IgnoreAndRemove)
         return super().on_directive_handle(directive, toks, ifpassthru, precedingtoks)
 
     def _has_undecidable_macro(self, toks) -> bool:
