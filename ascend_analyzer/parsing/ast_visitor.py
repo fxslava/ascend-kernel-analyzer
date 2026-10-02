@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from math import gcd as _gcd
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
@@ -40,6 +41,7 @@ from ..hardware import (
     TPOSITION_TO_DOMAIN,
 )
 from ..ir import (
+    CoreView,
     AnalysisUnit,
     ApiCallOp,
     ArgRef,
@@ -162,6 +164,49 @@ def _member_target_name(text: str) -> Optional[str]:
     """The bare member name an assignment writes, or ``None`` if not a member."""
     match = _MEMBER_TARGET_RE.match(text.strip())
     return match.group(1) if match else None
+
+
+#: Compile-time core selectors and the core each one guards.
+_CORE_GUARD_MACROS = {
+    "__DAV_C220_CUBE__": CoreView.AIC,
+    "__DAV_C220_VEC__": CoreView.AIV,
+}
+#: Run-time core predicates, as the macro expander rewrites them.
+_CORE_PREDICATES = {
+    "__ascend_core_is_aic": CoreView.AIC,
+    "__ascend_core_is_aiv": CoreView.AIV,
+}
+_CORE_PREDICATE_RE = re.compile(
+    r"^\s*\(*\s*(?P<not>!\s*)?\(*\s*(?P<name>__ascend_core_is_ai[cv])\s*\)*\s*$"
+)
+
+
+def _core_view_of_ifdef(visitor: "ASTVisitor", node: Node) -> CoreView:
+    """The core a ``#ifdef``/``#if`` selects, or ``BOTH`` if it is unrelated."""
+    name_node = node.child_by_field_name("name") or node.child_by_field_name(
+        "condition"
+    )
+    if name_node is None:
+        return CoreView.BOTH
+    text = visitor.text(name_node)
+    negated = "!" in text or "ndef" in visitor.text(node)[:12]
+    for macro, view in _CORE_GUARD_MACROS.items():
+        if macro in text:
+            return view.complement if negated else view
+    return CoreView.BOTH
+
+
+def _core_view_of_condition(
+    visitor: "ASTVisitor", condition: Optional[Node]
+) -> CoreView:
+    """The core an ``if`` condition selects, or ``BOTH`` if it is unrelated."""
+    if condition is None:
+        return CoreView.BOTH
+    match = _CORE_PREDICATE_RE.match(visitor.text(condition))
+    if match is None:
+        return CoreView.BOTH
+    view = _CORE_PREDICATES[match.group("name")]
+    return view.complement if match.group("not") else view
 
 
 #: Receiver spellings a kernel uses to reach its tiling struct.
@@ -969,6 +1014,8 @@ class _KernelWalker:
         self._buffer_blocks: Dict[str, Expr] = {}
         #: Callees currently being inlined, innermost last; the recursion guard.
         self._inline_stack: List[str] = []
+        #: Core whose binary the region being walked belongs to.
+        self._core_view_current: CoreView = CoreView.BOTH
         #: Class owning the function being walked, so an unqualified call
         #: resolves to this class's method rather than a sibling's.
         self._owner_class: Optional[str] = visitor._owner_of.get(func)
@@ -1067,6 +1114,7 @@ class _KernelWalker:
             "scope_id": self._scope_id,
             "loop_id": self._loop_id,
             "conditional": self._conditional_depth > 0,
+            "core_view": self._core_view_current,
         }
 
     # -- parameters ---------------------------------------------------------
@@ -1141,17 +1189,59 @@ class _KernelWalker:
             self.v._collect_define(node, self._env)
             return
         if kind in {"preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif"}:
-            # Both arms of a conditional-compilation block are walked; mark
-            # them conditional so pairing diagnostics are softened.
-            self._conditional_depth += 1
-            for child in node.named_children:
-                self._visit_statement(child)
-            self._conditional_depth -= 1
+            self._handle_preproc_conditional(node)
             return
 
         # Anything else (return, labelled statements, try blocks, ...) is
         # scanned for operations and then walked structurally.
         self._scan_for_ops(node)
+
+    def _handle_preproc_conditional(self, node: Node) -> None:
+        """Walk both arms of a ``#if``, tracking which core each selects.
+
+        ``#ifdef __DAV_C220_CUBE__`` / ``#ifdef __DAV_C220_VEC__`` is how a mix
+        kernel splits itself between the two cores.  Both arms are still walked
+        - the trace covers the whole file - but the operations in each are
+        tagged with the core they are compiled into, so the event spaces stay
+        separate instead of being merged into one.
+        """
+        selected = _core_view_of_ifdef(self.v, node)
+        # Children of a preproc conditional are flat: the guarded statements
+        # first, then the `preproc_else`/`preproc_elif` node holding the rest.
+        # The else arm is the opposite core, but only when the guard selected a
+        # core at all: for any other `#ifdef` both arms stay resident on both,
+        # since the complement of "both cores" is "neither" and would silently
+        # drop the else arm of every unrelated conditional.
+        otherwise = selected.complement if selected is not CoreView.BOTH else CoreView.BOTH
+        self._conditional_depth += 1
+        try:
+            for child in node.named_children:
+                if child.type in {"preproc_else", "preproc_elif"}:
+                    with self._core_view(otherwise):
+                        self._visit_statement(child)
+                    continue
+                with self._core_view(selected):
+                    self._visit_statement(child)
+        finally:
+            self._conditional_depth -= 1
+
+    @contextmanager
+    def _core_view(self, view: CoreView):
+        """Narrow the active core view for a region, then restore it.
+
+        Views intersect, so a core guard nested inside the opposite guard marks
+        its region ``NONE``: it is compiled into neither binary, and nothing in
+        it can pair with anything.
+        """
+        if view is CoreView.BOTH:
+            yield
+            return
+        previous = self._core_view_current
+        self._core_view_current = previous.intersect(view)
+        try:
+            yield
+        finally:
+            self._core_view_current = previous
 
     def _handle_loop(self, node: Node) -> None:
         # ``do { ... } while (0)`` is the stage-macro idiom, not a loop: the
@@ -1599,15 +1689,24 @@ class _KernelWalker:
                 else:
                     self._visit_statement(branch)
             return
+        # ``if ASCEND_IS_AIV { ... } else { ... }`` is the run-time spelling of
+        # the core split: the two arms run on different physical cores, never
+        # on one, so each arm's operations belong to that core's event space.
+        guard = _core_view_of_condition(self.v, condition)
+        otherwise = guard.complement if guard is not CoreView.BOTH else CoreView.BOTH
         self._conditional_depth += 1
-        for field_name in ("consequence", "alternative"):
+        for field_name, view in (
+            ("consequence", guard),
+            ("alternative", otherwise),
+        ):
             branch = node.child_by_field_name(field_name)
             if branch is None:
                 continue
-            if branch.type == "compound_statement":
-                self._visit_block(branch, ScopeKind.BRANCH)
-            else:
-                self._visit_statement(branch)
+            with self._core_view(view):
+                if branch.type == "compound_statement":
+                    self._visit_block(branch, ScopeKind.BRANCH)
+                else:
+                    self._visit_statement(branch)
         self._conditional_depth -= 1
 
     def _handle_switch(self, node: Node) -> None:

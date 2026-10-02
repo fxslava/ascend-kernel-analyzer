@@ -185,6 +185,7 @@ class MacroExpansion:
             self.stats.get("defines_blanked")
             or self.stats.get("expansions")
             or self.stats.get("includes_inlined")
+            or self.stats.get("builtin_objects_substituted")
         )
 
     def origin_line(self, line: int) -> int:
@@ -260,6 +261,54 @@ def _line_continues(text: str, start: int, end: int) -> bool:
             continue
         return ch == "\\"
     return False
+
+
+#: Object-like macros from CANN headers that the expander substitutes itself.
+#:
+#: These are not inlined (vendor headers are left alone), yet they are
+#: *syntactically load-bearing*: kernels write ``if ASCEND_IS_AIV {`` with no
+#: parentheses of their own, because the macro supplies them.  Left alone the
+#: ``if`` is not valid C++, the statement lands in an ``ERROR`` node, and the
+#: whole core-guarded region - every flag operation in it - disappears from the
+#: trace.  Each expands to a parenthesised sentinel identifier the AST visitor
+#: recognises as a core predicate; it stays opaque to the constant folder, so
+#: neither arm is pruned.
+BUILTIN_OBJECT_MACROS: Dict[str, str] = {
+    "ASCEND_IS_AIC": "(__ascend_core_is_aic)",
+    "ASCEND_IS_AIV": "(__ascend_core_is_aiv)",
+}
+
+
+def _substitute_builtin_objects(
+    text: str, defined: Dict[str, str]
+) -> Tuple[str, int]:
+    """Replace the CANN core predicates with parenthesised sentinels.
+
+    A translation unit that defines one of these names itself wins: its own
+    body was already recorded, and overriding it here would analyze code the
+    compiler never sees.
+    """
+    pending = {
+        name: body
+        for name, body in BUILTIN_OBJECT_MACROS.items()
+        if name not in defined and name in text
+    }
+    if not pending:
+        return text, 0
+    spans = non_code_spans_str(text)
+    pattern = re.compile(r"\b(" + "|".join(map(re.escape, pending)) + r")\b")
+    pieces: List[str] = []
+    cursor = 0
+    count = 0
+    for match in pattern.finditer(text):
+        if _in_span(spans, match.start()):
+            continue  # a mention in a comment or string literal
+        pieces.append(text[cursor : match.start()])
+        pieces.append(pending[match.group(1)])
+        cursor = match.end()
+        count += 1
+    pieces.append(text[cursor:])
+    return "".join(pieces), count
 
 
 def _collect_directives(
@@ -644,6 +693,9 @@ def expand_macros(source: str, base_dir: Optional[Path] = None) -> MacroExpansio
         lines[number - 1] = " " * len(lines[number - 1])
 
     text = "\n".join(lines)
+    text, substituted = _substitute_builtin_objects(text, objects)
+    if substituted:
+        stats["builtin_objects_substituted"] = substituted
     if not functions:
         return MacroExpansion(
             text=text,

@@ -55,6 +55,52 @@ class ScopeKind(Enum):
     BRANCH = "branch"
     #: The body of a callee walked into its caller's trace.
     INLINE = "inline"
+    #: A region guarded to one physical core (AIC or AIV).
+    CORE = "core"
+
+
+class CoreView(Enum):
+    """Which physical core of a dual-core DaVinci part runs a region.
+
+    A "mix" kernel is one source file compiled twice: once for the Cube core
+    (AIC) and once for the Vector core (AIV), selected by
+    ``__DAV_C220_CUBE__`` / ``__DAV_C220_VEC__`` at compile time and by
+    ``ASCEND_IS_AIC`` / ``ASCEND_IS_AIV`` at run time.  The two cores hold
+    **separate event-id spaces**, so a ``SetFlag`` compiled into one of them
+    can never be consumed by a ``WaitFlag`` compiled into the other.  Treating
+    the merged source as one event space reports every such half as an orphan.
+    """
+
+    #: Unguarded: compiled into both binaries.
+    BOTH = "both"
+    #: Cube core only.
+    AIC = "aic"
+    #: Vector core only.
+    AIV = "aiv"
+    #: Guarded into both cores at once, so it is compiled into neither.
+    NONE = "none"
+
+    def intersect(self, other: "CoreView") -> "CoreView":
+        """The cores on which both views are resident."""
+        if self is CoreView.BOTH:
+            return other
+        if other is CoreView.BOTH:
+            return self
+        return self if self is other else CoreView.NONE
+
+    def overlaps(self, other: "CoreView") -> bool:
+        """``True`` when some core runs both views, so they can interact."""
+        return self.intersect(other) is not CoreView.NONE
+
+    @property
+    def complement(self) -> "CoreView":
+        """The opposite arm of a core guard."""
+        return {
+            CoreView.AIC: CoreView.AIV,
+            CoreView.AIV: CoreView.AIC,
+            CoreView.BOTH: CoreView.NONE,
+            CoreView.NONE: CoreView.BOTH,
+        }[self]
 
 
 @dataclass
@@ -256,6 +302,11 @@ class Operation:
     #: trace over-approximates it as unconditionally executed.  Pairing
     #: diagnostics are softened for such operations.
     conditional: bool = False
+    #: Which physical core this operation is compiled into.  A mix kernel is
+    #: one source file but two binaries, and the AIC and AIV cores have
+    #: separate event spaces, so a flag raised in one view can never be seen
+    #: in the other.
+    core_view: CoreView = CoreView.BOTH
 
     @property
     def kind(self) -> str:  # pragma: no cover - overridden
@@ -273,6 +324,7 @@ class Operation:
             "pipe": self.pipe.value,
             "loop_id": self.loop_id,
             "conditional": self.conditional,
+            "core_view": self.core_view.value,
             "location": self.loc.to_json(),
         }
 

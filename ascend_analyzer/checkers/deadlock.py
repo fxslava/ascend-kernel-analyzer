@@ -48,7 +48,7 @@ import networkx as nx
 
 from ..diagnostics import Code, Severity, SourceLoc
 from ..hardware import REAL_PIPES, HardEventRoute, Pipe
-from ..ir import BarrierOp, FlagKind, FlagOp, KernelIR, Operation
+from ..ir import BarrierOp, CoreView, FlagKind, FlagOp, KernelIR, Operation
 from .base import Checker
 
 __all__ = ["DeadlockChecker", "Channel", "SyncEdge"]
@@ -296,14 +296,85 @@ class DeadlockChecker(Checker):
                 entry.waits_by_loop[op.loop_id].append(op)
         return stats
 
+    # -- core-split residency ------------------------------------------------
+
+    @staticmethod
+    def _resident_views(ops: Sequence[FlagOp]) -> Set[CoreView]:
+        """Cores on which at least one of *ops* is compiled."""
+        views: Set[CoreView] = set()
+        for op in ops:
+            if op.core_view is CoreView.NONE:
+                continue
+            if op.core_view is CoreView.BOTH:
+                views.update({CoreView.AIC, CoreView.AIV})
+            else:
+                views.add(op.core_view)
+        return views
+
+    @classmethod
+    def _co_resident(
+        cls, op: FlagOp, others: Sequence[FlagOp]
+    ) -> List[FlagOp]:
+        """The operations in *others* that run on a core *op* also runs on."""
+        return [other for other in others if op.core_view.overlaps(other.core_view)]
+
+    @classmethod
+    def _crosses_cores(cls, op: FlagOp, others: Sequence[FlagOp]) -> bool:
+        """``True`` when *op*'s only partners are on the opposite core.
+
+        A mix kernel is compiled twice, and the AIC and AIV cores hold separate
+        event spaces, so this pair is not a local handshake at all - it is
+        inter-core synchronisation, which the hardware carries over a different
+        mechanism than the per-core flag registers.  Reporting the local half as
+        a leak or a hang would be wrong in both directions.
+        """
+        if op.core_view is CoreView.NONE:
+            return True  # compiled into neither binary; nothing to pair with
+        return bool(others) and not cls._co_resident(op, others)
+
+    @classmethod
+    def _loop_imbalance(
+        cls, sets: Sequence[FlagOp], waits: Sequence[FlagOp]
+    ) -> Optional[Tuple[List[FlagOp], List[FlagOp]]]:
+        """The worst per-core set/wait imbalance in one loop body.
+
+        Returns the offending core's sets and waits, or ``None`` when every
+        core the body is compiled for is balanced.
+        """
+        views = cls._resident_views(list(sets) + list(waits))
+        if not views:
+            return None
+        worst: Optional[Tuple[List[FlagOp], List[FlagOp]]] = None
+        for view in sorted(views, key=lambda v: v.value):
+            on_core_sets = [op for op in sets if op.core_view.overlaps(view)]
+            on_core_waits = [op for op in waits if op.core_view.overlaps(view)]
+            delta = abs(len(on_core_sets) - len(on_core_waits))
+            if delta == 0:
+                continue
+            if worst is None or delta > abs(len(worst[0]) - len(worst[1])):
+                worst = (on_core_sets, on_core_waits)
+        return worst
+
     def _check_orphans(
         self, kernel: KernelIR, stats: Dict[Channel, _ChannelStats]
     ) -> None:
         """Channels where one side is missing entirely."""
         for channel, entry in stats.items():
             route, event_id = channel
-            if entry.sets and not entry.waits:
-                for op in entry.sets:
+            # A set whose waits all sit on the opposite core (and vice versa) is
+            # a cross-core hand-off, not an orphan.
+            orphan_sets = [
+                op for op in entry.sets
+                if not self._co_resident(op, entry.waits)
+                and not self._crosses_cores(op, entry.waits)
+            ]
+            orphan_waits = [
+                op for op in entry.waits
+                if not self._co_resident(op, entry.sets)
+                and not self._crosses_cores(op, entry.sets)
+            ]
+            if orphan_sets:
+                for op in orphan_sets:
                     self.diags.add(
                         Code.UNMATCHED_SET_FLAG,
                         self._soften(Severity.FATAL, op),
@@ -322,8 +393,8 @@ class DeadlockChecker(Checker):
                         route=route,
                         event_id=event_id,
                     )
-            elif entry.waits and not entry.sets:
-                for op in entry.waits:
+            if orphan_waits:
+                for op in orphan_waits:
                     self.diags.add(
                         Code.UNMATCHED_WAIT_FLAG,
                         self._soften(Severity.FATAL, op),
@@ -356,10 +427,16 @@ class DeadlockChecker(Checker):
                 loop = kernel.loops.get(loop_id)
                 if loop is None:
                     continue
-                sets = entry.sets_by_loop.get(loop_id, [])
-                waits = entry.waits_by_loop.get(loop_id, [])
-                if len(sets) == len(waits):
+                all_sets = entry.sets_by_loop.get(loop_id, [])
+                all_waits = entry.waits_by_loop.get(loop_id, [])
+                # The body is compiled once per core, so balance is per core:
+                # a set the Cube core issues cannot be the one the Vector
+                # core's wait consumes, and counting them together makes a
+                # balanced pair of bodies look like two imbalanced ones.
+                imbalance = self._loop_imbalance(all_sets, all_waits)
+                if imbalance is None:
                     continue
+                sets, waits = imbalance
                 anchor = (sets or waits)[0]
                 delta = len(sets) - len(waits)
                 direction = (

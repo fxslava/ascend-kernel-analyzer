@@ -330,3 +330,104 @@ def test_kernel_without_synchronisation_publishes_an_empty_graph():
     result = analyze_body("return;")
     graph = sync_graph(result)
     assert graph["nodes"] == []
+
+
+# ---------------------------------------------------------------------------
+# AIC/AIV core-split isolation
+# ---------------------------------------------------------------------------
+
+
+class TestCoreSplit:
+    """A mix kernel is one source file but two binaries, one per core.
+
+    The AIC and AIV cores hold separate event-id spaces, so flag operations
+    guarded into different cores can neither pair with each other nor be
+    counted against each other.
+    """
+
+    def test_ifdef_guards_tag_each_arm_with_its_core(self):
+        result = analyze_body(
+            "#ifdef __DAV_C220_CUBE__\n"
+            + set_flag("M_MTE1", 0)
+            + "#endif\n"
+            "#ifdef __DAV_C220_VEC__\n"
+            + set_flag("MTE3_V", 0)
+            + "#endif\n"
+        )
+        views = {
+            op.loc.line: op.core_view.value
+            for op in result.unit.kernels[0].ops
+        }
+        assert sorted(views.values()) == ["aic", "aiv"]
+
+    def test_runtime_predicate_guards_both_arms(self):
+        # `if ASCEND_IS_AIC {` carries no parentheses of its own - the CANN
+        # macro supplies them - so this also pins that the predicate parses.
+        result = analyze_body(
+            "if ASCEND_IS_AIC {\n"
+            + set_flag("FIX_M", 1)
+            + "} else {\n"
+            + set_flag("V_MTE2", 1)
+            + "}\n"
+        )
+        assert not find(result, "AKA9001")
+        views = sorted(op.core_view.value for op in result.unit.kernels[0].ops)
+        assert views == ["aic", "aiv"]
+
+    def test_an_unrelated_ifdef_leaves_both_arms_on_both_cores(self):
+        # Regression: the complement of "both cores" is "neither", so applying
+        # it to a non-core guard would drop the else arm from every analysis.
+        result = analyze_body(
+            "#ifdef SOME_OTHER_FEATURE\n"
+            + set_flag("MTE2_V", 0)
+            + "#else\n"
+            + set_flag("MTE2_V", 1)
+            + "#endif\n"
+        )
+        views = sorted(op.core_view.value for op in result.unit.kernels[0].ops)
+        assert views == ["both", "both"]
+
+    def test_a_cross_core_handoff_is_not_a_local_orphan(self):
+        result = analyze_body(
+            "if ASCEND_IS_AIC {\n"
+            + set_flag("MTE3_MTE2", 2)
+            + "}\n"
+            "if ASCEND_IS_AIV {\n"
+            + wait_flag("MTE3_MTE2", 2)
+            + "}\n"
+        )
+        assert not find(result, "AKA2001")
+        assert not find(result, "AKA2002")
+
+    def test_loop_balance_is_counted_per_core(self):
+        # One set on the Cube core and one wait on the Vector core: merged
+        # counting sees 1 set + 1 wait and calls the body balanced, hiding that
+        # each core's body is off by one.
+        result = analyze_body(
+            "for (int i = 0; i < 4; ++i) {\n"
+            "if ASCEND_IS_AIC {\n"
+            + set_flag("V_MTE2", 0)
+            + "}\n"
+            "if ASCEND_IS_AIV {\n"
+            + wait_flag("V_MTE2", 0)
+            + "}\n"
+            "}\n"
+        )
+        assert find(result, "AKA2006")
+
+    def test_a_per_core_balanced_loop_is_silent(self):
+        result = analyze_body(
+            "for (int i = 0; i < 4; ++i) {\n"
+            "if ASCEND_IS_AIC {\n"
+            + set_flag("M_MTE1", 0)
+            + wait_flag("M_MTE1", 0)
+            + "}\n"
+            "if ASCEND_IS_AIV {\n"
+            + set_flag("V_MTE2", 1)
+            + wait_flag("V_MTE2", 1)
+            + "}\n"
+            "}\n"
+        )
+        assert not find(result, "AKA2006")
+        assert not find(result, "AKA2001")
+        assert not find(result, "AKA2002")
