@@ -29,7 +29,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import List, Optional, Sequence, Set
 
@@ -45,6 +45,9 @@ KERNEL_DIR = Path(__file__).resolve().parent / "kernels"
 
 _EXPECT_RE = re.compile(r"@ascend-expect\s*:\s*(?P<codes>[^\n*]*)")
 _EXPECT_FATAL_RE = re.compile(r"@ascend-expect-fatal\s*:\s*(?P<count>\d+)")
+#: A fixture whose kernel targets a part other than the default declares it,
+#: so an instruction-set gate (AKA1011) judges it against the right profile.
+_EXPECT_CHIP_RE = re.compile(r"@ascend-chip\s*:\s*(?P<chip>[A-Za-z0-9_.-]+)")
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +62,8 @@ class Expectation:
     path: Path
     codes: Set[str] = field(default_factory=set)
     fatal_count: Optional[int] = None
+    #: Chip profile the fixture is written against; ``None`` means the default.
+    chip: Optional[str] = None
 
     @classmethod
     def from_source(cls, path: Path) -> "Expectation":
@@ -77,10 +82,12 @@ class Expectation:
                 if token.strip()
             )
         fatal_match = _EXPECT_FATAL_RE.search(text)
+        chip_match = _EXPECT_CHIP_RE.search(text)
         return cls(
             path=path,
             codes=codes,
             fatal_count=int(fatal_match.group("count")) if fatal_match else None,
+            chip=chip_match.group("chip") if chip_match else None,
         )
 
 
@@ -110,6 +117,12 @@ class Outcome:
 def check_fixture(path: Path, analyzer: KernelAnalyzer) -> Outcome:
     """Analyze one fixture and compare the findings with its declaration."""
     expectation = Expectation.from_source(path)
+    if expectation.chip and expectation.chip != analyzer.hardware.chip.name:
+        # The fixture targets a different part; judge it against that profile
+        # rather than the suite default.
+        analyzer = KernelAnalyzer(
+            replace(analyzer.options, chip=expectation.chip)
+        )
     result = analyzer.analyze_file(path)
     produced = set(result.codes())
 

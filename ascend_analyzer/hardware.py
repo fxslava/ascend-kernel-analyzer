@@ -312,6 +312,11 @@ class ChipSpec:
     #: ``True`` when the capacity numbers are inferred rather than documented.
     provisional: bool = False
     notes: str = ""
+    #: Optional instruction-set features this part implements.  An intrinsic
+    #: whose ``requires_feature`` is absent here cannot be issued on this chip.
+    #: Empty on DaVinci v2 (910B/910C): those parts have the baseline Cube and
+    #: Vector sets, and no MX microscale path.
+    features: FrozenSet[str] = frozenset()
     # -- 351x SIMD/SIMT Unified Buffer partitioning --------------------------
     #: Total Unified Buffer bytes when the architecture strictly partitions UB
     #: between tensor allocations and the SIMT DataCache.  ``None`` on parts
@@ -455,6 +460,9 @@ CHIP_PROFILES: Dict[str, ChipSpec] = {
         min_datacache_bytes=32 * KIB,
         max_usable_ub_bytes=216 * KIB,
         provisional=True,
+        # DaVinci v3 Cube: carries the MX (microscaled FP4) operand format and
+        # its scale-load path, which the v2 parts above do not.
+        features=frozenset({"mx_cube"}),
         notes="Capacities extrapolated; override with --chip-profile for a "
               "specific 351x SKU. UB is partitioned: at most 216 KiB for "
               "tensors when SIMT is in use, leaving a 32 KiB DataCache.",

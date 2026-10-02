@@ -23,6 +23,11 @@
  * Both kernels are functionally correct (no memory or pairing findings);
  * only performance advisories from the 4xxx block are expected.
  *
+ * The pipeline issues mad_mx (MX microscale multiply-accumulate), a
+ * DaVinci v3 instruction, so the fixture declares a v3 target rather
+ * than being judged against 910B, which cannot issue it (AKA1011).
+ *
+ * @ascend-chip: ascend351x
  * @ascend-expect: AKA4001 AKA4002
  * @ascend-expect-fatal: 0
  */

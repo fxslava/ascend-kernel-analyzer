@@ -56,6 +56,13 @@ class AnalyzerOptions:
     warnings_as_errors: bool = False
     #: Honour in-source ``@ascend-ignore`` annotations.
     honour_inline_ignores: bool = True
+    #: Concrete tiling-struct field values, as ``{field: value}``.  The host
+    #: tiling function runs on the CPU, so a kernel's ``tilingData->rowFactor``
+    #: is a runtime load that no amount of source analysis can fold.  Supplying
+    #: one real configuration (from a test harness, a profile, or by hand) binds
+    #: those loads and lets the layout - and with it the alignment, aliasing and
+    #: bank-conflict checks - resolve for that configuration.
+    tiling_values: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -145,6 +152,7 @@ class KernelAnalyzer:
             VisitorOptions(
                 analyze_all_functions=self.options.all_functions,
                 max_ops=self.options.max_ops,
+                tiling_values=dict(self.options.tiling_values),
             ),
         )
 

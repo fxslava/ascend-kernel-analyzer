@@ -64,6 +64,7 @@ class Code(str, enum.Enum):
     UNKNOWN_DOMAIN = "AKA1009"
     # 351x SIMD/SIMT DataCache headroom below the 32 KiB hardware minimum.
     INSUFFICIENT_DATACACHE = "AKA1010"
+    UNSUPPORTED_INTRINSIC = "AKA1011"
 
     # -- 2xxx: synchronisation / pipeline ----------------------------------
     UNMATCHED_SET_FLAG = "AKA2001"
@@ -112,6 +113,7 @@ CODE_TITLES: Dict[str, str] = {
     Code.NEGATIVE_OFFSET.value: "Negative buffer offset",
     Code.UNKNOWN_DOMAIN.value: "Undetermined memory domain",
     Code.INSUFFICIENT_DATACACHE.value: "Insufficient UB DataCache headroom (351x SIMT)",
+    Code.UNSUPPORTED_INTRINSIC.value: "Intrinsic unsupported on target architecture",
     Code.UNMATCHED_SET_FLAG.value: "SetFlag without matching WaitFlag",
     Code.UNMATCHED_WAIT_FLAG.value: "WaitFlag without matching SetFlag",
     Code.RESERVED_EVENT_ID.value: "Reserved EVENT_ID used",

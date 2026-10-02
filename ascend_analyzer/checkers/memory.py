@@ -122,6 +122,7 @@ class MemoryChecker(Checker):
         self._check_api_domains(kernel)
         self._check_vector_bank_conflicts(kernel)
         self._check_simt_datacache(kernel)
+        self._check_target_features(kernel)
 
         tensors = on_core
 
@@ -655,6 +656,43 @@ class MemoryChecker(Checker):
                 return None
             picked.append((name, tensor))
         return (picked[0], picked[1])
+
+    # -- target instruction-set gating (AKA1011) -----------------------------
+
+    def _check_target_features(self, kernel: KernelIR) -> None:
+        """Reject intrinsics the active chip profile cannot issue (AKA1011).
+
+        The MX Cube path (``mad_mx`` and its ``load_*_mx`` scale loaders) is
+        DaVinci v3.  Analyzing such a kernel against a v2 profile like 910B
+        used to model it as valid, reporting layout and pipeline findings for
+        an instruction the part cannot execute at all - so the real defect,
+        that the kernel is built for the wrong target, went unreported.
+        """
+        features = self.hw.chip.features
+        for op in kernel.api_calls():
+            spec = lookup_api(op.name)
+            if spec is None or spec.requires_feature is None:
+                continue
+            if spec.requires_feature in features:
+                continue
+            self.diags.add(
+                Code.UNSUPPORTED_INTRINSIC,
+                Severity.FATAL,
+                f"Intrinsic '{op.name}' is unsupported on target architecture "
+                f"{self.hw.chip.display_name}: it requires the "
+                f"'{spec.requires_feature}' feature, which this part does not "
+                "implement",
+                op.loc,
+                remediation=(
+                    f"Analyze this kernel against a chip whose profile carries "
+                    f"'{spec.requires_feature}' (see --list-chips), or contract "
+                    f"'{op.name}' to the instruction set the target does have - "
+                    "on DaVinci v2 that is standard Mmad over FP16/BF16/INT8/INT4."
+                ),
+                api=op.name,
+                requires_feature=spec.requires_feature,
+                chip=self.hw.chip.name,
+            )
 
     # -- 351x SIMD/SIMT DataCache budget (AKA1010) ---------------------------
 

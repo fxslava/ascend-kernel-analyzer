@@ -12,6 +12,7 @@ usable directly as a CI gate.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -117,6 +118,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-ops", type=_positive_int, default=20000, metavar="N",
         help="cap on tracked operations per kernel (default: %(default)s)",
     )
+    analysis.add_argument(
+        "--tiling-data", metavar="PATH[:KEY]",
+        help=(
+            "bind tiling-struct fields from a JSON manifest, so layouts that "
+            "depend on host tiling resolve for that configuration; append "
+            "':KEY' to pick a named config (default: the first one)"
+        ),
+    )
 
     output = parser.add_argument_group("output")
     output.add_argument(
@@ -177,6 +186,64 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_tiling_values(spec: Optional[str]) -> dict:
+    """Read ``PATH[:KEY]`` into a flat ``{field: value}`` binding.
+
+    Two manifest shapes are accepted: a flat ``{field: value}`` mapping, and the
+    harvested per-kernel form ``{"kernels": {<path>: {"configs": {KEY: {...}}}}}``.
+    In the second case every kernel that carries the requested config
+    contributes its fields; a field two kernels disagree on is dropped rather
+    than silently resolved one way.
+    """
+    if not spec:
+        return {}
+    path_text, _, key = spec.rpartition(":")
+    # A bare Windows drive letter is not a config key.
+    if not path_text or len(key) == 1:
+        path_text, key = spec, ""
+    path = Path(path_text)
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"cannot read --tiling-data {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--tiling-data {path} is not valid JSON: {exc}") from exc
+
+    if not isinstance(doc, dict):
+        raise ValueError(f"--tiling-data {path} must hold a JSON object")
+
+    kernels = doc.get("kernels")
+    if not isinstance(kernels, dict):
+        flat = {k: v for k, v in doc.items() if isinstance(v, (int, float))}
+        if not flat:
+            raise ValueError(f"--tiling-data {path} has no field values")
+        return {k: int(v) for k, v in flat.items() if float(v).is_integer()}
+
+    merged: dict = {}
+    conflicting: set = set()
+    for entry in kernels.values():
+        configs = (entry or {}).get("configs")
+        if not isinstance(configs, dict) or not configs:
+            continue
+        chosen = configs.get(key) if key else next(iter(configs.values()))
+        if not isinstance(chosen, dict):
+            continue
+        for name, value in chosen.items():
+            if not isinstance(value, (int, float)) or not float(value).is_integer():
+                continue  # a float clamp is not a layout input
+            value = int(value)
+            if name in merged and merged[name] != value:
+                conflicting.add(name)
+            merged[name] = value
+    for name in conflicting:
+        merged.pop(name, None)
+    if key and not merged:
+        raise ValueError(
+            f"--tiling-data {path}: no kernel defines a config named {key!r}"
+        )
+    return merged
+
+
 def _positive_int(raw: str) -> int:
     try:
         value = int(raw, 0)
@@ -223,6 +290,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_ops=args.max_ops,
                 warnings_as_errors=args.warnings_as_errors,
                 honour_inline_ignores=not args.ignore_inline_pragmas,
+                tiling_values=_load_tiling_values(args.tiling_data),
             )
         )
     except (KeyError, ValueError, OSError) as exc:

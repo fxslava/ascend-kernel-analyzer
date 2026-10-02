@@ -21,7 +21,8 @@ invents facts is worse than one that admits ignorance.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from math import gcd as _gcd
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -77,7 +78,137 @@ __all__ = ["ASTVisitor", "parse_source", "parse_file", "VisitorOptions"]
 _TENSOR_TYPE_RE = re.compile(
     r"\b(?P<kind>LocalTensor|GlobalTensor)\s*<\s*(?P<dtype>[A-Za-z_][\w:]*)\s*>"
 )
+#: Bound on nested single-return helper folding.
+_MAX_HELPER_DEPTH = 8
+#: Bound on call-graph inlining depth.
+_MAX_INLINE_DEPTH = 6
+
 _TBUF_TYPE_RE = re.compile(r"\bT(?:Buf|Que|QueBind)\b.*?TPosition::(?P<pos>[A-Z0-9_]+)")
+#: The ping/pong depth of ``TQue<TPosition::VECIN, 2>`` - the trailing integer
+#: template argument.  ``TBuf`` has no depth argument and reserves one block.
+_QUEUE_DEPTH_RE = re.compile(
+    r"\bT(?:Que|QueBind)\b[^>]*?TPosition::[A-Z0-9_]+\s*,\s*(?P<depth>\d+)"
+)
+
+
+#: ``hidden_``, ``this->hidden_`` and ``obj.hidden_`` all name one member; a
+#: subscript or call target is not a scalar member and is rejected.
+_MEMBER_TARGET_RE = re.compile(r"^(?:this\s*->\s*|[A-Za-z_]\w*\s*\.\s*)?([A-Za-z_]\w*)$")
+
+
+def _strip_template_args(name: str) -> str:
+    """``Service<A::B>::f`` -> ``Service::f``; drops every ``<...>`` group."""
+    depth = 0
+    out: List[str] = []
+    for ch in name:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out).strip()
+
+
+def _enclosing_class_name(visitor: "ASTVisitor", func: Node) -> Optional[str]:
+    """The class a function belongs to, or ``None`` for a free function.
+
+    Mirrored method names are the norm in these kernels - a Vector service and
+    a Cube service both define ``AllocEventID`` - so the owning class is what
+    makes a call site resolvable.  Taken from the qualified declarator when the
+    definition is written out of class, otherwise from the enclosing class or
+    struct body.
+    """
+    declarator = func.child_by_field_name("declarator")
+    if declarator is not None:
+        qualified = _strip_template_args(visitor.text(declarator))
+        head = qualified.split("(", 1)[0]
+        if "::" in head:
+            return head.rsplit("::", 2)[-2].strip() or None
+    node = func.parent
+    for _ in range(8):
+        if node is None:
+            break
+        if node.type in {"class_specifier", "struct_specifier"}:
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                return _strip_template_args(visitor.text(name_node)) or None
+            return None
+        node = node.parent
+    return None
+
+
+def _bare_function_name(name: str) -> str:
+    """``Service<T>::AllocEventID`` -> ``AllocEventID``.
+
+    A member definition carries its class qualification and template
+    arguments; the call site does not.  Matching the two needs the bare name.
+    Template arguments are dropped before splitting so a ``::`` inside them
+    (``Service<A::B>::f``) cannot be mistaken for the class separator.
+    """
+    depth = 0
+    out: List[str] = []
+    for ch in name:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out).rsplit("::", 1)[-1].strip()
+
+
+def _member_target_name(text: str) -> Optional[str]:
+    """The bare member name an assignment writes, or ``None`` if not a member."""
+    match = _MEMBER_TARGET_RE.match(text.strip())
+    return match.group(1) if match else None
+
+
+#: Receiver spellings a kernel uses to reach its tiling struct.
+_TILING_RECEIVERS = (
+    "tilingData", "tiling_data", "tiling", "tilingDataPtr", "tilingPtr",
+)
+
+#: Accessors that hand out storage from a TPipe-managed buffer, and the
+#: tensor origin each one records.
+_PIPE_ACCESSORS = {
+    "Get": "TBuf::Get",
+    "AllocTensor": "TQue::AllocTensor",
+    "DeQue": "TQue::DeQue",
+}
+
+
+def _queue_depth(type_text: str) -> int:
+    """Blocks reserved by a queue declaration; 1 when it is a plain ``TBuf``."""
+    match = _QUEUE_DEPTH_RE.search(type_text)
+    if match is None:
+        return 1
+    depth = int(match.group("depth"))
+    return depth if depth > 0 else 1
+
+
+@dataclass(frozen=True)
+class PipeBuffer:
+    """One ``TBuf``/``TQue`` member and the extent its ``InitBuffer`` reserves.
+
+    ``block_bytes`` is the per-block length passed to ``InitBuffer``; a queue of
+    ``depth`` blocks reserves ``depth * block_bytes`` contiguous bytes, which is
+    what the bump allocator consumes.
+    """
+
+    name: str
+    position: TPosition
+    depth: int = 1
+    block_bytes: Optional[Expr] = None
+    #: Position in ``InitBuffer`` call order, which is what fixes the layout.
+    #: ``None`` for a buffer that is never sized.
+    order: Optional[int] = None
+
+    @property
+    def total_bytes(self) -> Optional[Expr]:
+        if self.block_bytes is None:
+            return None
+        return mul(self.block_bytes, Const(self.depth)) if self.depth > 1 else self.block_bytes
 _LEADING_IDENT_RE = re.compile(r"^\s*\(*\s*(?:[A-Za-z_]\w*::)*(?P<name>[A-Za-z_]\w*)")
 
 #: Scalar type words that may appear as the operand of a C-style cast.
@@ -177,6 +308,8 @@ class VisitorOptions:
     #: ``p ? EVENT_ID1 : EVENT_ID0`` ping-pong selection fold to constants the
     #: pairing analysis can reason about.
     unroll_trip_limit: int = 8
+    #: Concrete tiling-struct field values to bind, as ``{field: value}``.
+    tiling_values: Dict[str, int] = field(default_factory=dict)
     #: How many iterations adjacent to each loop boundary the three-phase
     #: peeling traversal may explicitly replay ("peeled head" / "peeled tail").
     peel_window: int = 4
@@ -231,6 +364,25 @@ class ASTVisitor:
         #: a single ``return <expr>;``, for constexpr-style event-id folding.
         #: Maps name -> (parameter names, returned expression node).
         self._helpers: Dict[str, Tuple[Tuple[str, ...], Node]] = {}
+        self._helper_depth = 0
+        self._eval.helper_resolver = self.fold_helper_call
+        #: Every named function body in the unit, keyed by (owning class or
+        #: ``None``, bare name) -> (parameter names, body node, definition).
+        self._functions: Dict[
+            Tuple[Optional[str], str], Tuple[Tuple[str, ...], Node, Node]
+        ] = {}
+        #: Keys whose class declares that name more than once (an overload set).
+        self._ambiguous_functions: Set[Tuple[Optional[str], str]] = set()
+        #: Bare name -> every key defining it, for unqualified resolution.
+        self._definitions_by_name: Dict[str, List[Tuple[Optional[str], str]]] = {}
+        #: Definition node -> its owning class, for resolving calls made inside it.
+        self._owner_of: Dict[Node, Optional[str]] = {}
+        #: Bare names that appear as a callee anywhere in the unit.
+        self._called_functions: Set[str] = set()
+        #: Every ``TBuf``/``TQue`` in the unit, by member name, with the byte
+        #: size its ``InitBuffer`` reserves.  Unit-wide because the declaration,
+        #: the sizing call and the ``Get<T>()`` live in different scopes.
+        self._pipe_buffers: Dict[str, "PipeBuffer"] = {}
 
     # -- entry point --------------------------------------------------------
 
@@ -241,8 +393,12 @@ class ASTVisitor:
         unit = AnalysisUnit(path=self.prepared.path, source=self.prepared.original)
         self._report_parse_errors(root, unit)
         self._seed_builtin_constants()
+        self._seed_tiling_values()
         self._collect_global_constants(root)
         self._collect_helper_functions(root)
+        self._collect_scalar_members(root)
+        self._collect_pipe_buffers(root)
+        self._collect_call_graph(root)
         unit.constants = dict(self._global_env.flatten())
         unit.suppressions = {
             ann.line: [
@@ -253,9 +409,16 @@ class ASTVisitor:
             for ann in self.prepared.annotations_of("ignore")
         }
 
-        for func in self._find_functions(root):
+        functions = self._find_functions(root)
+        covered = self._inlined_elsewhere(functions)
+        for func in functions:
             is_entry = self.prepared.has_kernel_attribute_before(func.start_byte)
             if not is_entry and not self.opts.analyze_all_functions:
+                continue
+            if func in covered and not self.opts.analyze_all_functions:
+                # Reached by inlining it into the entry that calls it, where
+                # its flags pair with their partners.  Walking it again on its
+                # own would re-report that one handshake as two orphans.
                 continue
             walker = _KernelWalker(self, func, is_entry)
             unit.kernels.append(walker.build())
@@ -369,6 +532,229 @@ class ASTVisitor:
                 continue
             self._helpers[name] = (tuple(params), value)
 
+    def fold_helper_call(self, node: Node, env: ConstEnv) -> Optional[int]:
+        """Evaluate a call to a single-``return`` helper to a constant.
+
+        Covers both the ``ev(p) { return p ? EV1 : EV0; }`` ping-pong selector
+        and the arithmetic helpers kernels size their buffers with, such as
+        ``AlignUpBytes(bytes)``.  Every argument must fold, the body is then
+        evaluated with the parameters bound, and the result must be constant.
+        Recursion is bounded by ``_helper_depth``: a helper that calls itself
+        would otherwise recurse until the stack gives out.
+        """
+        if node.type != "call_expression":
+            return None
+        func = node.child_by_field_name("function")
+        name = _callee_base_name(self, func)
+        if name is None or name not in self._helpers:
+            return None
+        if self._helper_depth >= _MAX_HELPER_DEPTH:
+            return None
+        params, body = self._helpers[name]
+        values: List[int] = []
+        self._helper_depth += 1
+        try:
+            for arg in _argument_nodes(node):
+                folded = self._eval.fold(arg, env)
+                if folded is None:
+                    return None
+                values.append(folded)
+            if len(values) != len(params):
+                return None
+            local = self._global_env.child()
+            for param, value in zip(params, values):
+                local.define(param, value)
+            return self._eval.fold(body, local)
+        finally:
+            self._helper_depth -= 1
+
+    def _seed_tiling_values(self) -> None:
+        """Bind supplied tiling fields under every spelling kernels use.
+
+        The field is reached as ``tilingData->rowFactor``, ``tiling->rowFactor``
+        or ``tilingData.rowFactor`` depending on the operator, and the evaluator
+        looks names up by their source text, so each receiver spelling is
+        defined.  The bare field name is defined too, which covers the common
+        ``GET_TILING_DATA`` style where the struct is unpacked into locals.
+        """
+        values = self.opts.tiling_values
+        if not values:
+            return
+        for field_name, value in values.items():
+            if not isinstance(value, int) or isinstance(value, bool):
+                continue  # floats are not integral layout inputs
+            for receiver in _TILING_RECEIVERS:
+                self._global_env.define(f"{receiver}->{field_name}", value)
+                self._global_env.define(f"{receiver}.{field_name}", value)
+            self._global_env.define(field_name, value)
+
+    def _local_env_before(self, call: Node) -> ConstEnv:
+        """Globals plus the foldable locals declared before *call* in its scope.
+
+        A buffer's extent is usually computed into a local of the method that
+        sizes it, so folding the ``InitBuffer`` argument needs those locals.
+        Only declarations lexically before the call are bound, and only when
+        they fold, so nothing is read out of order.
+        """
+        env = self._global_env.child()
+        function = call
+        while function is not None and function.type not in {
+            "function_definition", "lambda_expression"
+        }:
+            function = function.parent
+        if function is None:
+            return env
+        for node in _walk(function):
+            if node.start_byte >= call.start_byte:
+                break
+            if node.type != "declaration":
+                continue
+            for declarator in node.children_by_field_name("declarator"):
+                if declarator.type != "init_declarator":
+                    continue
+                name_node = _declarator_identifier(declarator)
+                value = declarator.child_by_field_name("value")
+                if name_node is None or value is None:
+                    continue
+                folded = self._eval.fold(value, env)
+                if folded is not None:
+                    env.define(self.text(name_node), folded)
+        return env
+
+    def _collect_scalar_members(self, root: Node) -> None:
+        """Fold scalar members that the unit assigns exactly once.
+
+        A kernel class unpacks its tiling struct in one method and sizes its
+        buffers in another: ``hidden_ = tilingData.hiddenSize;`` in ``Init()``,
+        ``InitBuffer(xBitsBuf_, AlignUpBytes(hidden_ * 2))`` in
+        ``InitBuffers()``.  Without carrying the member across that boundary a
+        supplied tiling configuration binds the struct field and still leaves
+        every dependent extent symbolic.
+
+        Only members assigned *once* in the whole unit are bound, and only when
+        the right-hand side already folds.  A member written twice may hold
+        either value at the point of use, so pinning one would invent a layout.
+        """
+        assignments: Dict[str, List[Node]] = defaultdict(list)
+        for node in _walk(root):
+            if node.type != "assignment_expression":
+                continue
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is None or right is None:
+                continue
+            operator = node.child_by_field_name("operator")
+            if operator is not None and self.text(operator) != "=":
+                continue  # compound assignment depends on the prior value
+            name = _member_target_name(self.text(left))
+            if name is None:
+                continue
+            assignments[name].append(right)
+
+        for name, writes in assignments.items():
+            if len(writes) != 1:
+                continue
+            if self._global_env.lookup(name) is not None:
+                continue  # a real constant of that name already won
+            folded = self._eval.fold(writes[0], self._global_env)
+            if folded is not None:
+                self._global_env.define(name, folded)
+
+    def _collect_pipe_buffers(self, root: Node) -> None:
+        """Index every ``TBuf``/``TQue`` in the unit and its ``InitBuffer`` size.
+
+        Production kernels encapsulate the buffer manager: the ``TBuf``/``TQue``
+        members are declared in a class body, ``pipe_->InitBuffer(...)`` runs in
+        ``Init()``, and ``buf.Get<T>()`` runs in ``Process()`` - three different
+        scopes.  A per-function walker therefore never sees a buffer and its
+        size together, which is why every queued tensor used to come out with no
+        domain (AKA1009) and no offset, disabling the whole memory and
+        bank-conflict analysis.  Collecting the declarations and the sizes once
+        per translation unit lets each function's walker resolve them.
+        """
+        ambiguous: Set[str] = set()
+        conflicting: Set[str] = set()
+        for node in _walk(root):
+            if node.type not in {"declaration", "field_declaration"}:
+                continue
+            type_node = node.child_by_field_name("type")
+            type_text = self.text(type_node) if type_node is not None else ""
+            decl_text = self.text(node)
+            match = _TBUF_TYPE_RE.search(type_text) or _TBUF_TYPE_RE.search(decl_text)
+            if match is None:
+                continue
+            position = TPosition.parse(match.group("pos"))
+            if position is None:
+                continue
+            depth = _queue_depth(type_text or decl_text)
+            for declarator in node.children_by_field_name("declarator"):
+                name_node = _declarator_identifier(declarator)
+                if name_node is None:
+                    continue
+                name = self.text(name_node)
+                prior = self._pipe_buffers.get(name)
+                if prior is not None and (
+                    prior.position is not position or prior.depth != depth
+                ):
+                    # Two classes in one unit using the same member name for
+                    # different buffers; binding either way could invent a
+                    # layout, so neither is trusted.
+                    ambiguous.add(name)
+                    continue
+                self._pipe_buffers[name] = PipeBuffer(name, position, depth)
+
+        next_order = 0
+        for node in _walk(root):
+            if node.type != "call_expression":
+                continue
+            func = node.child_by_field_name("function")
+            if func is None:
+                continue
+            if _callee_base_name(self, func) not in {"InitBuffer", "InitQueue"}:
+                continue
+            args = _argument_nodes(node)
+            if len(args) < 2:
+                continue
+            name = _leading_identifier(self.text(args[0]))
+            buf = self._pipe_buffers.get(name or "")
+            if buf is None:
+                continue
+            # The extent is routinely a local of the sizing method
+            # (``const int64_t xFloatBytes = AlignUpBytes(...)``), so the call
+            # is evaluated in that method's scope, not the bare global one.
+            env = self._local_env_before(node)
+            # InitBuffer(buf, len) for a TBuf; InitBuffer(que, num, len) for a
+            # TQue - the block length is always the last argument.
+            size = self._eval.evaluate(args[-1], env)
+            if size is None:
+                continue
+            depth = buf.depth
+            if len(args) >= 3:
+                num = to_int(self._eval.evaluate(args[1], env))
+                if num is not None and num > 0:
+                    depth = num
+            if buf.order is not None:
+                # Sized twice in one unit.  Same extent: harmless repetition.
+                # Different extent: two kernels reusing one member name, so no
+                # unit-wide size is correct and only the function-local
+                # InitBuffer may size it.
+                if to_int(size) != to_int(buf.block_bytes) or depth != buf.depth:
+                    conflicting.add(name)
+                continue
+            self._pipe_buffers[name] = PipeBuffer(
+                buf.name, buf.position, depth, size, order=next_order
+            )
+            next_order += 1
+
+        for name in ambiguous:
+            self._pipe_buffers.pop(name, None)
+        for name in conflicting:
+            entry = self._pipe_buffers.get(name)
+            if entry is not None:
+                # Keep the TPosition (consistent across the declarations) but
+                # drop the size, so the layout comes from the owning function.
+                self._pipe_buffers[name] = PipeBuffer(entry.name, entry.position)
+
     def _collect_global_constants(self, root: Node) -> None:
         """Fold file-scope ``constexpr``, ``#define`` and ``enum`` constants."""
         for node in self._walk_skipping_bodies(root):
@@ -449,6 +835,105 @@ class ASTVisitor:
     def _find_functions(self, root: Node) -> List[Node]:
         return [n for n in _walk(root) if n.type == "function_definition"]
 
+    def resolve_callee(
+        self, name: str, caller_owner: Optional[str]
+    ) -> Optional[Tuple[Tuple[str, ...], Node, Node]]:
+        """Find the body an unqualified call names, or ``None`` if unclear.
+
+        A method calling ``AllocEventID()`` means *its own* class's method, so
+        the caller's class is tried first.  Failing that, a name defined
+        exactly once in the unit resolves to that definition.  A name defined
+        by several classes with no class context is left alone: inlining the
+        wrong sibling would trace code that never runs here.
+        """
+        for key in ((caller_owner, name), (None, name)):
+            if key in self._ambiguous_functions:
+                return None
+            entry = self._functions.get(key)
+            if entry is not None:
+                return entry
+        keys = self._definitions_by_name.get(name) or []
+        if len(keys) == 1 and keys[0] not in self._ambiguous_functions:
+            return self._functions.get(keys[0])
+        return None
+
+    def _inlined_elsewhere(self, functions: Sequence[Node]) -> Set[Node]:
+        """Functions covered by inlining, so not analyzed in their own right.
+
+        A function qualifies when it is called inside this unit, is not itself
+        a ``__global__`` launch entry, and resolves unambiguously by name.  The
+        set is only applied when the unit has at least one launch entry to
+        inline it *into*: a header or fixture whose ``__aicore__`` helpers are
+        the only things present must still be analyzed directly, or the file
+        would report nothing at all.
+        """
+        launches = [
+            f for f in functions
+            if self.prepared.has_launch_attribute_before(f.start_byte)
+        ]
+        if not launches:
+            return set()
+        covered: Set[Node] = set()
+        for func in functions:
+            if func in launches:
+                continue
+            name = _bare_function_name(_KernelWalker._function_name(func))
+            if not name or name not in self._called_functions:
+                continue
+            owner = self._owner_of.get(func)
+            if (owner, name) in self._ambiguous_functions:
+                continue
+            # Only suppress a definition some call site actually resolves to;
+            # otherwise it would be dropped from the report without ever being
+            # inlined anywhere.
+            if self.resolve_callee(name, owner) is not self._functions.get((owner, name)):
+                continue
+            covered.add(func)
+        return covered
+
+    def _collect_call_graph(self, root: Node) -> None:
+        """Index the unit's functions and record which of them get called.
+
+        Kernels are written as a ``__global__`` entry that delegates to
+        ``__aicore__ inline`` helpers and member methods: the entry calls
+        ``AllocEventID()`` to prime its flags, then ``Process()`` to consume
+        them.  Analyzing each of those bodies on its own sees a ``SetFlag``
+        with no ``WaitFlag`` in one function and the mirror image in another,
+        and reports both as fatal - one real handshake, counted twice as two
+        orphans.  Indexing the definitions lets the walker inline a callee into
+        its caller's trace, where the pair is visible.
+        """
+        for func in self._find_functions(root):
+            body = func.child_by_field_name("body")
+            if body is None:
+                continue
+            # Indexed by (owning class, bare name): a method is defined as
+            # ``Service<T>::AllocEventID`` but called as ``AllocEventID``, and
+            # a sibling class usually defines the same method name.
+            name = _bare_function_name(_KernelWalker._function_name(func))
+            if not name or name == "<anonymous>":
+                continue
+            declarator = func.child_by_field_name("declarator")
+            params = tuple(_parameter_names(declarator)) if declarator else ()
+            owner = _enclosing_class_name(self, func)
+            entry = (params, body, func)
+            key = (owner, name)
+            # The same class declaring one name twice is an overload set that
+            # cannot be told apart by name, so neither body is inlined.
+            if key in self._functions:
+                self._ambiguous_functions.add(key)
+                continue
+            self._functions[key] = entry
+            self._owner_of[func] = owner
+            self._definitions_by_name.setdefault(name, []).append(key)
+
+        for node in _walk(root):
+            if node.type != "call_expression":
+                continue
+            base = _callee_base_name(self, node.child_by_field_name("function"))
+            if base is not None:
+                self._called_functions.add(base)
+
 
 # ---------------------------------------------------------------------------
 # Per-kernel walker
@@ -479,6 +964,28 @@ class _KernelWalker:
         self._buffer_sizes: Dict[str, Expr] = {}
         #: LocalTensor name -> the TBuf it was obtained from via ``.Get()``.
         self._tensor_buffers: Dict[str, str] = {}
+        #: Per-block length of each queue, which is what one ``AllocTensor``
+        #: hands out (``_buffer_sizes`` holds the whole reserved extent).
+        self._buffer_blocks: Dict[str, Expr] = {}
+        #: Callees currently being inlined, innermost last; the recursion guard.
+        self._inline_stack: List[str] = []
+        #: Class owning the function being walked, so an unqualified call
+        #: resolves to this class's method rather than a sibling's.
+        self._owner_class: Optional[str] = visitor._owner_of.get(func)
+        if self._owner_class is None:
+            self._owner_class = _enclosing_class_name(visitor, func)
+        # Seed from the unit-wide registry so a ``Get<T>()`` in ``Process()``
+        # resolves against a buffer declared in the class body and sized in
+        # ``Init()``.  A same-function InitBuffer still overwrites these.
+        for buf in visitor._pipe_buffers.values():
+            self._buffer_positions[buf.name] = buf.position
+            total = buf.total_bytes
+            if total is not None:
+                self._buffer_sizes[buf.name] = total
+                self._buffer_blocks[buf.name] = buf.block_bytes
+                folded = to_int(total)
+                if folded is not None:
+                    self.ir.buffer_sizes[buf.name] = folded
         self._truncated = False
 
     # -- public -------------------------------------------------------------
@@ -1237,13 +1744,17 @@ class _KernelWalker:
             # tensor inherits the parent buffer's TPosition domain, so
             # ``TBuf<TPosition::A1> b; b.Get<int8_t>()`` binds to L1 without
             # any manual SetTPosition call or annotation.
-            if base == "Get" and func is not None:
+            # ``buf.Get<T>()`` is the TBuf accessor; ``que.AllocTensor<T>()`` and
+            # ``que.DeQue<T>()`` are the TQue equivalents.  All three hand out
+            # storage inside the receiver's reserved extent, so the tensor
+            # inherits its TPosition domain and its place in the layout.
+            if base in _PIPE_ACCESSORS and func is not None:
                 receiver = _field_receiver_name(self.v, func)
                 if receiver and receiver in self._buffer_positions:
                     self._assign_position(decl, self._buffer_positions[receiver])
                     self._tensor_buffers[decl.name] = receiver
                     decl.source_buffer = receiver
-                    decl.origin = "TBuf::Get"
+                    decl.origin = _PIPE_ACCESSORS[base]
                 return
 
             # ``other.ReinterpretCast<T>()`` - inherits the source binding.
@@ -1369,6 +1880,48 @@ class _KernelWalker:
         receiver = _field_receiver_name(self.v, func)
         if receiver is not None and receiver in self.ir.tensors:
             self._handle_tensor_method(node, base, self.ir.tensors[receiver])
+            return
+
+        self._inline_callee(node, base)
+
+    def _inline_callee(self, node: Node, base: str) -> bool:
+        """Walk an intra-TU callee's body into this trace, in call position.
+
+        This is what makes a flag raised in a setup helper and consumed in the
+        processing method one paired handshake instead of two orphans.  The
+        callee's parameters are bound to its arguments where they fold, so an
+        event id passed in still resolves.
+
+        Not inlined: anything outside this unit, an overloaded or re-declared
+        name, a call already on the inlining stack (recursion), and anything
+        past ``_MAX_INLINE_DEPTH``.
+        """
+        if base in self._inline_stack:
+            return False
+        entry = self.v.resolve_callee(base, self._owner_class)
+        if entry is None:
+            return False
+        params, body, definition = entry
+        if definition is self.func or len(self._inline_stack) >= _MAX_INLINE_DEPTH:
+            return False
+        if self._truncated:
+            return False
+
+        env = self._env.child()
+        for param, arg in zip(params, _argument_nodes(node)):
+            folded = self.v._eval.fold(arg, self._env)
+            if folded is not None:
+                env.define(param, folded)
+
+        self._inline_stack.append(base)
+        self._env_stack.append(env)
+        try:
+            self._visit_block(body, ScopeKind.INLINE)
+        finally:
+            self._env_stack.pop()
+            self._inline_stack.pop()
+        self.ir.inlined.append(base)
+        return True
 
     def _handle_init_buffer(self, node: Node) -> None:
         """Record ``pipe.InitBuffer(buf, bytes)`` sizes."""
@@ -1378,15 +1931,23 @@ class _KernelWalker:
         name = _leading_identifier(self._text(args[0]))
         if not name or name not in self._buffer_positions:
             return
-        size_node = args[1] if len(args) >= 2 else None
-        if size_node is None:
+        # InitBuffer(buf, len) sizes a TBuf; InitBuffer(que, num, len) sizes a
+        # queue of num blocks.  The block length is the last argument either
+        # way, and the reserved extent is num blocks of it.
+        block = self.v._eval.evaluate(args[-1], self._env)
+        if block is None:
             return
-        size = self.v._eval.evaluate(size_node, self._env)
-        if size is not None:
-            self._buffer_sizes[name] = size
-            folded = to_int(size)
-            if folded is not None:
-                self.ir.buffer_sizes[name] = folded
+        depth = 1
+        if len(args) >= 3:
+            num = to_int(self.v._eval.evaluate(args[1], self._env))
+            if num is not None and num > 0:
+                depth = num
+        total = mul(block, Const(depth)) if depth > 1 else block
+        self._buffer_sizes[name] = total
+        self._buffer_blocks[name] = block
+        folded = to_int(total)
+        if folded is not None:
+            self.ir.buffer_sizes[name] = folded
 
     # -- synchronisation ----------------------------------------------------
 
@@ -1464,26 +2025,7 @@ class _KernelWalker:
         arguments must fold to constants, the body is then evaluated with the
         parameters bound to them, and the result must itself be constant.
         """
-        if node.type != "call_expression":
-            return None
-        func = node.child_by_field_name("function")
-        name = _callee_base_name(self.v, func)
-        if name is None or name not in self.v._helpers:
-            return None
-        params, body = self.v._helpers[name]
-        arg_nodes = _argument_nodes(node)
-        values: List[int] = []
-        for arg in arg_nodes:
-            folded = self.v._eval.fold(arg, self._env)
-            if folded is None:
-                return None
-            values.append(folded)
-        if len(values) != len(params):
-            return None
-        env = self.v._global_env.child()
-        for param, value in zip(params, values):
-            env.define(param, value)
-        return self.v._eval.fold(body, env)
+        return self.v.fold_helper_call(node, self._env)
 
     def _handle_barrier(self, node: Node, func: Node) -> None:
         target = Pipe.ALL
@@ -1740,6 +2282,24 @@ class _KernelWalker:
         for scope in self.ir.scopes.values():
             scope.end_index = max(scope.end_index, scope.start_index)
 
+    def _allocation_order(self) -> List[str]:
+        """Buffer names in the order ``TPipe`` carves UB for them.
+
+        The allocator is a bump pointer driven by ``InitBuffer`` call order,
+        which need not match the order the members were declared in.  Buffers
+        that were never sized sort last; they only mark their domain blocked.
+        """
+        names = list(self._buffer_positions)
+        registry = self.v._pipe_buffers
+
+        def key(name: str) -> Tuple[int, int]:
+            entry = registry.get(name)
+            if entry is None or entry.order is None:
+                return (1, names.index(name))
+            return (0, entry.order)
+
+        return sorted(names, key=key)
+
     def _synthesize_tpipe_layout(self) -> None:
         """Give ``TBuf<TPosition>`` allocations concrete byte ranges.
 
@@ -1755,32 +2315,50 @@ class _KernelWalker:
             return
         cursors: Dict[PhysicalDomain, int] = {}
         layouts: Dict[str, Tuple[int, int]] = {}
-        for name, position in self._buffer_positions.items():
+        #: Domains whose bump allocation has hit a buffer of unknown size.
+        #: Everything the allocator hands out after that sits at an offset we
+        #: cannot know, so no later buffer in that domain gets a concrete base -
+        #: inventing one would fabricate overlaps and bank deltas.
+        blocked: Set[PhysicalDomain] = set()
+        for name in self._allocation_order():
+            position = self._buffer_positions.get(name)
+            if position is None:
+                continue
             domain = self.v.hw.domain_of(position)
-            if not domain.is_on_core_sram:
+            if not domain.is_on_core_sram or domain in blocked:
                 continue
             size = self._buffer_sizes.get(name)
             size_value = to_int(size) if size is not None else None
+            if size_value is None or size_value <= 0:
+                blocked.add(domain)
+                continue
             align = self.v.hw.base_alignment(domain)
             base = -(-cursors.get(domain, 0) // align) * align  # ceil to align
-            layouts[name] = (base, size_value) if size_value is not None else (base, None)
-            if size_value is not None:
-                cursors[domain] = base + size_value
+            layouts[name] = (base, size_value)
+            cursors[domain] = base + size_value
 
         for tensor_name, buffer_name in self._tensor_buffers.items():
             decl = self.ir.tensors.get(tensor_name)
             layout = layouts.get(buffer_name)
             if decl is None or layout is None:
                 continue
-            base, size = layout
+            base, _ = layout
             if decl.byte_offset is None:
                 decl.byte_offset = Const(base)
                 decl.unbound = False
-            if size is not None:
+            # One accessor call hands out one block, not the queue's whole
+            # reserved extent, so a depth-2 queue sizes its tensors by block.
+            block = to_int(self._buffer_blocks.get(buffer_name))
+            if block is not None:
                 if decl.byte_size is None:
-                    decl.byte_size = Const(size)
+                    decl.byte_size = Const(block)
                 if decl.elem_count is None and decl.elem_size:
-                    decl.elem_count = Const(size // decl.elem_size)
+                    decl.elem_count = Const(block // decl.elem_size)
+            # Every tensor drawn from one buffer shares that storage by design:
+            # successive Get<T>() calls return the same region, and a queue's
+            # ping/pong blocks are deliberate recycling.  Grouping them keeps
+            # the aliasing check from reporting the buffer manager's own reuse.
+            decl.reuse_group = decl.reuse_group or f"tpipe:{buffer_name}"
             decl.origin = f"{decl.origin} + TPipe layout"
 
     @staticmethod

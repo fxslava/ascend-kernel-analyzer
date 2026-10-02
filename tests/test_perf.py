@@ -31,7 +31,14 @@ def profile_of(result, kernel_name: str) -> dict:
     return profile
 
 
+#: The fixture issues mad_mx (DaVinci v3) and declares this via @ascend-chip;
+#: the 910B profile cannot issue it, so the perf behaviour under test is
+#: measured against a part that can.
+FIXTURE_CHIP = "ascend351x"
+
+
 def analyze_fixture(**kwargs) -> object:
+    kwargs.setdefault("chip", FIXTURE_CHIP)
     return KernelAnalyzer(AnalyzerOptions(**kwargs)).analyze_file(FIXTURE)
 
 

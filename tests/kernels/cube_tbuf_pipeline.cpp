@@ -22,6 +22,12 @@
  * included: every SetFlag has exactly one statically paired WaitFlag and the
  * whole SRAM layout is concrete.
  *
+ * The Cube stage issues mad_mx, the MX microscale multiply-accumulate,
+ * which is a DaVinci v3 instruction: 910B has no MX operand format. The
+ * fixture therefore declares a v3 target, so the instruction-set gate
+ * (AKA1011) judges it against a part that can actually issue it.
+ *
+ * @ascend-chip: ascend351x
  * @ascend-expect:
  * @ascend-expect-fatal: 0
  */

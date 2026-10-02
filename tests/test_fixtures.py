@@ -247,9 +247,17 @@ class TestExpectationParsing:
 # ---------------------------------------------------------------------------
 
 
+#: Declared by cube_tbuf_pipeline.cpp via @ascend-chip.
+CUBE_TBUF_CHIP = "ascend351x"
+
+
 @pytest.fixture(scope="module")
 def cube_tbuf_result():
-    return KernelAnalyzer(AnalyzerOptions()).analyze_file(
+    # The fixture issues mad_mx, a DaVinci v3 instruction, and declares its
+    # target with @ascend-chip; analyzing it against the 910B default would
+    # (correctly) reject it on the instruction-set gate instead of exercising
+    # the frontend features it is here to cover.
+    return KernelAnalyzer(AnalyzerOptions(chip=CUBE_TBUF_CHIP)).analyze_file(
         KERNEL_DIR / "cube_tbuf_pipeline.cpp"
     )
 
@@ -263,7 +271,7 @@ class TestCubeTBufPipeline:
 
     def test_strict_mode_is_also_clean(self):
         result = KernelAnalyzer(
-            AnalyzerOptions(strict=True)
+            AnalyzerOptions(strict=True, chip=CUBE_TBUF_CHIP)
         ).analyze_file(KERNEL_DIR / "cube_tbuf_pipeline.cpp")
         assert result.fatal_count == 0
         assert result.warning_count == 0

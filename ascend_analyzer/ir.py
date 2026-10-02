@@ -53,6 +53,8 @@ class ScopeKind(Enum):
     BLOCK = "block"
     LOOP = "loop"
     BRANCH = "branch"
+    #: The body of a callee walked into its caller's trace.
+    INLINE = "inline"
 
 
 @dataclass
@@ -406,6 +408,8 @@ class KernelIR:
     buffer_sizes: Dict[str, int] = field(default_factory=dict)
     #: ``True`` when the function carried ``__global__``/``__aicore__``.
     is_kernel_entry: bool = True
+    #: Callees whose bodies were walked into this trace, in call order.
+    inlined: List[str] = field(default_factory=list)
 
     # -- trace views --------------------------------------------------------
 
@@ -457,6 +461,9 @@ class KernelIR:
             "location": self.loc.to_json(),
             "is_kernel_entry": self.is_kernel_entry,
             "op_count": len(self.ops),
+            # Which callees this trace covers: a finding may point into one of
+            # them rather than into the entry's own body.
+            "inlined": list(self.inlined),
             "tensors": [t.to_json() for t in self.tensors.values()],
             "loops": [
                 {

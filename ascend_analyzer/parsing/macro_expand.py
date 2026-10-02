@@ -36,9 +36,23 @@ line.  :class:`MacroExpansion.line_origins` hands that map to the AST visitor,
 which translates every reported location back through it.
 
 The expander is deliberately minimal: no conditional evaluation (``#if`` arms
-are left for tree-sitter), no token pasting or stringification, no variadic
-macros.  Kernels do not use those; when one does, the unexpanded construct
-degrades exactly as before this module existed.
+are left for tree-sitter), no stringification, no variadic macros.  When a
+kernel uses one of those, the unexpanded construct degrades exactly as before
+this module existed.
+
+The ``##`` token-paste operator *is* supported, because production kernels do
+use it: the CANN-style flag wrappers
+
+.. code-block:: c
+
+   #define SET_FLAG(trigger, waiter, e) \\
+       AscendC::SetFlag<AscendC::HardEvent::trigger##_##waiter>((e))
+
+build the ``HardEvent`` enumerator by pasting their arguments.  Without paste
+support the invocation cannot be expanded, lands in an ``ERROR`` node, and the
+flag operation never reaches the trace - so the kernel's whole synchronisation
+structure silently reads as clean.  Paste runs after argument substitution and
+before rescanning, per the C rules.
 """
 
 from __future__ import annotations
@@ -70,6 +84,10 @@ _NON_CALL_PRECEDERS = frozenset({".", ":", ">", "#"})
 
 _LAUNCH_OPEN_RE = re.compile(r"[A-Za-z_]\w*\s*$")
 _LAUNCH_TOKEN_RE = re.compile(r"<<<|>>>")
+#: The ``##`` token-paste operator with the horizontal whitespace it absorbs.
+#: Newlines are deliberately excluded: a replacement must not change the line
+#: count, or every origin mapping downstream of it would shift.
+_PASTE_RE = re.compile(r"[ \t]*##[ \t]*")
 
 
 def non_code_spans_str(text: str) -> List[Tuple[int, int]]:
@@ -377,14 +395,59 @@ def _split_arguments(text: str) -> List[str]:
     return [a.strip() for a in args]
 
 
+def _substitute_param(text: str, pattern: re.Pattern, arg: str) -> str:
+    """Replace every occurrence of one parameter, honouring ``##`` adjacency.
+
+    An occurrence that is an operand of a token paste is substituted *bare*.
+    Pasting joins the spelling of the adjacent tokens, so the protective
+    parentheses used everywhere else would make the result ill-formed:
+    ``PIPE_##pipe`` has to become ``PIPE_V``, never ``PIPE_##(V)``.
+    """
+    pieces: List[str] = []
+    cursor = 0
+    for match in pattern.finditer(text):
+        before = text[: match.start()].rstrip(" \t")
+        after = text[match.end() :].lstrip(" \t")
+        pasted = before.endswith("##") or after.startswith("##")
+        pieces.append(text[cursor : match.start()])
+        pieces.append(arg if pasted else f"({arg})")
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _apply_pastes(text: str) -> str:
+    """Execute the ``##`` operators in an already-substituted macro body.
+
+    Paste runs after substitution and before rescanning, as C requires, so a
+    concatenation that names another macro is expanded on the rescan.
+    """
+    if "##" not in text:
+        return text
+    spans = non_code_spans_str(text)
+    pieces: List[str] = []
+    cursor = 0
+    for match in _PASTE_RE.finditer(text):
+        if _in_span(spans, match.start()):
+            continue  # '##' inside a comment or string literal is not an operator
+        pieces.append(text[cursor : match.start()])
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 def _substitute(body: str, params: Sequence[str], args: Sequence[str]) -> str:
-    """Replace parameter occurrences with parenthesised arguments."""
+    """Replace parameter occurrences with arguments, then paste.
+
+    Arguments are parenthesised to keep operator precedence, except where the
+    occurrence is an operand of ``##`` (see :func:`_substitute_param`).
+    """
     out = body
     for param, arg in zip(params, args):
         if not param:
             continue
-        out = re.sub(rf"\b{re.escape(param)}\b", f"({arg})", out)
-    return out
+        out = _substitute_param(out, re.compile(rf"\b{re.escape(param)}\b"), arg)
+    return _apply_pastes(out)
 
 
 def _find_matching_paren(

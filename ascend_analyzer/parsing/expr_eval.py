@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from tree_sitter import Node
 
@@ -29,6 +29,21 @@ __all__ = ["ConstEnv", "ExpressionEvaluator"]
 
 
 _INT_SUFFIX_RE = re.compile(r"[uUlLzZ]+$")
+#: Whitespace around a member accessor, so ``a -> b`` canonicalises to ``a->b``.
+_ACCESSOR_WS_RE = re.compile(r"\s*(->|\.)\s*")
+#: Integral target types of a value-preserving cast.
+_INT_TYPE_WORDS = (
+    r"(?:u?int(?:8|16|32|64)_t|size_t|ssize_t|ptrdiff_t|"
+    r"(?:(?:unsigned|signed)\s+)?(?:char|short|int|long(?:\s+long)?)|"
+    r"unsigned|signed)"
+)
+#: ``static_cast<int64_t>(x)`` or the functional ``int64_t(x)``.  Deliberately
+#: excludes ``reinterpret_cast`` (reinterprets an address - must stay opaque)
+#: and floating-point targets (truncation is not value-preserving).
+_INT_CAST_RE = re.compile(
+    rf"^(?:(?:static_cast|const_cast)\s*<\s*(?:const\s+)?{_INT_TYPE_WORDS}\s*>"
+    rf"|{_INT_TYPE_WORDS})$"
+)
 
 _BIN_OPS = frozenset({"+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^"})
 _UN_OPS = frozenset({"-", "+", "~"})
@@ -131,6 +146,14 @@ class ExpressionEvaluator:
 
     def __init__(self, source: bytes) -> None:
         self._source = source
+        #: Resolver for calls to single-``return`` helper functions, installed
+        #: by the visitor once it has indexed them.  Takes the call node and the
+        #: environment, returns a constant or ``None``.  Without it a helper
+        #: such as ``AlignUpBytes(hidden_ * 2)`` stays opaque, which leaves
+        #: every extent it computes unresolvable.
+        self.helper_resolver: Optional[
+            "Callable[[Node, ConstEnv], Optional[int]]"
+        ] = None
 
     # -- helpers ------------------------------------------------------------
 
@@ -213,7 +236,13 @@ class ExpressionEvaluator:
 
     def _lower_name(self, raw: str, env: ConstEnv) -> Optional[Expr]:
         name = raw.strip()
-        for candidate in (name, name.rsplit("::", 1)[-1]):
+        # ``tilingData -> rowFactor`` and ``tilingData->rowFactor`` are the same
+        # member; normalise the accessor so a single binding matches both.
+        canonical = _ACCESSOR_WS_RE.sub(r"\1", name)
+        candidates = [name, name.rsplit("::", 1)[-1]]
+        if canonical != name:
+            candidates.insert(1, canonical)
+        for candidate in candidates:
             value = env.lookup(candidate)
             if value is not None:
                 return Const(value)
@@ -304,6 +333,14 @@ class ExpressionEvaluator:
             size = dtype_size(_strip_type_text(self.text(arg_nodes[0])))
             return Const(size) if size is not None else Var(name=self.text(node))
 
+        # ``static_cast<int64_t>(x)`` is a call_expression in this grammar, not
+        # a cast_expression, so without this it stays opaque - and kernels spell
+        # nearly every width conversion that way, which left the extents built
+        # from them unresolvable.  A named-cast to an integral type is
+        # value-preserving for layout arithmetic, so the operand passes through.
+        if _INT_CAST_RE.match(fname) and len(arg_nodes) == 1:
+            return self._lower(arg_nodes[0], env)
+
         # Common host-side helpers that are pure integer arithmetic.
         if fname in {"AlignUp", "ALIGN_UP", "CeilAlign"} and len(arg_nodes) == 2:
             value = self._lower(arg_nodes[0], env)
@@ -322,6 +359,14 @@ class ExpressionEvaluator:
             divisor = self._lower(arg_nodes[1], env)
             if value is not None and divisor is not None:
                 return BinOp("/", BinOp("-", BinOp("+", value, divisor), Const(1)), divisor)
+
+        # A project-local single-``return`` helper, evaluated with its arguments
+        # bound.  Tried last so the built-in spellings above keep their
+        # symbolic (non-constant) form where the arguments do not fold.
+        if self.helper_resolver is not None:
+            folded = self.helper_resolver(node, env)
+            if folded is not None:
+                return Const(folded)
 
         return Var(name=self.text(node))
 

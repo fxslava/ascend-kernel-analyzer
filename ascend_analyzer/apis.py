@@ -51,6 +51,11 @@ class ArgRole(Enum):
 
 ANY_TENSOR: Optional[FrozenSet[D]] = None  # sentinel: operand is not domain-checked
 
+#: Feature name for the MX (microscaled FP4) Cube path: ``mad_mx`` plus the
+#: ``load_*_mx`` scale loaders.  DaVinci v3 only; 910B/910C contract to the
+#: standard ``Mmad`` over FP16/BF16/INT8/INT4.
+MX_CUBE_FEATURE = "mx_cube"
+
 _UB = frozenset({D.UB})
 _L1 = frozenset({D.L1})
 _GM = frozenset({D.GM})
@@ -114,6 +119,11 @@ class ApiSpec:
     doc: str = ""
     #: How to derive the transferred byte volume, for raw-pointer loaders.
     volume: Optional[TransferVolume] = None
+    #: Hardware feature the intrinsic needs.  ``None`` means every supported
+    #: chip has it.  A kernel that calls an intrinsic whose feature the active
+    #: chip profile lacks cannot run there at all, so it is reported rather
+    #: than modelled as if it were valid (AKA1011).
+    requires_feature: Optional[str] = None
 
     def param_at(self, index: int) -> Optional[ParamSpec]:
         return self.params[index] if 0 <= index < len(self.params) else None
@@ -436,6 +446,9 @@ def _build_table() -> Dict[str, ApiSpec]:
         ("load_cbuf_to_ca_mx", _L0A, _L1, _MX_VOLUME),
         ("load_cbuf_to_cb_mx", _L0B, _L1, _MX_VOLUME),
     ):
+        # The MX scale-load path is DaVinci v3; v2 (910B/910C) has no
+        # microscale operand format and no instruction to feed it.
+        feature = MX_CUBE_FEATURE if name.endswith("_mx") else None
         put(ApiSpec(
             name=name,
             params=(
@@ -451,6 +464,7 @@ def _build_table() -> Dict[str, ApiSpec]:
             category="cube-load",
             doc=f"Raw CCE tile load; moves {volume.basis}.",
             volume=volume,
+            requires_feature=feature,
         ))
     put(ApiSpec(
         name="mad_mx",
@@ -468,6 +482,7 @@ def _build_table() -> Dict[str, ApiSpec]:
         category="cube",
         doc="MX-format matrix multiply-accumulate: L0A x L0B -> L0C "
             "(fp4x2 operands with E8M0 microscales).",
+        requires_feature=MX_CUBE_FEATURE,
     ))
     put(ApiSpec(
         name="DataCacheCleanAndInvalid",

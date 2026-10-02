@@ -260,6 +260,22 @@ class PreparedSource:
             for span in self.qualifiers
         )
 
+    def has_launch_attribute_before(
+        self, start_byte: int, window: int = 160
+    ) -> bool:
+        """``True`` when specifically ``__global__`` precedes ``start_byte``.
+
+        ``__aicore__`` alone marks device code, which every helper and member
+        method carries; only ``__global__`` marks a launch entry.  The
+        distinction decides whether a function is analyzed in its own right or
+        reached by inlining it into the entry that calls it.
+        """
+        lo = max(0, start_byte - window)
+        return any(
+            span.token == "__global__" and lo <= span.start_byte < start_byte
+            for span in self.qualifiers
+        )
+
     # -- annotation lookup --------------------------------------------------
 
     def annotations_of(self, kind: str) -> List[Annotation]:
