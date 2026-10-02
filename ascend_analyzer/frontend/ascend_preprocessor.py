@@ -610,9 +610,14 @@ def _consume_line_markers(
     in_primary = True
     #: Where the content being emitted is attributed when it is not the
     #: primary file: the line of the ``#include`` that pulled it in.
-    include_site = 1
     primary_key = _path_key(primary)
     sites = include_sites or {}
+    include_site = 1
+    #: Where we last were in the primary file.  An ``#include`` emits no
+    #: output of its own, so this is the line *before* the directive that
+    #: caused a descent, and the descent is attributed to the first include
+    #: at or after it.
+    last_primary_line = 1
 
     for line in text.split("\n"):
         match = _LINE_MARKER_RE.match(line.strip())
@@ -622,17 +627,16 @@ def _consume_line_markers(
             if name is not None:
                 in_primary = _path_key(name) == primary_key
                 if not in_primary:
-                    # Attribute the header's content to its #include line.
-                    site = sites.get(_path_key(name))
-                    if site is not None:
-                        include_site = site
+                    include_site = _attribute_include(
+                        sites, _path_key(name), last_primary_line, include_site
+                    )
             if in_primary:
                 include_site = max(1, min(current, total_source_lines or current))
             continue
         out.append(line)
         if in_primary:
             origin = min(current, total_source_lines) if total_source_lines else current
-            include_site = origin
+            last_primary_line = origin
         else:
             origin = include_site
         origins.append(max(1, origin))
@@ -641,6 +645,26 @@ def _consume_line_markers(
     if not out:
         out, origins = [""], [1]
     return "\n".join(out), tuple(origins)
+
+
+def _attribute_include(
+    sites: Dict[str, int], header: str, after: int, fallback: int
+) -> int:
+    """The primary-file line an include's contents belong to.
+
+    A header named directly in the primary file uses its own ``#include``
+    line.  A header included *by a header* has none - and pcpp emits no marker
+    for the outer header before descending into the inner one - so the
+    descent is attributed to the first include at or after where the primary
+    file was last seen, which is the directive that must have caused it.
+    """
+    direct = sites.get(header)
+    if direct is not None:
+        return direct
+    later = [line for line in sites.values() if line >= after]
+    if later:
+        return min(later)
+    return min(sites.values()) if sites else fallback
 
 
 def _path_key(path: str) -> str:

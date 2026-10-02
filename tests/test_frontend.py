@@ -75,6 +75,29 @@ class TestLineMapping:
         index = next(i for i, l in enumerate(lines, 1) if "from_header" in l)
         assert result.origin_line(index) == 2
 
+    def test_nested_include_maps_to_the_outer_include_line(self, tmp_path):
+        """A header included by a header has no #include line of its own in
+        the primary file, so it keeps the outer header's attribution."""
+        (tmp_path / "inner.h").write_text("int from_inner = 1;" + nl, encoding="utf-8")
+        (tmp_path / "outer.h").write_text(
+            '#include "inner.h"' + nl + "int from_outer = 2;" + nl, encoding="utf-8"
+        )
+        main = tmp_path / "k.cpp"
+        source = (
+            "int before = 0;" + nl        # 1
+            + '#include "outer.h"' + nl   # 2
+            + "int after = 3;" + nl       # 3
+        )
+        main.write_text(source, encoding="utf-8")
+        result = preprocess_source(str(main), source)
+        lines = result.text.split(nl)
+        for needle in ("from_inner", "from_outer"):
+            index = next(i for i, l in enumerate(lines, 1) if needle in l)
+            assert result.origin_line(index) == 2, needle
+        # The primary file's own lines still map to themselves.
+        index = next(i for i, l in enumerate(lines, 1) if "int after" in l)
+        assert result.origin_line(index) == 3
+
     def test_utf8_header_is_decoded(self, tmp_path):
         """These headers carry Chinese comments; cp1252 would abort the unit."""
         header = tmp_path / "zh.h"
