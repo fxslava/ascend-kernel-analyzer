@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ascend-kernel-analyzer"
+version = "0.1.0"
+description = "Static analyzer for Huawei Ascend C / DaVinci NPU kernels: SRAM layout, alignment, aliasing and pipeline deadlock detection"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+keywords = [
+    "ascend", "davinci", "npu", "ascend-c", "static-analysis",
+    "huawei", "cann", "deadlock-detection", "compiler",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "tree-sitter>=0.21",
+    "tree-sitter-cpp>=0.21",
+    "networkx>=3.0",
+]
+
+[project.optional-dependencies]
+# Z3 is optional: without it the analyzer falls back to interval arithmetic,
+# which is exact for fully constant layouts but cannot produce counterexamples
+# for loop-varying offsets.
+solver = ["z3-solver>=4.12"]
+dev = [
+    "pytest>=7.0",
+    "pyflakes>=3.0",
+    "z3-solver>=4.12",
+]
+
+[project.scripts]
+ascend-analyze = "ascend_analyzer.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/example/ascend-kernel-analyzer"
+Issues = "https://github.com/example/ascend-kernel-analyzer/issues"
+
+[tool.setuptools.packages.find]
+include = ["ascend_analyzer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: tests that invoke the solver repeatedly",
+]

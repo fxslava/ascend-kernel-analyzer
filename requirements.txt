@@ -1,0 +1,9 @@
+# Runtime dependencies.
+tree-sitter>=0.21
+tree-sitter-cpp>=0.21
+networkx>=3.0
+
+# Optional but recommended: enables the Z3 backend, which proves layout
+# properties over symbolic (loop-varying) offsets and returns concrete
+# counterexamples. Without it the analyzer uses interval arithmetic.
+z3-solver>=4.12

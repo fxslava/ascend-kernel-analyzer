@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# Generated analyzer reports
+*.report.json
+*.report.html
+report.json
+report.html
