@@ -204,6 +204,50 @@ class TestUnresolvedIncludes:
         assert "include" not in expand(source)
 
 
+class TestCommentsInMacroBodies:
+    """A comment on a ``#define`` line is not part of the macro.
+
+    ``on_comment`` passes comments through verbatim to keep output lines
+    aligned, so ``pcpp`` would otherwise capture the trailing ``// 512B`` into
+    the macro's stored value and re-emit it at every use site - where a ``//``
+    swallows the rest of the line, including each closing parenthesis after
+    it.  ``#define UB_BANK_DEPTH_STRIDE (...) // 512B`` alone put four
+    thousand error lines into ``lightning_indexer.cpp`` that way.
+    """
+
+    def test_a_line_comment_after_a_body_stays_out_of_it(self):
+        source = (
+            "#define STRIDE (2 * 8)    // 512B" + nl
+            + "int buf[STRIDE];" + nl
+        )
+        assert expand(source) == "int buf[(2 * 8)];"
+
+    def test_a_comment_inside_a_nested_expansion_does_not_swallow_code(self):
+        source = (
+            "#define BLOCK 32   // 32B" + nl
+            + "#define STRIDE (8 * BLOCK)    // 512B" + nl
+            + "int buf[STRIDE];" + nl
+        )
+        assert expand(source) == "int buf[(8 * 32)];"
+
+    def test_a_block_comment_becomes_a_space_not_a_paste(self):
+        source = "#define CAT(a, b) a/*keep apart*/b" + nl + "int CAT(x, y);" + nl
+        assert expand(source) == "int x y;"
+
+    def test_the_comment_leaves_the_object_macro_body_clean(self):
+        import io
+
+        from ascend_analyzer.frontend.ascend_preprocessor import AscendCPreprocessor
+
+        engine = AscendCPreprocessor()
+        engine.parse(
+            "#define WIDTH 128    // bytes per row" + nl + "int w = WIDTH;" + nl,
+            source="t.cpp",
+        )
+        engine.write(io.StringIO())  # macros materialize as tokens are consumed
+        assert engine.macros["WIDTH"].value[0].value == "128"
+
+
 class TestNormalizer:
     """Byte-for-byte rewrites, so offsets still address the original file."""
 

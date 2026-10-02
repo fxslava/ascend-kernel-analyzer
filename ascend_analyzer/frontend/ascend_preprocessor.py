@@ -35,6 +35,7 @@ kernel.  They are therefore passed through untouched for the parser to see.
 
 from __future__ import annotations
 
+import copy
 import io
 import re
 from dataclasses import dataclass, field
@@ -101,6 +102,12 @@ ERASED_DECORATION_MACROS: Tuple[str, ...] = (
     "TEMPLATES_DEF_NO_DEFAULT",
     "TEMPLATES_DEF",
     "TEMPLATE_ARGS_DEF",
+    # CANN MicroAPI marker for a vector-core scope block.  Its definition
+    # lives in CANN headers not in this tree; left standing it is a bare
+    # identifier ahead of a ``{``, and the block it opens (every ``arch35``
+    # ``vf/`` helper body) fails to attach.  In CANN it expands to nothing
+    # observable here, so the block it introduces becomes a plain scope.
+    "__VEC_SCOPE__",
 )
 
 #: CCE function *location* qualifiers, erased before tokenizing.
@@ -438,6 +445,36 @@ class AscendCPreprocessor(Preprocessor):
             self.define(name)  # empty body: expands to nothing
 
     # -- hooks --------------------------------------------------------------
+
+    def define(self, tokens):
+        """Store macro bodies without the comments on their ``#define`` line.
+
+        ``on_comment`` passes comments through verbatim - that is what keeps
+        output line numbers aligned - but it also means a comment token ends
+        up *inside* the macro's stored value, because ``pcpp`` captures every
+        token after the name to end of line.  The comment is then re-emitted
+        at every use site, mid-expression, where a ``//`` swallows the rest
+        of the line - the fleet's ``#define UB_BANK_DEPTH_STRIDE (...) // 512B``
+        alone turned ``lightning_indexer.cpp`` into four thousand error lines
+        by commenting out the closing parenthesis of each expansion.
+
+        A real compiler removes comments (translation phase 3) before it
+        processes directives (phase 4); this restores that order.  Each
+        comment becomes a single space, never a deletion, so ``A/*c*/B``
+        stays two tokens instead of pasting into ``AB``.
+        """
+        if not isinstance(tokens, str):
+            cleaned = []
+            for tok in tokens:
+                if tok.type in self.t_COMMENT:
+                    space = copy.copy(tok)
+                    space.type = self.t_SPACE
+                    space.value = " "
+                    cleaned.append(space)
+                else:
+                    cleaned.append(tok)
+            tokens = cleaned
+        super().define(tokens)
 
     def on_include_not_found(
         self, is_malformed, is_system_include, curdir, includepath

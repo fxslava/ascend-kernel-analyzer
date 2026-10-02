@@ -56,6 +56,10 @@ _OTHER_EXTENSIONS: Tuple[str, ...] = (
     # Marks a v3 SIMD vector function; carries nothing for the layout, but an
     # unknown specifier ahead of a return type derails the declaration.
     "__simd_vf__",
+    # Marks a function callable from v3 SIMD code (``arch35`` service headers
+    # spell it on every helper); same shape as ``__simd_vf__`` and just as
+    # unknown to the grammar.
+    "__simd_callee__",
     # Storage qualifier on a per-block static.
     "__BLOCK_LOCAL__",
 )

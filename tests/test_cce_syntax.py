@@ -549,11 +549,32 @@ class TestExtraQualifiers:
         "source",
         [
             "__simd_vf__ void QuantImpl(__ubuf__ float *dst) { *dst = 0; }\n",
+            "__simd_callee__ void AddVFImpl(__ubuf__ float *dst) { *dst = 0; }\n",
+            "__simd_callee__ inline int CeilDiv(int a, int b) { return a / b; }\n",
             "void f() { auto p = (__local_mem__ float *)0; (void)p; }\n",
             "struct S { __BLOCK_LOCAL__ inline unsigned counter; };\n",
         ],
     )
     def test_v3_qualifiers_parse(self, source):
+        assert parses(source)
+
+    def test_vec_scope_block_parses(self):
+        """A CANN MicroAPI scope marker with no in-tree definition.
+
+        Left standing it is a bare identifier ahead of a ``{``, and the whole
+        ``arch35`` ``vf/`` helper body fails to attach; the frontend erases it
+        so the block becomes an ordinary scope.
+        """
+        source = (
+            "void Helper()" + nl
+            + "{" + nl
+            + "    __VEC_SCOPE__" + nl
+            + "    {" + nl
+            + "        int reg = 1;" + nl
+            + "        (void)reg;" + nl
+            + "    }" + nl
+            + "}" + nl
+        )
         assert parses(source)
 
     def test_local_mem_resolves_to_the_unified_buffer(self):
