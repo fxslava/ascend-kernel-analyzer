@@ -21,19 +21,28 @@ Four fatal classes of bug are detected here:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Dict, List, Optional, Sequence, Set
 
-from ..apis import TRANSFER_PIPE, lookup_api
+from ..apis import TRANSFER_PIPE, ArgRole, lookup_api
 from ..diagnostics import Code, Severity
-from ..hardware import PhysicalDomain
+from ..hardware import PhysicalDomain, Pipe
 from ..ir import ApiCallOp, KernelIR, TensorDecl
 from ..solver import Finding, MemorySolver, Verdict, make_solver
 from ..symbolic import is_decidable, render, to_int
 from .base import Checker, CheckerContext
 
 __all__ = ["MemoryChecker", "DomainUsage"]
+
+#: Source tokens whose presence marks a translation unit as using the 351x
+#: isomorphic SIMD/SIMT vector-execution path (DataCache-guarded UB budget).
+_SIMT_MARKERS = (
+    "__simt_vf__",
+    "__simt_callee__",
+    "asc_call_vf",
+)
 
 
 @dataclass(frozen=True)
@@ -111,6 +120,8 @@ class MemoryChecker(Checker):
 
         self._check_aliasing(kernel, on_core)
         self._check_api_domains(kernel)
+        self._check_vector_bank_conflicts(kernel)
+        self._check_simt_datacache(kernel)
 
         tensors = on_core
 
@@ -558,6 +569,165 @@ class MemoryChecker(Checker):
             return PhysicalDomain.UNKNOWN
         tensor = kernel.tensors.get(name)
         return tensor.domain if tensor is not None else PhysicalDomain.UNKNOWN
+
+    # -- vector ALU bank conflicts (AKA3006) ---------------------------------
+
+    def _check_vector_bank_conflicts(self, kernel: KernelIR) -> None:
+        """Flag dual-operand vector reads that share one UB bank (AKA3006).
+
+        The Unified Buffer is an interleaved 8-bank structure addressed in
+        32-byte quantization blocks.  When one Vector ALU instruction reads
+        both source operands from base offsets that land in the *same* bank
+        (their 32-byte block delta is a multiple of 8), the two read ports
+        contend for one bank and the hardware arbitrates them into extra
+        pipeline bubbles - correct, but silently slower, so this is a
+        performance warning rather than a rejection.
+        """
+        block = self.hw.chip.block_bytes
+        banks = 8
+        for op in kernel.api_calls():
+            spec = lookup_api(op.name)
+            if spec is None or op.pipe is not Pipe.V:
+                continue
+            srcs = self._dual_source_tensors(kernel, op, spec)
+            if srcs is None:
+                continue
+            (name0, tensor0), (name1, tensor1) = srcs
+            if name0 == name1:
+                # The same tensor through both operand ports is served by the
+                # broadcast path; there is no second bank to collide with.
+                continue
+            off0, off1 = tensor0.offset_value, tensor1.offset_value
+            if off0 is None or off1 is None:
+                continue  # unresolved layout; _check_extent_known owns that
+            delta = abs(off0 - off1) // block % banks
+            if delta != 0:
+                continue
+            bank = off0 // block % banks
+            self.diags.add(
+                Code.UB_BANK_CONFLICT,
+                Severity.WARNING,
+                f"Dual-operand vector instruction '{op.name}' reads "
+                f"'{name0}' (offset 0x{off0:X}) and '{name1}' "
+                f"(offset 0x{off1:X}) from identical UB Bank {bank}. "
+                "Causes pipeline arbitration stall.",
+                op.loc,
+                hardware_domain="UB",
+                remediation=(
+                    f"Pad the allocation of '{name1}' by +32 bytes (1 DaVinci "
+                    "block) or enforce bank-orthogonal base alignment."
+                ),
+                related=[(f"declaration of {name1!r}", tensor1.loc)],
+                api=op.name,
+                src0=name0,
+                src1=name1,
+                src0_offset=off0,
+                src1_offset=off1,
+                bank=bank,
+                delta_blocks=abs(off0 - off1) // block,
+            )
+
+    @staticmethod
+    def _dual_source_tensors(
+        kernel: KernelIR, op: ApiCallOp, spec
+    ) -> Optional[tuple[tuple[str, TensorDecl], tuple[str, TensorDecl]]]:
+        """The ``(src0, src1)`` tensor pair of a dual-input op, when resolvable.
+
+        Only instructions whose signature carries exactly one ``SRC0`` and one
+        ``SRC1`` parameter (``Add``, ``Mul``, ``Sub``, ``Max``, ``Min``,
+        ``Compare``, ...) qualify; both arguments must resolve to declared
+        tensors living in UB.
+        """
+        picked: List[tuple[str, TensorDecl]] = []
+        for role in (ArgRole.SRC0, ArgRole.SRC1):
+            indices = [
+                i
+                for i, param in enumerate(spec.params)
+                if param.role is role
+            ]
+            if len(indices) != 1 or indices[0] >= len(op.args):
+                return None
+            name = op.args[indices[0]].tensor
+            if not name:
+                return None
+            tensor = kernel.tensors.get(name)
+            if tensor is None or tensor.domain is not PhysicalDomain.UB:
+                return None
+            picked.append((name, tensor))
+        return (picked[0], picked[1])
+
+    # -- 351x SIMD/SIMT DataCache budget (AKA1010) ---------------------------
+
+    def _check_simt_datacache(self, kernel: KernelIR) -> None:
+        """Enforce the 351x UB partition when SIMT execution is present.
+
+        On 351x the Unified Buffer is strictly partitioned:
+        ``DataCache = 256 KiB - StaticMem - DynamicMem - 8 KiB (compiler)``.
+        Whenever the SIMT vector path is in use, the runtime requires
+        ``DataCache >= 32 KiB``; more than 216 KiB of tensor allocation drops
+        below that floor and the hardware corrupts memory at run time.
+        """
+        chip = self.hw.chip
+        if not chip.enforces_datacache_partition:
+            return
+        source = self.ctx.unit.source
+        if not any(
+            re.search(rf"\b{re.escape(marker)}\b", source)
+            for marker in _SIMT_MARKERS
+        ):
+            return
+
+        allocated = self._ub_allocation_bytes(kernel)
+        available = self.hw.simt_datacache_available(allocated)
+        assert available is not None  # guarded by enforces_datacache_partition
+        if available >= (chip.min_datacache_bytes or 0):
+            return
+
+        self.diags.add(
+            Code.INSUFFICIENT_DATACACHE,
+            Severity.FATAL,
+            f"Insufficient UB DataCache headroom for {chip.name} SIMT "
+            f"execution (available: {available} B, required: >= "
+            f"{chip.min_datacache_bytes} B). Total tensor allocation exceeds "
+            f"{chip.max_usable_ub_bytes // 1024} KB limit.",
+            kernel.loc,
+            hardware_domain="UB",
+            remediation=(
+                f"Free at least {chip.min_datacache_bytes - available} B of UB: "
+                f"keep static + dynamic (InitBuffer) allocations at or below "
+                f"{chip.max_usable_ub_bytes} B "
+                f"({chip.max_usable_ub_bytes // 1024} KiB) so the SIMT DataCache "
+                f"keeps its {chip.min_datacache_bytes // 1024} KiB hardware "
+                "minimum, or shrink the tile until the budget closes."
+            ),
+            allocated_bytes=allocated,
+            available_bytes=available,
+            required_bytes=chip.min_datacache_bytes,
+            ub_total_bytes=chip.ub_total_bytes,
+            compiler_reserved_bytes=chip.compiler_reserved_bytes,
+        )
+
+    def _ub_allocation_bytes(self, kernel: KernelIR) -> int:
+        """Total static + dynamic UB allocation, each storage counted once.
+
+        ``TPipe::InitBuffer`` / ``LocalMemAllocator`` extents are counted per
+        buffer; tensors that do not come from a buffer are counted by their
+        own byte size, with identical ``(offset, size)`` ranges (two views of
+        one raw region) deduplicated so deliberate reuse is not double-billed.
+        """
+        counted: Set[tuple[Optional[int], int]] = set()
+        total = 0
+        for tensor in kernel.tensors.values():
+            if tensor.domain is not PhysicalDomain.UB or tensor.size_value is None:
+                continue
+            if tensor.source_buffer is not None:
+                continue  # billed through its InitBuffer below
+            key = (tensor.offset_value, tensor.size_value)
+            if key in counted:
+                continue
+            counted.add(key)
+            total += tensor.size_value
+        return total + sum(kernel.buffer_sizes.values())
 
     # -- aggregate footprint ------------------------------------------------
 

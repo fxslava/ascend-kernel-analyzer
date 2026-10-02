@@ -312,6 +312,18 @@ class ChipSpec:
     #: ``True`` when the capacity numbers are inferred rather than documented.
     provisional: bool = False
     notes: str = ""
+    # -- 351x SIMD/SIMT Unified Buffer partitioning --------------------------
+    #: Total Unified Buffer bytes when the architecture strictly partitions UB
+    #: between tensor allocations and the SIMT DataCache.  ``None`` on parts
+    #: (910B/910C) where the whole UB is available to tensors.
+    ub_total_bytes: Optional[int] = None
+    #: Bytes the compiler reserves inside the partitioned UB.
+    compiler_reserved_bytes: int = 0
+    #: Hardware/runtime minimum for the SIMT DataCache partition.
+    min_datacache_bytes: Optional[int] = None
+    #: Largest static+dynamic tensor allocation that still leaves the minimum
+    #: DataCache: ``ub_total - compiler_reserved - min_datacache``.
+    max_usable_ub_bytes: Optional[int] = None
 
     def domain_spec(self, domain: PhysicalDomain) -> Optional[DomainSpec]:
         return self.domains.get(domain)
@@ -321,6 +333,15 @@ class ChipSpec:
             self.domains[d]
             for d in PhysicalDomain
             if d in self.domains and d.is_on_core_sram
+        )
+
+    @property
+    def enforces_datacache_partition(self) -> bool:
+        """``True`` on parts where UB is split with a guarded DataCache."""
+        return (
+            self.ub_total_bytes is not None
+            and self.min_datacache_bytes is not None
+            and self.max_usable_ub_bytes is not None
         )
 
 
@@ -392,9 +413,19 @@ CHIP_PROFILES: Dict[str, ChipSpec] = {
             BT=(1 * KIB, 64, 64, 32, "Bias table"),
             FB=(2 * KIB, 128, 128, 32, "Fixpipe parameter buffer"),
         ),
+        # 351x runs isomorphic SIMD/SIMT execution: the 256 KiB UB is strictly
+        # partitioned between tensor memory and the SIMT DataCache, with 8 KiB
+        # reserved by the compiler and a hardware-enforced DataCache floor of
+        # 32 KiB.  Static+dynamic allocations beyond 216 KiB push the DataCache
+        # below that floor and corrupt memory at runtime (AKA1010).
+        ub_total_bytes=256 * KIB,
+        compiler_reserved_bytes=8 * KIB,
+        min_datacache_bytes=32 * KIB,
+        max_usable_ub_bytes=216 * KIB,
         provisional=True,
         notes="Capacities extrapolated; override with --chip-profile for a "
-              "specific 351x SKU.",
+              "specific 351x SKU. UB is partitioned: at most 216 KiB for "
+              "tensors when SIMT is in use, leaving a 32 KiB DataCache.",
     ),
 }
 
@@ -489,6 +520,22 @@ class HardwareModel:
             vector_bytes=int(raw.get("vector_bytes", base.vector_bytes)),
             provisional=bool(raw.get("provisional", True)),
             notes=str(raw.get("notes", f"loaded from {Path(path).name}")),
+            ub_total_bytes=(
+                int(raw["ub_total_bytes"]) if "ub_total_bytes" in raw else base.ub_total_bytes
+            ),
+            compiler_reserved_bytes=int(
+                raw.get("compiler_reserved_bytes", base.compiler_reserved_bytes)
+            ),
+            min_datacache_bytes=(
+                int(raw["min_datacache_bytes"])
+                if "min_datacache_bytes" in raw
+                else base.min_datacache_bytes
+            ),
+            max_usable_ub_bytes=(
+                int(raw["max_usable_ub_bytes"])
+                if "max_usable_ub_bytes" in raw
+                else base.max_usable_ub_bytes
+            ),
         )
         return cls(chip=spec)
 
@@ -522,6 +569,17 @@ class HardwareModel:
     def is_event_id_in_range(self, event_id: int) -> bool:
         return 0 <= event_id <= self.chip.max_event_id
 
+    def simt_datacache_available(self, allocated_bytes: int) -> Optional[int]:
+        """DataCache bytes left after *allocated_bytes* of tensor memory.
+
+        ``DataCache = ub_total - StaticMem + DynamicMem - compiler_reserved``.
+        ``None`` on architectures that do not partition the Unified Buffer.
+        """
+        chip = self.chip
+        if chip.ub_total_bytes is None:
+            return None
+        return chip.ub_total_bytes - allocated_bytes - chip.compiler_reserved_bytes
+
     def tracked_sram_domains(self) -> Tuple[PhysicalDomain, ...]:
         return tuple(spec.domain for spec in self.chip.sram_domains())
 
@@ -535,6 +593,14 @@ class HardwareModel:
             "block_bytes": self.chip.block_bytes,
             "max_event_id": self.chip.max_event_id,
             "reserved_event_ids": sorted(self.chip.reserved_event_ids),
+            "ub_partition": {
+                "ub_total_bytes": self.chip.ub_total_bytes,
+                "compiler_reserved_bytes": self.chip.compiler_reserved_bytes,
+                "min_datacache_bytes": self.chip.min_datacache_bytes,
+                "max_usable_ub_bytes": self.chip.max_usable_ub_bytes,
+            }
+            if self.chip.enforces_datacache_partition
+            else None,
             "domains": {
                 spec.domain.value: {
                     "capacity_bytes": spec.capacity_bytes,

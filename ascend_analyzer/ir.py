@@ -102,6 +102,21 @@ class LoopInfo:
     #: a loop carry ``loop_id=None``: the trace *is* the full execution, so
     #: straight-line reasoning is exact and no back edges are needed.
     unrolled: bool = False
+    #: ``True`` when the visitor executed this loop as three peeled phases:
+    #: a straight-line head, a cyclic steady-state representative cycle and a
+    #: straight-line tail (see ``ast_visitor``).  Head/tail operations carry
+    #: ``loop_id=None``; the steady-state representatives carry this loop's
+    #: id, so the marked graph models them as a cycle with one-token back
+    #: edges while the bulk iterations they stand for stay abstract.
+    peeled: bool = False
+    #: Induction-variable value of the first steady-state representative.
+    steady_first: Optional[int] = None
+    #: How many steady-state representative iterations were emitted (the
+    #: loop's modular period, e.g. 2 for ``p = t & 1`` ping-pong parity).
+    steady_reps: int = 0
+    #: How many peeled head / tail iterations were emitted.
+    peeled_head: int = 0
+    peeled_tail: int = 0
     #: Trace indices spanned by the loop body (inclusive).
     start_index: int = 0
     end_index: int = 0
@@ -138,6 +153,9 @@ class TensorDecl:
     origin: str = "declaration"
     #: Tensors sharing a non-empty reuse group may legally overlap.
     reuse_group: Optional[str] = None
+    #: Name of the ``TBuf`` this tensor was obtained from via ``.Get()``, so
+    #: aggregate budgeting can count the buffer once instead of once per view.
+    source_buffer: Optional[str] = None
     #: Trace indices of first and last observed use; ``None`` when never used.
     first_use: Optional[int] = None
     last_use: Optional[int] = None
@@ -381,6 +399,11 @@ class KernelIR:
     loops: Dict[int, LoopInfo] = field(default_factory=dict)
     #: Folded ``constexpr`` environment, for report context.
     constants: Dict[str, int] = field(default_factory=dict)
+    #: ``TPipe::InitBuffer`` / ``LocalMemAllocator`` byte sizes, folded to
+    #: integers, by buffer name.  The memory checker sums these with tensor
+    #: declarations when budgeting architectures that partition the Unified
+    #: Buffer (351x SIMD/SIMT DataCache).
+    buffer_sizes: Dict[str, int] = field(default_factory=dict)
     #: ``True`` when the function carried ``__global__``/``__aicore__``.
     is_kernel_entry: bool = True
 
@@ -440,12 +463,15 @@ class KernelIR:
                     "id": loop.id,
                     "induction_var": loop.induction_var,
                     "trip_count": loop.trip_count,
+                    "peeled": loop.peeled,
+                    "steady_reps": loop.steady_reps,
                     "header": loop.header,
                     "location": loop.loc.to_json(),
                 }
                 for loop in self.loops.values()
             ],
             "constants": self.constants,
+            "buffer_sizes": self.buffer_sizes,
         }
 
 

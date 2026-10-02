@@ -498,7 +498,16 @@ class DeadlockChecker(Checker):
         surrounding straight-line code: inside the body, a wait that precedes
         its set is satisfied by the previous iteration, and the tokens on that
         edge are the flags the prologue primed.
+
+        Kernels with *peeled* loops are matched globally instead: their head
+        and tail iterations are straight-line code that flows flags into and
+        out of the steady-state representative cycle, so splitting the channel
+        ledger by region would pair a head-primed set with the wrong wait and
+        report a primed handshake as unprimed.  Global FIFO matching is the
+        hardware's actual semaphore semantics.
         """
+        if any(loop.peeled for loop in kernel.loops.values()):
+            return self._match_channels_globally(kernel, stats)
         edges: List[SyncEdge] = []
         for channel, entry in stats.items():
             regions = set(entry.sets_by_loop) | set(entry.waits_by_loop)
@@ -519,6 +528,41 @@ class DeadlockChecker(Checker):
                             loop_carried=loop_carried,
                         )
                     )
+        return edges
+
+    def _match_channels_globally(
+        self, kernel: KernelIR, stats: Dict[Channel, _ChannelStats]
+    ) -> List[SyncEdge]:
+        """FIFO-match whole channels across regions (peeled kernels)."""
+        edges: List[SyncEdge] = []
+        for channel, entry in stats.items():
+            sets = sorted(entry.sets, key=lambda o: o.index)
+            waits = sorted(entry.waits, key=lambda o: o.index)
+            for setter, waiter in zip(sets, waits):
+                loop_carried = waiter.index < setter.index
+                tokens = 0
+                if loop_carried:
+                    loop = (
+                        kernel.loops.get(waiter.loop_id)
+                        if waiter.loop_id is not None
+                        else None
+                    )
+                    if loop is not None:
+                        tokens = sum(
+                            1
+                            for op in entry.sets
+                            if op.index < loop.start_index
+                            and not loop.contains(op.index)
+                        )
+                edges.append(
+                    SyncEdge(
+                        setter=setter,
+                        waiter=waiter,
+                        channel=channel,
+                        tokens=tokens,
+                        loop_carried=loop_carried,
+                    )
+                )
         return edges
 
     def _prime_count(
@@ -810,6 +854,17 @@ class DeadlockChecker(Checker):
                 "topological_order": schedule,
                 "cycles": [[int(n) for n in cycle] for cycle in cycles],
                 "pipes": [pipe.value for pipe in kernel.active_pipes()],
+                "peeled_loops": [
+                    {
+                        "id": loop.id,
+                        "steady_first": loop.steady_first,
+                        "steady_reps": loop.steady_reps,
+                        "peeled_head": loop.peeled_head,
+                        "peeled_tail": loop.peeled_tail,
+                    }
+                    for loop in kernel.loops.values()
+                    if loop.peeled
+                ],
             },
         )
 

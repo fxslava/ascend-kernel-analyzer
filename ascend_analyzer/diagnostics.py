@@ -61,6 +61,8 @@ class Code(str, enum.Enum):
     STRIDE_MISALIGNED = "AKA1007"
     NEGATIVE_OFFSET = "AKA1008"
     UNKNOWN_DOMAIN = "AKA1009"
+    # 351x SIMD/SIMT DataCache headroom below the 32 KiB hardware minimum.
+    INSUFFICIENT_DATACACHE = "AKA1010"
 
     # -- 2xxx: synchronisation / pipeline ----------------------------------
     UNMATCHED_SET_FLAG = "AKA2001"
@@ -80,6 +82,11 @@ class Code(str, enum.Enum):
     SYMBOLIC_EVENT_ID = "AKA3003"
     UB_FRAGMENTATION = "AKA3004"
     REDUNDANT_BARRIER = "AKA3005"
+    # NOTE: the UB bank-conflict check is specified as "AKA3003", but that
+    # code was already assigned to SYMBOLIC_EVENT_ID when the analyzer first
+    # shipped (and the shipped tests pin it there), so the bank conflict takes
+    # the next free code in the 3xxx performance block.
+    UB_BANK_CONFLICT = "AKA3006"
 
     # -- 9xxx: analyzer infrastructure -------------------------------------
     PARSE_ERROR = "AKA9001"
@@ -99,6 +106,7 @@ CODE_TITLES: Dict[str, str] = {
     Code.STRIDE_MISALIGNED.value: "DMA stride alignment violation",
     Code.NEGATIVE_OFFSET.value: "Negative buffer offset",
     Code.UNKNOWN_DOMAIN.value: "Undetermined memory domain",
+    Code.INSUFFICIENT_DATACACHE.value: "Insufficient UB DataCache headroom (351x SIMT)",
     Code.UNMATCHED_SET_FLAG.value: "SetFlag without matching WaitFlag",
     Code.UNMATCHED_WAIT_FLAG.value: "WaitFlag without matching SetFlag",
     Code.RESERVED_EVENT_ID.value: "Reserved EVENT_ID used",
@@ -114,6 +122,7 @@ CODE_TITLES: Dict[str, str] = {
     Code.SYMBOLIC_EVENT_ID.value: "EVENT_ID not statically resolvable",
     Code.UB_FRAGMENTATION.value: "Fragmented SRAM layout",
     Code.REDUNDANT_BARRIER.value: "Redundant consecutive barrier",
+    Code.UB_BANK_CONFLICT.value: "UB bank conflict on Vector ALU",
     Code.PARSE_ERROR.value: "Source could not be parsed cleanly",
     Code.UNRESOLVED_TENSOR.value: "Tensor argument could not be resolved",
     Code.NO_KERNEL_FOUND.value: "No kernel entry point found",

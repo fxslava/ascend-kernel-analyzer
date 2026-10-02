@@ -32,6 +32,7 @@ __all__ = [
     "add",
     "mul",
     "simplify",
+    "substitute",
     "free_vars",
     "is_decidable",
     "is_z3_lowerable",
@@ -236,6 +237,31 @@ def simplify(expr: Expr) -> Expr:
 
 def add(left: Expr, right: Expr) -> Expr:
     return simplify(BinOp("+", left, right))
+
+
+def substitute(expr: Optional[Expr], name: str, value: int) -> Optional[Expr]:
+    """Replace every free variable called *name* with a constant.
+
+    Used by the loop-peeling planner to probe whether an expression is linear
+    in the induction variable: comparing ``substitute(e, 't', 0)`` against
+    ``substitute(e, 't', 1)`` and ``substitute(e, 't', 2)`` decides linearity
+    without assuming anything about the operator mix.
+    """
+    if expr is None:
+        return None
+    node = expr
+    if isinstance(node, Var):
+        return Const(value) if node.name == name else node
+    if isinstance(node, BinOp):
+        left = substitute(node.left, name, value)
+        right = substitute(node.right, name, value)
+        if left is None or right is None:
+            return None
+        return simplify(BinOp(node.op, left, right))
+    if isinstance(node, UnOp):
+        inner = substitute(node.operand, name, value)
+        return None if inner is None else simplify(UnOp(node.op, inner))
+    return node
 
 
 def mul(left: Expr, right: Expr) -> Expr:

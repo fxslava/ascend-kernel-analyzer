@@ -33,10 +33,23 @@ def ub_tensor(name: str, offset, count, pos: str = "VECIN") -> str:
     )
 
 
+# Three contiguous tiles.  Note this layout's source pair (0, 512) is a real
+# UB bank collision (16 blocks = 0 mod 8), so the Add below now warns with
+# AKA3006; it stays for memory-map geometry tests, which only read the layout.
 LAYOUT = (
     ub_tensor("a", 0, 256)
     + ub_tensor("b", 512, 256)
     + ub_tensor("c", 1024, 256)
+    + "AscendC::Add(c, a, b, 256);\n"
+)
+
+# Bank-orthogonal counterpart for verdict tests: |0 - 544| / 32 = 17 blocks
+# = 1 mod 8, so the same dual-operand Add reads distinct UB banks and the
+# kernel stays clean end to end.
+BANK_CLEAN_LAYOUT = (
+    ub_tensor("a", 0, 256)
+    + ub_tensor("b", 544, 256)
+    + ub_tensor("c", 1056, 256)
     + "AscendC::Add(c, a, b, 256);\n"
 )
 
@@ -209,7 +222,7 @@ class TestTerminalReport:
         return stream.getvalue()
 
     def test_clean_kernel_says_accepted(self):
-        text = self.render(LAYOUT)
+        text = self.render(BANK_CLEAN_LAYOUT)
         assert "ACCEPTED" in text
         assert "REJECTED" not in text
         assert "No findings" in text
@@ -298,7 +311,7 @@ class TestJsonReport:
 
     @pytest.mark.parametrize(
         "body, verdict",
-        [(LAYOUT, "accepted"), (OVERLAPPING, "rejected")],
+        [(BANK_CLEAN_LAYOUT, "accepted"), (OVERLAPPING, "rejected")],
     )
     def test_verdict(self, body, verdict):
         assert self.build(body)["verdict"] == verdict

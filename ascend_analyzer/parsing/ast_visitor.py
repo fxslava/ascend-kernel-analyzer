@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from math import gcd as _gcd
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from tree_sitter import Language, Node, Parser
 
@@ -51,7 +52,18 @@ from ..ir import (
     ScopeKind,
     TensorDecl,
 )
-from ..symbolic import BinOp, Const, Expr, dtype_size, mul, simplify, to_int
+from ..symbolic import (
+    BinOp,
+    Const,
+    Expr,
+    Var,
+    dtype_size,
+    free_vars,
+    mul,
+    simplify,
+    substitute,
+    to_int,
+)
 from .expr_eval import ConstEnv, ExpressionEvaluator, collect_define_value
 from .preprocess import PreparedSource, prepare_source, prepare_translation_unit
 
@@ -165,6 +177,30 @@ class VisitorOptions:
     #: ``p ? EVENT_ID1 : EVENT_ID0`` ping-pong selection fold to constants the
     #: pairing analysis can reason about.
     unroll_trip_limit: int = 8
+    #: How many iterations adjacent to each loop boundary the three-phase
+    #: peeling traversal may explicitly replay ("peeled head" / "peeled tail").
+    peel_window: int = 4
+    #: Largest modular period (``t & 1`` -> 2, ``t % 4`` -> 4, ...) for which
+    #: a steady-state representative cycle is emitted.  A loop whose parity
+    #: exceeds this stays symbolic rather than being mis-abstracted.
+    max_steady_period: int = 4
+
+
+@dataclass
+class _PeeledPlan:
+    """A three-phase (head / steady / tail) traversal schedule for one loop.
+
+    *Phase A* - ``head`` - and *Phase C* - ``tail`` - replay iterations with
+    the induction variable bound to concrete constants, as straight-line code.
+    *Phase B* - ``steady`` - stands in for every elided bulk iteration with a
+    minimal representative cycle of the loop's modular period; its bindings
+    are concrete constants when the trip count is known and point-bounded
+    variables (symbolic induction offsets) in the symbolic-trip-count fallback.
+    """
+
+    head: List[int]
+    steady: List[object]
+    tail: List[int]
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +675,7 @@ class _KernelWalker:
         self._parse_loop_header(node, loop)
 
         unrolled = self._maybe_unroll(loop, body)
+        plan = None if unrolled else self._plan_peeling(loop, body)
         if unrolled:
             # Replay the body once per iteration with the induction variable
             # bound to each concrete value.  The emitted operations carry no
@@ -651,6 +688,19 @@ class _KernelWalker:
                 self._env.define(loop.induction_var, start + iteration * step)
                 self._visit_loop_body(body)
                 self._env_stack.pop()
+        elif plan is not None:
+            # Three-phase traversal: a peeled straight-line head, a cyclic
+            # steady-state representative cycle (operations carry this loop's
+            # id, so the marked graph closes them with one-token back edges),
+            # and a peeled straight-line tail.
+            loop.peeled = True
+            loop.steady_first = (
+                plan.steady[0] if isinstance(plan.steady[0], int) else None
+            )
+            loop.steady_reps = len(plan.steady)
+            loop.peeled_head = len(plan.head)
+            loop.peeled_tail = len(plan.tail)
+            self._execute_peeled(loop, body, plan)
         else:
             self._loop_stack.append(loop)
             self._visit_loop_body(body)
@@ -699,6 +749,227 @@ class _KernelWalker:
             return False
         loop.unrolled = True
         return True
+
+    # -- three-phase loop peeling -------------------------------------------
+
+    def _plan_peeling(self, loop: LoopInfo, body: Optional[Node]) -> Optional[_PeeledPlan]:
+        """Plan a head / steady-state / tail traversal for a long loop.
+
+        Full unrolling explodes past ``unroll_trip_limit`` iterations, but a
+        single symbolic body pass is blind to the transient pipeline states at
+        the loop boundaries: ``if (t >= 1)`` prologue guards, ``if (t + 2 < T)``
+        epilogue guards and ``p = t & 1`` ping-pong parity all refuse to fold,
+        so the checkers see phantom operations from dead branches and symbolic
+        event ids instead of real pairings.
+
+        The plan replaces the bulk iterations with a minimal representative
+        cycle whose length is the loop's modular period (two iterations for a
+        ``t & 1`` double buffer), chosen where every prologue condition has
+        settled true and every epilogue condition has settled false, and
+        replays only the boundary iterations explicitly.  A loop with no
+        induction-dependent conditions and no parity has nothing to peel, and
+        keeps the exact single-pass treatment.
+        """
+        var = loop.induction_var
+        if not var or body is None or loop.start is None:
+            return None
+        step = loop.step or 1
+        if step <= 0 or loop.trip_count == 0:
+            return None
+        start = loop.start
+        if not re.search(rf"\b{re.escape(var)}\b", self._text(body)):
+            return None
+
+        switches, period = self._critical_points(loop, body)
+        if period > self.v.opts.max_steady_period:
+            return None
+        if not switches and period <= 1:
+            return None
+
+        window = self.v.opts.peel_window
+
+        def snap(value: int) -> int:
+            """First induction value on the loop's grid at or after *value*."""
+            return start + (-(-(value - start) // step)) * step
+
+        switches = {snap(v) for v in switches}
+
+        if loop.trip_count is None:
+            # Symbolic trip count (spec: fallback).  Phase A runs with the
+            # conservative concrete bounds that fold without knowing T; the
+            # steady state is projected at symbolic induction offsets, so the
+            # trace keeps loop-carried edges without inventing facts about how
+            # many iterations actually execute.
+            head_end = max(
+                (v for v in switches if start <= v <= start + window * step),
+                default=start,
+            )
+            head = list(range(start, head_end, step))
+            steady = [
+                Var(var, lower=value, upper=value)
+                for value in range(head_end, head_end + period * step, step)
+            ]
+            return _PeeledPlan(head=head, steady=steady, tail=[])
+
+        end = start + (loop.trip_count - 1) * step
+        reachable = {v for v in switches if start <= v <= end}
+        early = {v for v in reachable if (v - start) // step <= window}
+        late = {
+            v for v in reachable if (end - v) // step <= window and v not in early
+        }
+        if reachable - early - late:
+            # A condition flips mid-loop: the prologue/steady/epilogue model
+            # does not apply, so keep the exact symbolic treatment.
+            return None
+
+        steady_start = max(early) if early else start
+        tail_start = min(late) if late else end + step
+        if steady_start + (period - 1) * step >= tail_start:
+            return None  # no room for a whole representative cycle
+        head = list(range(start, steady_start, step))
+        tail = list(range(tail_start, end + step, step))
+        if len(head) > window or len(tail) > window:
+            return None
+        steady = list(range(steady_start, steady_start + period * step, step))
+        return _PeeledPlan(head=head, steady=steady, tail=tail)
+
+    def _critical_points(self, loop: LoopInfo, body: Node) -> Tuple[set, int]:
+        """Boundary switch points and modular period of a loop body.
+
+        *Switch points* are induction values at which some guard condition
+        changes truth value (``t >= C`` -> ``C``; ``t + k < T`` -> ``T - k``).
+        The *period* is the least common multiple of the ``t % m`` / ``t & m``
+        modular expressions in the body - 2 for standard ping-pong parity.
+        """
+        var = loop.induction_var or ""
+        switches: set = set()
+        for node in _walk(body):
+            if node.type not in {"if_statement", "conditional_expression"}:
+                continue
+            condition = node.child_by_field_name("condition")
+            if condition is None:
+                continue
+            found = self._switch_values_of(condition, var)
+            if found:
+                switches.update(found)
+        return switches, self._steady_period(body, var)
+
+    def _switch_values_of(self, condition: Node, var: str) -> Optional[set]:
+        """Induction values where a linear comparison over *var* flips.
+
+        Returns ``None`` for conditions that are constant, reference further
+        unknown variables (an unresolved trip count), or are not linear in the
+        induction variable - those are either already folded by ``_handle_if``
+        or belong to the period scan, not to boundary extraction.
+        """
+        node = condition
+        while node.type in {"parenthesized_expression", "condition_clause"}:
+            inner = next((c for c in node.named_children if c.type != "comment"), None)
+            if inner is None or inner.type in {"(", ")"}:
+                return None
+            node = inner
+        if node.type != "binary_expression":
+            return None
+        op_node = node.child_by_field_name("operator")
+        op = self._text(op_node) if op_node is not None else ""
+        if op not in {"<", "<=", ">", ">=", "==", "!="}:
+            return None
+        left = self.v._eval.evaluate(node.child_by_field_name("left"), self._env)
+        right = self.v._eval.evaluate(node.child_by_field_name("right"), self._env)
+        if left is None or right is None:
+            return None
+        diff = simplify(BinOp("-", left, right))
+        variables = free_vars(diff)
+        if var not in variables or set(variables) - {var}:
+            return None
+
+        def probe(k: int) -> Optional[int]:
+            return to_int(substitute(diff, var, k))
+
+        f0, f1, f2 = probe(0), probe(1), probe(2)
+        if f0 is None or f1 is None or f2 is None:
+            return None
+        slope, intercept = f1 - f0, f0
+        if slope == 0 or f2 - f0 != 2 * slope:
+            return None  # not linear in t (e.g. a parity mask)
+        if slope < 0:
+            # Normalise to a positive slope by negating the comparison.
+            slope, intercept = -slope, -intercept
+            op = {"<": ">", ">": "<", "<=": ">=", ">=": "<=", "==": "==", "!=": "!="}[op]
+
+        # The condition reads slope*t + intercept <op> 0 with slope > 0.
+        ceil_r = -(-(-intercept) // slope)   # ceil((-intercept) / slope)
+        floor_r = (-intercept) // slope      # floor((-intercept) / slope)
+        if op == ">=":
+            return {ceil_r}                  # false -> true at ceil_r
+        if op == ">":
+            return {floor_r + 1}
+        if op == "<":
+            return {ceil_r}                  # true -> false at ceil_r
+        if op == "<=":
+            return {floor_r + 1}
+        # Point conditions flip on at v and flip back off at v + 1.
+        if (-intercept) % slope:
+            return None
+        point = (-intercept) // slope
+        return {point, point + 1}
+
+    def _steady_period(self, body: Node, var: str) -> int:
+        """LCM of the modular periods (``t % m``, ``t & m``) in the body."""
+        period = 1
+        for node in _walk(body):
+            if node.type != "binary_expression":
+                continue
+            op_node = node.child_by_field_name("operator")
+            op = self._text(op_node) if op_node is not None else ""
+            if op not in {"&", "%"}:
+                continue
+            for var_side, const_side in (
+                (node.child_by_field_name("left"), node.child_by_field_name("right")),
+                (node.child_by_field_name("right"), node.child_by_field_name("left")),
+            ):
+                if var_side is None or const_side is None:
+                    continue
+                if var_side.type != "identifier" or self._text(var_side) != var:
+                    continue
+                modulus = self.v._eval.fold(const_side, self._env)
+                if modulus is None or modulus < 1:
+                    continue
+                if op == "%" and modulus > 1:
+                    period = period * modulus // _gcd(period, modulus)
+                elif op == "&" and modulus & (modulus + 1) == 0:
+                    # A 2^k - 1 mask: t & (2^k - 1) has period 2^k.
+                    period = period * (modulus + 1) // _gcd(period, modulus + 1)
+        return period
+
+    def _execute_peeled(self, loop: LoopInfo, body: Node, plan: _PeeledPlan) -> None:
+        """Run a planned head / steady / tail traversal of a loop body."""
+        var = loop.induction_var
+        for value in plan.head:
+            self._run_loop_iteration(body, {var: value})
+        self._loop_stack.append(loop)
+        for value in plan.steady:
+            self._run_loop_iteration(body, {var: value})
+        self._loop_stack.pop()
+        for value in plan.tail:
+            self._run_loop_iteration(body, {var: value})
+
+    def _run_loop_iteration(self, body: Node, bindings: Dict[str, object]) -> None:
+        """Visit one loop-body instance with the given induction binding.
+
+        A plain integer binding folds every induction-dependent expression in
+        the body; a :class:`~ascend_analyzer.symbolic.Var` binding (symbolic
+        trip-count fallback) keeps expressions symbolic but bounded to the
+        representative's exact value.
+        """
+        self._env_stack.append(self._env.child())
+        for name, value in bindings.items():
+            if isinstance(value, Var):
+                self._env.define_bounded(name, value.lower, value.upper)
+            else:
+                self._env.define(name, value)
+        self._visit_loop_body(body)
+        self._env_stack.pop()
 
     def _loop_header_text(self, node: Node) -> str:
         body = node.child_by_field_name("body")
@@ -971,6 +1242,7 @@ class _KernelWalker:
                 if receiver and receiver in self._buffer_positions:
                     self._assign_position(decl, self._buffer_positions[receiver])
                     self._tensor_buffers[decl.name] = receiver
+                    decl.source_buffer = receiver
                     decl.origin = "TBuf::Get"
                 return
 
@@ -1112,6 +1384,9 @@ class _KernelWalker:
         size = self.v._eval.evaluate(size_node, self._env)
         if size is not None:
             self._buffer_sizes[name] = size
+            folded = to_int(size)
+            if folded is not None:
+                self.ir.buffer_sizes[name] = folded
 
     # -- synchronisation ----------------------------------------------------
 

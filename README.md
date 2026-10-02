@@ -45,6 +45,7 @@ $ ascend-analyze vec_add.cpp --chip ascend910b
 | `AKA1005` | Allocation size misaligned | The tail block is transferred *whole*, so a ragged length silently clobbers whatever follows it. |
 | `AKA1003` | Buffer aliasing / collision | Two tensors live at the same time in one domain must be disjoint. This is where ping/pong and in/out bugs surface. |
 | `AKA1004` | Memory domain mismatch | `LocalTensor<T>` hides the address space, so handing a UB tensor to a Cube API that reads L0A type-checks in C++ and fails on hardware. |
+| `AKA1010` | Insufficient UB DataCache headroom (351x SIMT) | On 351x the 256 KiB UB is partitioned: `DataCache = 256 KiB − allocations − 8 KiB (compiler reserved)`, and the SIMT runtime requires `DataCache ≥ 32 KiB`. More than 216 KiB of tensor allocation corrupts memory at run time. |
 | `AKA1007`/`AKA1008`/`AKA1009` | Stride alignment, negative offset, undetermined domain | |
 
 ### Pipeline deadlocks and synchronisation
@@ -58,6 +59,7 @@ $ ascend-analyze vec_add.cpp --chip ascend910b
 | `AKA2003` | Reserved `EVENT_ID` 6 or 7 | The runtime owns these and may consume or raise them behind your back. |
 | `AKA2007`/`AKA2008`/`AKA2009` | Double set, out-of-range id, same-pipeline route | |
 | `AKA3001` | `PipeBarrier(PIPE_ALL)` antipattern | Warning. Drains every pipeline, discarding the overlap double buffering exists to create. The fix names the two pipelines that actually share data. |
+| `AKA3006` | UB bank conflict on Vector ALU | Warning. UB is an interleaved 8-bank structure in 32-byte blocks; a dual-operand instruction (`Add`, `Mul`, `Sub`, `Max`, `Min`, ...) whose two sources sit `8k` blocks apart reads both from the same bank and stalls the read ports. Pad one source by +32 bytes (one DaVinci block) for bank-orthogonal bases. Note: this check was specified as "AKA3003", but that code already belongs to `SYMBOLIC_EVENT_ID` and is pinned there by the shipped tests, so the bank conflict carries the next free code in the 3xxx performance block. |
 
 `ascend-analyze --list-codes` prints the full table.
 
@@ -252,6 +254,59 @@ A missing prime is reported once, as the precise root cause (`AKA2005`), rather
 than as every cycle it creates. One mistake should not produce a wall of
 findings.
 
+### Long loops: three-phase peeling and the steady state
+
+Full unrolling is exact but explodes past small trip counts, while a single
+symbolic body pass is blind to the transient states at the loop boundaries:
+`if (t >= 1)` prologue guards, `if (t + 2 < T)` epilogue guards and the
+`p = t & 1` ping-pong parity all refuse to fold, so the checkers see phantom
+operations from dead branches and symbolic event ids instead of real pairings.
+
+Loops with a known trip count above the unroll limit are therefore executed as
+three phases, after extracting the loop's **critical boundary points**:
+
+* linear guard roots — `t >= C` switches at `C`, `t + k < T` switches at
+  `T − k`, point guards (`t == C`) at `C` and `C + 1`;
+* modular periods — `t & 1`/`t % 2` give period 2 (standard double
+  buffering), and the representative cycle length is the `lcm` of all of them.
+
+**Phase A (peeled head)** replays the iterations before the last early switch
+(`t ∈ [0, max C)`, typically `{0, 1}`) with concrete induction values, so dead
+branches prune statically. **Phase B (steady state)** does *not* unroll the
+bulk: it emits a minimal representative cycle of the modular period (two
+iterations for ping-pong parity, chosen where prologue conditions have settled
+true and epilogue conditions false) whose operations carry the loop id — they
+form the cyclic subgraph of the marked graph, closed by one-token back edges.
+**Phase C (peeled tail)** replays the terminal iterations where the epilogue
+guards flip (`t ∈ [T − k, T)`), where the loop-draining `WaitFlag`s consume
+the leftover tokens.
+
+A guard that flips mid-loop fits none of the phases, so such loops keep the
+exact symbolic treatment rather than being mis-abstracted. When the trip count
+is unresolved, Phase A still runs with the bounds that fold without knowing
+`T`, and the steady state is projected at symbolic induction offsets — the
+loop-carried sync edges survive without inventing a trip count.
+
+The result: `tests/kernels/loop_peeling_long.cpp` (a four-channel pipelined
+vector kernel, `T = 512`) analyses clean in well under the 200 ms budget with
+a 32-node synchronisation graph instead of ~4 000 traced operations.
+
+### 351x SIMD/SIMT Unified Buffer budgeting
+
+The Ascend 351x runs isomorphic SIMD/SIMT execution, and its Unified Buffer is
+strictly partitioned:
+
+```
+DataCache = 256 KiB − StaticMem − DynamicMem − 8 KiB (compiler reserved)
+```
+
+Whenever the SIMT path is present — `__simt_vf__`, `__simt_callee__` or
+`asc_call_vf` appears in the translation unit — the runtime requires
+`DataCache ≥ 32 KiB`. The analyzer sums static tensor allocations and dynamic
+`TPipe::InitBuffer` extents (each storage counted once) against the profile's
+`max_usable_ub_bytes` (216 KiB) and raises `AKA1010` when the floor would be
+breached. Other profiles do not partition the UB and are unaffected.
+
 ---
 
 ## Recognised source forms
@@ -387,7 +442,7 @@ The `ascend910b` profile is the one the regression suite pins; `ascend910c` and
 ```bash
 python tests/harness.py            # the runnable harness, exits non-zero on mismatch
 python tests/harness.py --verbose  # plus the full report per fixture
-python -m pytest                   # 384 tests
+python -m pytest                   # 485 tests
 ```
 
 The harness runs every fixture and checks the findings against expectations
@@ -413,6 +468,9 @@ PASSED  all 5 fixtures match their declarations
 | `ub_overflow.cpp` | A loop-varying offset that overflows UB at iteration 24; exercises the solver's counterexample path. |
 | `domain_mismatch.cpp` | Cube "phantom type" errors: UB tensors handed to L0A-reading APIs, an illegal GM→L0B transfer. |
 | `isasi_raw.cpp` | Raw `__ubuf__` pointers, ISASI `set_flag`/`wait_flag`, and `@ascend-layout` annotations. |
+| `bank_conflict_vec.cpp` | A dual-operand `Add` whose sources sit 8 blocks (256 B) apart — same UB bank, `AKA3006` — next to a control pair skewed by one 32-byte block. |
+| `loop_peeling_long.cpp` | A four-channel pipelined kernel with `T = 512` and ping-pong parity: three-phase peeling keeps the sync graph at 32 nodes and the analysis far under 200 ms, with zero findings. |
+| `simt_ub_budget_351x.cpp` | 220 KiB of UB tensors plus `asc_call_vf` calls: fatal `AKA1010` DataCache starvation on `--chip ascend351x` (plain `AKA1001` overflow on the default 910B profile). |
 
 ---
 
@@ -428,9 +486,10 @@ PASSED  all 5 fixtures match their declarations
 * **Loop bounds** — trip counts are recovered from simple `for` headers
   (`i < N`, `i <= N`, `i += k`). Loops with a known trip count of at most 8
   whose body references the induction variable are replayed once per
-  iteration with concrete values (so `p = t & 1` and `EV(p)` fold); anything
-  larger, and countdown or `while` loops, stay symbolic with the trip count
-  unknown.
+  iteration with concrete values (so `p = t & 1` and `EV(p)` fold); larger
+  loops with induction-dependent guards or parity are executed as three
+  peeled phases (head / steady-state representative cycle / tail — see
+  above), and the rest stay symbolic with the trip count unknown.
 * **Macro expander** — conditional compilation is not evaluated (`#if` arms
   are left for tree-sitter), and token pasting, stringification and variadic
   macros are not supported. Unexpanded constructs degrade as before the
