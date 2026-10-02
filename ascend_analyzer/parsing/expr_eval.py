@@ -25,7 +25,7 @@ from tree_sitter import Node
 
 from ..symbolic import BinOp, Const, Expr, UnOp, Var, dtype_size, simplify
 
-__all__ = ["ConstEnv", "ExpressionEvaluator"]
+__all__ = ["ConstEnv", "ExpressionEvaluator", "canonical_accessor"]
 
 
 _INT_SUFFIX_RE = re.compile(r"[uUlLzZ]+$")
@@ -139,6 +139,16 @@ class ConstEnv:
         for env in reversed(chain):
             out.update(env.values)
         return out
+
+
+def canonical_accessor(text: str) -> str:
+    """Canonicalise a member access: ``a -> b`` becomes ``a->b``.
+
+    The evaluator looks names up by their source text, so anything that binds
+    a member access has to spell it the same way.  Sharing this function is
+    what keeps a binding and a lookup from disagreeing over whitespace.
+    """
+    return _ACCESSOR_WS_RE.sub(lambda m: m.group(1), text).strip()
 
 
 class ExpressionEvaluator:

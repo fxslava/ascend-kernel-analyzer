@@ -548,6 +548,10 @@ class AnalysisUnit:
     parse_error_locs: List[SourceLoc] = field(default_factory=list)
     #: Diagnostic codes silenced per line by ``@ascend-ignore`` annotations.
     suppressions: Dict[int, List[str]] = field(default_factory=dict)
+    #: Tiling fields bound by role inference rather than by a manifest, as
+    #: ``{access: value}``.  Non-empty means some layout in this unit rests on
+    #: an inference; the report says so, and so does the JSON.
+    inferred_tiling_bindings: Dict[str, int] = field(default_factory=dict)
 
     def is_suppressed(self, code: str, line: int) -> bool:
         """``True`` when an ``@ascend-ignore`` covers ``code`` at ``line``.

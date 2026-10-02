@@ -586,6 +586,10 @@ class MemoryChecker(Checker):
         """
         block = self.hw.chip.block_bytes
         banks = 8
+        # Coverage is published whether or not anything is found: a check that
+        # silently did not run looks identical to a clean kernel otherwise, and
+        # "no conflicts" then means nothing.
+        candidates = evaluated = conflicts = 0
         for op in kernel.api_calls():
             spec = lookup_api(op.name)
             if spec is None or op.pipe is not Pipe.V:
@@ -598,12 +602,15 @@ class MemoryChecker(Checker):
                 # The same tensor through both operand ports is served by the
                 # broadcast path; there is no second bank to collide with.
                 continue
+            candidates += 1
             off0, off1 = tensor0.offset_value, tensor1.offset_value
             if off0 is None or off1 is None:
                 continue  # unresolved layout; _check_extent_known owns that
+            evaluated += 1
             delta = abs(off0 - off1) // block % banks
             if delta != 0:
                 continue
+            conflicts += 1
             bank = off0 // block % banks
             self.diags.add(
                 Code.UB_BANK_CONFLICT,
@@ -627,6 +634,18 @@ class MemoryChecker(Checker):
                 bank=bank,
                 delta_blocks=abs(off0 - off1) // block,
             )
+
+        self.ctx.publish(
+            f"bank_conflict_coverage::{kernel.name}",
+            {
+                # Dual-operand vector reads that could collide at all.
+                "candidates": candidates,
+                # Of those, the ones whose two offsets both resolved, so the
+                # check actually reached a verdict.
+                "evaluated": evaluated,
+                "conflicts": conflicts,
+            },
+        )
 
     @staticmethod
     def _dual_source_tensors(

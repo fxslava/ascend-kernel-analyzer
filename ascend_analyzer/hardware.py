@@ -204,6 +204,9 @@ ADDRESS_SPACE_TO_DOMAIN: Mapping[str, PhysicalDomain] = {
     "__bt__": PhysicalDomain.BT,
     "__fbuf__": PhysicalDomain.FB,
     "__gm__": PhysicalDomain.GM,
+    # The v3 SIMD/SIMT vector-function model addresses the Unified Buffer as
+    # plain "local memory"; 21 files in the production fleet spell it this way.
+    "__local_mem__": PhysicalDomain.UB,
 }
 
 #: Default ``TPosition`` to assume for a bare address-space qualifier.

@@ -63,6 +63,10 @@ class AnalyzerOptions:
     #: those loads and lets the layout - and with it the alignment, aliasing and
     #: bank-conflict checks - resolve for that configuration.
     tiling_values: Dict[str, int] = field(default_factory=dict)
+    #: Infer values for unresolved tiling-struct fields from the role each
+    #: plays at its call sites (see
+    #: :meth:`~ascend_analyzer.parsing.ast_visitor.ASTVisitor._infer_tiling_roles`).
+    infer_tiling_roles: bool = False
 
 
 @dataclass
@@ -153,6 +157,7 @@ class KernelAnalyzer:
                 analyze_all_functions=self.options.all_functions,
                 max_ops=self.options.max_ops,
                 tiling_values=dict(self.options.tiling_values),
+                infer_tiling_roles=self.options.infer_tiling_roles,
             ),
         )
 

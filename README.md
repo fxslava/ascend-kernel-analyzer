@@ -105,10 +105,61 @@ ascend-analyze kernel.cpp --format json -o findings.json
 
 # Standalone HTML report with a proportional memory map
 ascend-analyze kernel.cpp --html report.html
+
+# Record today's findings, then gate on regressions only
+ascend-analyze csrc/ --write-baseline baseline.json --baseline-root csrc
+ascend-analyze csrc/ --baseline baseline.json --quiet
+
+# Resolve tiling-dependent layouts from a mined manifest, or by role
+ascend-analyze kernel.cpp --tiling-data tilings.json:default
+ascend-analyze kernel.cpp --infer-tiling-roles
 ```
 
 Exit codes: `0` clean, `1` fatal findings, `2` warnings under
-`--warnings-as-errors`, `3` usage or I/O error.
+`--warnings-as-errors`, `3` usage or I/O error. A baselined run computes its
+verdict — and therefore its exit code — on the regressions only, so an adopted
+backlog does not keep the gate red.
+
+### Baselines
+
+`--write-baseline` records every current finding; `--baseline` suppresses those
+and reports only what is new. A finding is identified by its file, its code and
+its message, deliberately **not** by its line: inserting a comment above a
+kernel shifts every line below it, and treating that as a hundred new findings
+would make the baseline useless after the first unrelated edit. A code that
+fires *more* often than the baseline recorded reports the surplus, so a second
+instance of a known problem is not hidden by the first.
+
+Paths are normalised, and `--baseline-root` records them relative to a
+directory, so one baseline matches a tree spelled `D:/Projects/x`,
+`/mnt/d/Projects/x` or `/d/Projects/x`.
+
+### Tiling-dependent layouts
+
+A kernel that sizes its buffers from a host tiling struct resolves no offsets
+at all without that struct, which silently disables every offset-dependent
+check. Two options close the gap:
+
+* `--tiling-data PATH[:KEY]` binds concrete field values from a JSON manifest —
+  the shapes a test suite already pins.
+* `--infer-tiling-roles` infers values from the **role** each field plays at
+  its call sites, for the fields no manifest supplies.
+
+Role inference reads context, never names. A field that reaches the extent
+argument of `InitBuffer`/`InitQueue` is a buffer extent and takes the
+architecture-minimal valid dimension (16 for a Cube fractal, 64 for a vector
+tile); one that reaches the parameter block of `DataCopy`/`DataCopyPad` is a
+stride and takes the 32-byte DaVinci block; one compared against
+`GetBlockIdx()` is a core count and is left symbolic. The walk runs from the
+call site backwards through names assigned exactly once, because production
+kernels unpack the struct in one method and size their buffers in another.
+
+Three restrictions keep an inference from doing harm: only fields reached
+through a verified tiling pointer are touched, a supplied or source-derived
+value always wins, and a field used in two disagreeing roles is left symbolic.
+The values are inferred, so the flag is off by default — an inference should
+never be the reason a kernel is rejected. Whatever was inferred is reported on
+the unit, so every conclusion resting on one is visible.
 
 As a library:
 
@@ -188,7 +239,68 @@ so the visitor can recover each declaration's address space.
 The rewrite is comment- and string-aware. Rewriting `__ubuf__` *inside* a block
 comment would inject a `*/` that closes the comment early and spill prose into
 the token stream — and kernel files routinely mention these qualifiers in their
-header comments.
+header comments. Operands of `#ifdef`/`#ifndef`/`#undef` are left alone too:
+`#ifndef __force_inline__` is a guard testing whether a macro is defined, and
+rewriting that name would leave the directive without an identifier.
+
+### Parsing: CCE declaration decoration
+
+Three further constructs used to turn a whole translation unit into a single
+`ERROR` node. Each is blanked to spaces of the same byte length, so line and
+column coordinates are untouched:
+
+* the **CCE location qualifier**, `__forceinline__ [host, aicore] void f()`.
+  `tree-sitter-cpp` reads the `[` as a lambda capture and never recovers. It is
+  told apart from an array subscript (`buf[host]`), a C++ attribute
+  (`[[nodiscard]]`) and a lambda by three tests: a qualifier is never glued to
+  the preceding token, never doubled, and is always followed by something that
+  starts a type. A list of two or more names skips the first test, since a comma
+  inside a subscript is not valid C++.
+* an object-like macro that expands to **nothing but decoration**, such as
+  `#define HOST_DEVICE __forceinline__ [host, aicore]`. The expander blanks the
+  `#define` but leaves every use standing, and a bare identifier ahead of a
+  constructor derails the rest of the file. Such a macro is detected from its
+  body, not from a hard-coded name list, and blanked at each use.
+* `#ifdef __cplusplus` guarding `extern "C" {`, where the brace opens inside one
+  preprocessor block and closes inside another. `tree-sitter-cpp` requires each
+  block to be brace-balanced. Resolving the guard is exact rather than
+  approximate: this analyzer always parses as C++, so `__cplusplus` *is*
+  defined, the directive lines are inert, and blanking them leaves
+  `extern "C" { ... }` as ordinary balanced code.
+
+Two more constructs come from headers that are **not in the tree at all** —
+Catlass and the CANN tiling-key DSL are external dependencies, so their
+`#define`s can never be found and the body-based test above cannot classify
+them. Both rules are therefore *positional*, keyed on where the identifier
+sits rather than on what it is called:
+
+* a bare ALL-CAPS identifier **alone on its own line** at a declaration
+  boundary, or **directly in front of** `struct`/`class`/`template`/a type
+  keyword. No such line is valid C++ on its own, so either it is decoration —
+  and blanking it fixes the parse — or it expands to a whole declaration, which
+  was already unparseable. `CATLASS_DEVICE` decorates 42 files this way.
+* a **multi-line** ALL-CAPS macro invocation used as a statement, which is how
+  `ASCENDC_TPL_SEL(...)` writes a tiling-key table. Its argument list is not
+  valid C++ even as an expression. Only the multi-line form is blanked: a
+  one-line `FOO(a, b);` parses as an ordinary declaration, and a `)` followed
+  by `{` is a definition whose body is left intact, so `TORCH_LIBRARY` blocks
+  survive.
+
+Macro expansion handles four more cases that cascaded the same way:
+
+* a **variadic** `#define M(...)`, whose `__VA_ARGS__` was never substituted;
+* **stringification** — `GetOpApiFuncAddr(#aclCreateTensor)` left a `#` reading
+  as a directive in mid-statement, which alone accounted for thousands of error
+  lines in `torch_binding.cpp`;
+* an **operator token passed as an argument** — `UNARY_OP(+)` came out as the
+  ill-formed `operator (+)`, because arguments are parenthesised to protect
+  precedence;
+* a **single-token argument**, which was parenthesised for the same reason and
+  so produced `(SCFABlockCube)<ARGS>` in a type position.
+
+The last two share one rule: parentheses protect *precedence within an
+expression*. An argument that is not an expression, or that is a single token,
+has no precedence to protect, so it goes in bare.
 
 ### Memory verification: satisfiability, not guesswork
 
@@ -530,13 +642,23 @@ PASSED  all 5 fixtures match their declarations
   loops with induction-dependent guards or parity are executed as three
   peeled phases (head / steady-state representative cycle / tail — see
   above), and the rest stay symbolic with the trip count unknown.
-* **Macro expander** — conditional compilation is not evaluated (`#if` arms
-  are left for tree-sitter), and token pasting, stringification and variadic
-  macros are not supported. Unexpanded constructs degrade as before the
-  expander existed.
+* **Macro expander** — conditional compilation is not evaluated, with one
+  exception: an `#ifdef __cplusplus` guard is resolved, because this analyzer
+  always parses as C++. Other `#if` arms are left for tree-sitter.
+  Token pasting, stringification and variadic macros are supported.
+* **SFINAE template parameters** — `tree-sitter-cpp` cannot parse
+  `template <class T, typename std::enable_if<...>::type* = nullptr>`, even in
+  its simplest one-line form. Headers in the `tla/` style therefore keep a
+  small residue of `ERROR` nodes, one per constrained declaration. The failure
+  no longer *cascades* — the rest of the file parses — and a type constraint
+  carries nothing the analyzer models, so no finding depends on it.
 * **TPipe layout synthesis** — buffers are bump-allocated per domain in
   `InitBuffer` program order. A buffer without a visible `InitBuffer` size
-  keeps a symbolic extent.
+  keeps a symbolic extent, **and blocks its whole domain**: everything the
+  allocator hands out after it sits at an offset that cannot be known, so no
+  later buffer in that domain gets a concrete base. That is what
+  `--infer-tiling-roles` exists to unblock when the missing size is a tiling
+  field.
 * **Flag depth** — the hardware event counter is modelled as an unbounded
   semaphore; `AKA2007` warns about double-sets but no exact saturation depth is
   enforced.

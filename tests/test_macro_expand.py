@@ -65,7 +65,7 @@ class TestFunctionMacros:
         exp = expand(source)
         assert exp.stats["expansions"] == 1
         expanded = [l for l in exp.text.splitlines() if "do {" in l]
-        assert expanded == ["    do { f(((7))); g(); } while (0);"]
+        assert expanded == ["    do { f((7)); g(); } while (0);"]
 
     def test_nested_event_selector_expands_inside_stage_macro(self):
         source = (
@@ -78,8 +78,8 @@ class TestFunctionMacros:
         # Standard cpp substitution parenthesises at every level, so the
         # selector text comes out heavily wrapped; what matters is that the
         # ternary is inline and no EV( call remains for the parser to choke on.
-        assert "(((((0))) ? EVENT_ID1 : EVENT_ID0))" in line
-        assert "(((((1))) ? EVENT_ID1 : EVENT_ID0))" in line
+        assert "((0) ? EVENT_ID1 : EVENT_ID0)" in line
+        assert "((1) ? EVENT_ID1 : EVENT_ID0)" in line
         assert "EV(" not in line
 
     def test_expansion_lines_map_back_to_the_invocation_line(self):
@@ -94,8 +94,8 @@ class TestFunctionMacros:
         out_lines = exp.text.splitlines()
         # The multi-line define is blanked; the invocation line carries the
         # whole expansion and maps back to original line 4.
-        invocation = next(i for i, l in enumerate(out_lines) if "one(((9)))" in l)
-        assert "two(((9)))" in out_lines[invocation]
+        invocation = next(i for i, l in enumerate(out_lines) if "one((9))" in l)
+        assert "two((9))" in out_lines[invocation]
         assert exp.line_origins[invocation] == 4
 
     def test_invocation_before_definition_is_not_expanded(self):
@@ -106,7 +106,7 @@ class TestFunctionMacros:
         )
         exp = expand(source)
         assert "EARLY(1);" in exp.text          # before the define: untouched
-        assert "later(((2)))" in exp.text       # after the define: expanded
+        assert "later((2))" in exp.text       # after the define: expanded
 
     def test_undef_retires_a_macro(self):
         source = (
@@ -116,7 +116,7 @@ class TestFunctionMacros:
             "void b() { G(2); }\n"
         )
         exp = expand(source)
-        assert "g(((1)))" in exp.text
+        assert "g((1))" in exp.text
         assert "G(2);" in exp.text
 
     def test_member_and_qualified_names_are_not_expanded(self):
@@ -134,7 +134,7 @@ class TestFunctionMacros:
     def test_self_referential_macro_terminates(self):
         source = "#define LOOP(x) LOOP((x)) f((x))\nvoid k() { LOOP(1); }\n"
         exp = expand(source)  # must not raise or hang
-        assert "f(((1)))" in exp.text
+        assert "f((1))" in exp.text
 
     def test_macro_names_inside_comments_and_strings_are_left_alone(self):
         source = (

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from .analyzer import AVAILABLE_CHECKERS, TOOL_VERSION, AnalyzerOptions, KernelAnalyzer
+from .baseline import Baseline, BaselineError, build_baseline_document
 from .diagnostics import CODE_TITLES
 from .hardware import CHIP_PROFILES, PhysicalDomain
 from .report.html_report import build_html_report
@@ -119,6 +120,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="cap on tracked operations per kernel (default: %(default)s)",
     )
     analysis.add_argument(
+        "--infer-tiling-roles",
+        action="store_true",
+        help=(
+            "infer values for tiling-struct fields no manifest supplies from "
+            "the role each plays at its call sites: an InitBuffer extent gets "
+            "the architecture-minimal dimension (16 Cube / 64 Vector), a "
+            "DataCopy stride gets the 32-byte block, and a field compared "
+            "with GetBlockIdx() is left symbolic. Unblocks the TPipe layout, "
+            "and with it AKA3006, on queue-managed kernels"
+        ),
+    )
+    analysis.add_argument(
         "--tiling-data", metavar="PATH[:KEY]",
         help=(
             "bind tiling-struct fields from a JSON manifest, so layouts that "
@@ -174,6 +187,26 @@ def build_parser() -> argparse.ArgumentParser:
     output.add_argument(
         "--list-codes", action="store_true",
         help="list every diagnostic code and exit",
+    )
+
+    gate = parser.add_argument_group("CI gate")
+    gate.add_argument(
+        "--baseline", type=Path, metavar="FILE",
+        help=(
+            "suppress findings recorded in FILE and report only regressions; "
+            "the verdict and the exit code are computed on what is left"
+        ),
+    )
+    gate.add_argument(
+        "--write-baseline", type=Path, metavar="FILE",
+        help="record this run's findings as a baseline in FILE and exit 0",
+    )
+    gate.add_argument(
+        "--baseline-root", type=Path, metavar="DIR",
+        help=(
+            "record and match baseline paths relative to DIR, so a baseline "
+            "is portable between checkouts and between path spellings"
+        ),
     )
 
     parser.add_argument(
@@ -291,6 +324,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 warnings_as_errors=args.warnings_as_errors,
                 honour_inline_ignores=not args.ignore_inline_pragmas,
                 tiling_values=_load_tiling_values(args.tiling_data),
+                infer_tiling_roles=args.infer_tiling_roles,
             )
         )
     except (KeyError, ValueError, OSError) as exc:
@@ -313,7 +347,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("error: no analyzable sources found", file=sys.stderr)
         return _EXIT_USAGE
 
+    if args.write_baseline is not None:
+        document = build_baseline_document(
+            (d for r in results for d in r.diagnostics),
+            root=args.baseline_root,
+            chip=args.chip,
+            tool_version=TOOL_VERSION,
+        )
+        try:
+            args.write_baseline.write_text(
+                json.dumps(document, indent=2, sort_keys=False) + chr(10),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_USAGE
+        counts = document["counts"]
+        print(
+            f"baseline written to {args.write_baseline}: "
+            f"{counts['findings']} distinct findings, "
+            f"{counts['occurrences']} occurrences"
+        )
+        return 0
+
+    baselined_total = 0
+    if args.baseline is not None:
+        try:
+            baseline = Baseline.load(args.baseline)
+        except BaselineError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_USAGE
+        if args.baseline_root is not None:
+            baseline.root = args.baseline_root
+        for result in results:
+            kept, covered = baseline.partition(result.diagnostics)
+            result.diagnostics = kept
+            result.suppressed.extend(covered)
+            baselined_total += len(covered)
+
     exit_code = _emit(args, results)
+    if args.baseline is not None and not args.quiet and args.format != "json":
+        print(
+            f"  {baselined_total} finding(s) suppressed by baseline "
+            f"{args.baseline}"
+        )
     return exit_code
 
 

@@ -154,6 +154,9 @@ class FunctionMacro:
     body: str
     #: 1-based line of the ``#define`` in the merged text.
     define_line: int
+    #: ``True`` for ``#define M(...)`` / ``#define M(a, ...)``.  Trailing
+    #: arguments are then bound to ``__VA_ARGS__`` rather than to a parameter.
+    variadic: bool = False
     #: 1-based line of the ``#undef``, when the macro was retired.
     undef_line: Optional[int] = None
 
@@ -365,8 +368,21 @@ def _collect_directives(
                         for p in params_text.strip("()").split(",")
                         if p.strip()
                     )
+                    # ``#define TLA_REQUIRES(...)`` names no parameter; its
+                    # arguments arrive through ``__VA_ARGS__``.  Treating the
+                    # ``...`` as an ordinary parameter left ``__VA_ARGS__``
+                    # standing in the body, and the half-expanded
+                    # ``std::enable_if<(__VA_ARGS__)>`` took the whole
+                    # enclosing header down with it.
+                    variadic = bool(params) and params[-1] == "..."
+                    if variadic:
+                        params = params[:-1]
                     functions[name] = FunctionMacro(
-                        name=name, params=params, body=body, define_line=line_no
+                        name=name,
+                        params=params,
+                        body=body,
+                        define_line=line_no,
+                        variadic=variadic,
                     )
                 else:
                     objects[name] = body
@@ -380,6 +396,7 @@ def _collect_directives(
                     params=macro.params,
                     body=macro.body,
                     define_line=macro.define_line,
+                    variadic=macro.variadic,
                     undef_line=line_no,
                 )
             blank.add(line_no)
@@ -444,6 +461,51 @@ def _split_arguments(text: str) -> List[str]:
     return [a.strip() for a in args]
 
 
+#: Punctuation that can make up an operator token passed as a macro argument.
+_OPERATOR_CHARS = frozenset("+-*/%^&|~!<>=,[]")
+
+#: A single token - a plain or qualified identifier, or an integer literal.
+#: Parentheses around one are never needed and are sometimes fatal: a type
+#: argument comes out as ``(SCFABlockCube)<TEMPLATE_ARGS>``, and a macro name
+#: as ``(GEN_TRAIT_TYPE)(Q)``, neither of which is C++.
+_SINGLE_TOKEN_RE = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*|[0-9]+[uUlL]*)$")
+
+
+def _needs_parentheses(arg: str) -> bool:
+    """``True`` when an argument is a compound expression needing protection.
+
+    Precedence protection matters only for an argument built from more than
+    one token.  Wrapping a lone identifier changes nothing where it is an
+    expression and breaks it where it is a type or a macro name.
+    """
+    stripped = arg.strip()
+    if not stripped:
+        return False
+    return not _SINGLE_TOKEN_RE.match(stripped)
+
+
+def _is_operator_argument(arg: str) -> bool:
+    """``True`` when an argument is an operator token rather than an expression.
+
+    ``TLA_UNARY_OP(+)`` passes the ``+`` itself, to be planted both inside
+    ``C<(OP t)>`` and after the ``operator`` keyword.  Wrapping it in the
+    usual protective parentheses yields ``operator (+)``, which is not C++ at
+    all, and that error swallows every declaration after it.  Parentheses
+    guard operator precedence *within an expression*; an argument that is not
+    an expression has no precedence to guard.
+    """
+    stripped = arg.strip()
+    if not stripped:
+        return False
+    return all(ch in _OPERATOR_CHARS for ch in stripped)
+
+
+def _as_string_literal(arg: str) -> str:
+    """Render a macro argument as the string literal ``#arg`` produces."""
+    escaped = arg.strip().replace(chr(92), chr(92) * 2).replace('"', chr(92) + '"')
+    return '"' + escaped + '"'
+
+
 def _substitute_param(text: str, pattern: re.Pattern, arg: str) -> str:
     """Replace every occurrence of one parameter, honouring ``##`` adjacency.
 
@@ -452,14 +514,24 @@ def _substitute_param(text: str, pattern: re.Pattern, arg: str) -> str:
     parentheses used everywhere else would make the result ill-formed:
     ``PIPE_##pipe`` has to become ``PIPE_V``, never ``PIPE_##(V)``.
     """
+    bare_everywhere = _is_operator_argument(arg) or not _needs_parentheses(arg)
     pieces: List[str] = []
     cursor = 0
     for match in pattern.finditer(text):
         before = text[: match.start()].rstrip(" \t")
         after = text[match.end() :].lstrip(" \t")
         pasted = before.endswith("##") or after.startswith("##")
-        pieces.append(text[cursor : match.start()])
-        pieces.append(arg if pasted else f"({arg})")
+        # ``#param`` stringifies.  Left unexpanded the ``#`` reads as the start
+        # of a preprocessor directive in the middle of a statement, and
+        # ``GetOpApiFuncAddr(#aclCreateTensor)`` took thousands of lines of
+        # ``torch_binding.cpp`` down with it.
+        stringified = not pasted and before.endswith("#")
+        if stringified:
+            pieces.append(text[cursor : len(before) - 1])
+            pieces.append(_as_string_literal(arg))
+        else:
+            pieces.append(text[cursor : match.start()])
+            pieces.append(arg if (pasted or bare_everywhere) else f"({arg})")
         cursor = match.end()
     pieces.append(text[cursor:])
     return "".join(pieces)
@@ -485,7 +557,12 @@ def _apply_pastes(text: str) -> str:
     return "".join(pieces)
 
 
-def _substitute(body: str, params: Sequence[str], args: Sequence[str]) -> str:
+def _substitute(
+    body: str,
+    params: Sequence[str],
+    args: Sequence[str],
+    variadic: bool = False,
+) -> str:
     """Replace parameter occurrences with arguments, then paste.
 
     Arguments are parenthesised to keep operator precedence, except where the
@@ -496,6 +573,13 @@ def _substitute(body: str, params: Sequence[str], args: Sequence[str]) -> str:
         if not param:
             continue
         out = _substitute_param(out, re.compile(rf"\b{re.escape(param)}\b"), arg)
+    if variadic:
+        # The body decides whether the pack needs parentheses, as
+        # ``std::enable_if<(__VA_ARGS__)>`` does, so it goes in bare.
+        rest = ", ".join(a for a in args[len(params):] if a)
+        out = re.sub(
+            r"\b__VA_ARGS__\b", rest.replace(chr(92), chr(92) * 2), out
+        )
     return _apply_pastes(out)
 
 
@@ -590,7 +674,9 @@ def _expand_inline(
         args = _split_arguments(text[probe + 1 : close])
         if len(args) < len(macro.params):
             args += [""] * (len(macro.params) - len(args))
-        substituted = _substitute(macro.body, macro.params, args)
+        substituted = _substitute(
+            macro.body, macro.params, args, variadic=macro.variadic
+        )
         pieces.append(text[cursor : match.start()])
         pieces.append(
             _expand_inline(substituted, functions, active + (name,),
@@ -742,7 +828,9 @@ def expand_macros(source: str, base_dir: Optional[Path] = None) -> MacroExpansio
         args = _split_arguments(text[probe + 1 : close])
         if len(args) < len(macro.params):
             args += [""] * (len(macro.params) - len(args))
-        substituted = _substitute(macro.body, macro.params, args)
+        substituted = _substitute(
+            macro.body, macro.params, args, variadic=macro.variadic
+        )
         replacement = _expand_inline(
             substituted, functions, (name,), line, stats
         )

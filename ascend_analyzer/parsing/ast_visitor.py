@@ -67,7 +67,12 @@ from ..symbolic import (
     substitute,
     to_int,
 )
-from .expr_eval import ConstEnv, ExpressionEvaluator, collect_define_value
+from .expr_eval import (
+    ConstEnv,
+    ExpressionEvaluator,
+    canonical_accessor,
+    collect_define_value,
+)
 from .preprocess import PreparedSource, prepare_source, prepare_translation_unit
 
 __all__ = ["ASTVisitor", "parse_source", "parse_file", "VisitorOptions"]
@@ -208,6 +213,35 @@ def _core_view_of_condition(
     view = _CORE_PREDICATES[match.group("name")]
     return view.complement if match.group("not") else view
 
+
+#: A cast whose target type names a tiling struct.  This is what identifies a
+#: tiling pointer; the name of the variable it lands in is never consulted.
+_TILING_CAST_RE = re.compile(
+    r"(?:reinterpret_cast|static_cast|const_cast)\s*<[^>]*Tiling\w*\s*\*"
+    r"|\(\s*(?:\w+\s+|/\*\w+\*/\s+)*\w*Tiling\w*\s*\*\s*\)",
+    re.IGNORECASE,
+)
+
+#: The core index, which marks a field as a core-grid bound rather than an
+#: extent.
+_CORE_INDEX_RE = re.compile(r"\bGet(?:Block|SubBlock)(?:Idx|Num)\s*\(")
+
+#: APIs whose trailing parameter block carries the DMA strides and gaps.
+_DMA_APIS = frozenset({"DataCopy", "DataCopyPad"})
+#: ``DataCopy(dst, src, count, params)`` - the parameter block is argument 3.
+_DMA_PARAMS_INDEX = 3
+#: An aggregate whose type names a DMA parameter block.
+_DMA_PARAMS_RE = re.compile(r"\bDataCopy\w*Params\b|\bNd2NzParams\b")
+
+#: Architecture-minimal valid extents, in the units ``InitBuffer`` takes.
+#: The Cube unit addresses L1/L0 in 16-wide fractals; the Vector unit works in
+#: 64-element tiles over UB.
+_CUBE_MIN_FRACTAL = 16
+_VECTOR_MIN_TILE = 64
+#: Domains the Cube unit addresses.
+_CUBE_DOMAINS = frozenset(
+    {PhysicalDomain.L1, PhysicalDomain.L0A, PhysicalDomain.L0B, PhysicalDomain.L0C}
+)
 
 #: Receiver spellings a kernel uses to reach its tiling struct.
 _TILING_RECEIVERS = (
@@ -355,6 +389,12 @@ class VisitorOptions:
     unroll_trip_limit: int = 8
     #: Concrete tiling-struct field values to bind, as ``{field: value}``.
     tiling_values: Dict[str, int] = field(default_factory=dict)
+    #: Infer values for unresolved tiling-struct fields from the *role* each
+    #: one plays at its call sites (see
+    #: :meth:`ASTVisitor._infer_tiling_roles`).  Off by default: the values
+    #: are inferred, and an inference must never be the reason a kernel is
+    #: rejected.
+    infer_tiling_roles: bool = False
     #: How many iterations adjacent to each loop boundary the three-phase
     #: peeling traversal may explicitly replay ("peeled head" / "peeled tail").
     peel_window: int = 4
@@ -405,6 +445,8 @@ class ASTVisitor:
         self._parser = _make_parser()
         self._eval = ExpressionEvaluator(self._source_bytes)
         self._global_env = ConstEnv()
+        #: Tiling fields bound by role inference, as ``{access text: value}``.
+        self._inferred_tiling: Dict[str, int] = {}
         #: Small scalar helper functions (``event_t ev(int p)``) whose body is
         #: a single ``return <expr>;``, for constexpr-style event-id folding.
         #: Maps name -> (parameter names, returned expression node).
@@ -443,6 +485,12 @@ class ASTVisitor:
         self._collect_helper_functions(root)
         self._collect_scalar_members(root)
         self._collect_pipe_buffers(root)
+        if self.opts.infer_tiling_roles:
+            # Between the two buffer phases: inference needs each
+            # buffer's TPosition, and the sizing phase needs the values
+            # inference supplies.
+            self._infer_tiling_roles(root)
+        self._size_pipe_buffers(root)
         self._collect_call_graph(root)
         unit.constants = dict(self._global_env.flatten())
         unit.suppressions = {
@@ -480,6 +528,9 @@ class ASTVisitor:
                 SourceLoc(file=self.prepared.path, line=1),
                 remediation=hint,
             )
+        # Whatever the heuristic had to invent is recorded on the unit, so a
+        # reader can see exactly which fields a layout conclusion rests on.
+        unit.inferred_tiling_bindings = dict(self._inferred_tiling)
         return unit
 
     # -- shared helpers used by the per-kernel walker -----------------------
@@ -633,6 +684,276 @@ class ASTVisitor:
                 self._global_env.define(f"{receiver}.{field_name}", value)
             self._global_env.define(field_name, value)
 
+    # -- tiling role inference ----------------------------------------------
+
+    def _tiling_pointers(self, root: Node) -> Set[str]:
+        """Variables that demonstrably hold a pointer to a tiling struct.
+
+        Identified by the *cast that produces them*, not by their name::
+
+            __gm__ MlaTilingData *tilingData =
+                reinterpret_cast<__gm__ MlaTilingData *>(tiling);
+
+        A declaration or assignment whose initialiser casts to a type matching
+        :data:`_TILING_CAST_RE` binds its target.  The conventional
+        spellings in :data:`_TILING_RECEIVERS` are accepted too, because the
+        ``GET_TILING_DATA`` macro produces them with no visible cast.
+
+        Restricting inference to this set is what keeps it away from locals,
+        loop indices and macros: nothing outside it is ever given a value.
+        """
+        found: Set[str] = set(_TILING_RECEIVERS)
+        for node in _walk(root):
+            if node.type == "declaration":
+                for declarator in node.children_by_field_name("declarator"):
+                    if declarator.type != "init_declarator":
+                        continue
+                    name_node = _declarator_identifier(declarator)
+                    value = declarator.child_by_field_name("value")
+                    if name_node is None or value is None:
+                        continue
+                    if _TILING_CAST_RE.search(self.text(value)):
+                        found.add(self.text(name_node))
+            elif node.type == "assignment_expression":
+                left = node.child_by_field_name("left")
+                right = node.child_by_field_name("right")
+                if left is None or right is None:
+                    continue
+                if left.type == "identifier" and _TILING_CAST_RE.search(
+                    self.text(right)
+                ):
+                    found.add(self.text(left))
+        return found
+
+    def _enclosing_call(self, node: Node) -> Optional[Tuple[str, int, Node]]:
+        """``(callee, argument index, call node)`` for the call containing *node*.
+
+        The index is the position of the top-level argument the node sits
+        inside, so a member access buried in a nested aggregate initialiser is
+        still attributed to the argument it belongs to.
+        """
+        parent = node.parent
+        while parent is not None:
+            if parent.type == "call_expression":
+                for index, arg in enumerate(_argument_nodes(parent)):
+                    # Compare against the access itself: walking up leaves the
+                    # argument_list as the call's child, and its own start is
+                    # the '(', which precedes every argument.
+                    if arg.start_byte <= node.start_byte < arg.end_byte:
+                        func = parent.child_by_field_name("function")
+                        callee = (
+                            _callee_base_name(self, func) if func is not None else ""
+                        )
+                        return callee, index, parent
+                return None
+            parent = parent.parent
+        return None
+
+    def _is_core_grid_use(self, node: Node) -> bool:
+        """``True`` when the access is compared against the core index.
+
+        ``if (tilingData->coreNum <= GetBlockIdx()) return;`` partitions work
+        across cores.  Such a field counts cores, so giving it a tile extent
+        would not resolve a layout - it would invent a wrong one.
+        """
+        parent = node.parent
+        depth = 0
+        while parent is not None and depth < 4:
+            if parent.type in {"binary_expression", "conditional_expression"}:
+                if _CORE_INDEX_RE.search(self.text(parent)):
+                    return True
+            parent = parent.parent
+            depth += 1
+        return False
+
+    def _buffer_role_value(self, call: Node) -> int:
+        """The minimal valid extent for the buffer an ``InitBuffer`` sizes.
+
+        A Cube-resident buffer is addressed in 16-wide fractals, a
+        vector-resident one in 64-element tiles.  The value is deliberately
+        *minimal*: it only has to make the bump allocator in
+        :meth:`_synthesize_tpipe_layout` yield concrete, distinct offsets so
+        the offset-dependent checks can run at all.  A minimal extent cannot
+        manufacture an SRAM overflow, which a guessed large one could.
+        """
+        args = _argument_nodes(call)
+        if not args:
+            return _VECTOR_MIN_TILE
+        name = _leading_identifier(self.text(args[0]))
+        buffer = self._pipe_buffers.get(name or "")
+        if buffer is None:
+            return _VECTOR_MIN_TILE
+        domain = self.hw.domain_of(buffer.position)
+        return _CUBE_MIN_FRACTAL if domain in _CUBE_DOMAINS else _VECTOR_MIN_TILE
+
+    def _tiling_aliases(
+        self, root: Node, pointers: Set[str]
+    ) -> Dict[str, Set[str]]:
+        """``{name: tiling accesses that flow into it}`` for single assignments.
+
+        A name written more than once anywhere in the unit is excluded: it may
+        hold either value where it is used, so attributing a role through it
+        would be guesswork.
+        """
+        writes: Dict[str, List[Node]] = defaultdict(list)
+        for node in _walk(root):
+            if node.type == "assignment_expression":
+                left = node.child_by_field_name("left")
+                right = node.child_by_field_name("right")
+                operator = node.child_by_field_name("operator")
+                if left is None or right is None:
+                    continue
+                if operator is not None and self.text(operator) != "=":
+                    continue  # compound assignment depends on the prior value
+                writes[_member_target_name(self.text(left)) or ""].append(right)
+            elif node.type == "init_declarator":
+                name_node = _declarator_identifier(node)
+                value = node.child_by_field_name("value")
+                if name_node is not None and value is not None:
+                    writes[self.text(name_node)].append(value)
+
+        aliases: Dict[str, Set[str]] = {}
+        for name, values in writes.items():
+            if not name or len(values) != 1:
+                continue
+            accesses = self._direct_tiling_accesses(values[0], pointers)
+            if accesses:
+                aliases[name] = accesses
+        return aliases
+
+    def _direct_tiling_accesses(self, node: Node, pointers: Set[str]) -> Set[str]:
+        """Tiling-pointer member accesses appearing literally inside *node*."""
+        found: Set[str] = set()
+        for child in _walk(node):
+            if child.type != "field_expression":
+                continue
+            receiver = child.child_by_field_name("argument")
+            field = child.child_by_field_name("field")
+            if receiver is None or field is None:
+                continue
+            if _leading_identifier(self.text(receiver)) in pointers:
+                found.add(canonical_accessor(self.text(child)))
+        return found
+
+    def _feeding_accesses(
+        self,
+        node: Node,
+        pointers: Set[str],
+        aliases: Dict[str, Set[str]],
+        depth: int = 3,
+    ) -> Set[str]:
+        """Tiling fields that flow into *node*, directly or through aliases.
+
+        ``depth`` caps the hops so a chain of assignments cannot loop; three is
+        more than the unpack-then-size pattern needs.
+        """
+        found = self._direct_tiling_accesses(node, pointers)
+        if depth <= 0:
+            return found
+        seen: Set[str] = set()
+        for child in _walk(node):
+            if child.type == "identifier":
+                name = self.text(child)
+            elif child.type == "field_expression":
+                name = _member_target_name(self.text(child)) or ""
+            else:
+                continue
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            for access in aliases.get(name, ()):  # already canonical
+                found.add(access)
+        return found
+
+    def _infer_tiling_roles(self, root: Node) -> None:
+        """Bind unresolved tiling fields from the role they play at their uses.
+
+        Every field reached through a verified tiling pointer is classified by
+        the *context of its use*, never by its spelling:
+
+        * the extent argument of ``InitBuffer``/``InitQueue`` - a buffer
+          extent, bound to the architecture-minimal valid dimension.  This is
+          the one that matters: an unresolved extent blocks the ``TPipe`` bump
+          allocation for its whole domain, and every tensor the allocator
+          hands out afterwards loses its offset, which silences the
+          bank-conflict check (AKA3006) along with the rest.
+        * the parameter block of ``DataCopy``/``DataCopyPad``, or any
+          ``*Params`` aggregate - a DMA stride or gap, bound to the 32-byte
+          DaVinci block.
+        * a comparison against ``GetBlockIdx()`` - a core-grid bound, left
+          symbolic on purpose.
+
+        The walk runs from the call site *backwards*, through names assigned
+        exactly once, because the extent is usually a member unpacked in a
+        different method than the one that sizes the buffer.
+
+        A field used in two roles that disagree is left symbolic: no single
+        value is right for both, and picking one would invent a layout.
+        """
+        pointers = self._tiling_pointers(root)
+        aliases = self._tiling_aliases(root, pointers)
+        roles: Dict[str, Set[Tuple[str, Optional[int]]]] = defaultdict(set)
+
+        # The core-grid veto first: a field compared against the core index is
+        # a core count, whatever else it is used for.
+        for node in _walk(root):
+            if node.type != "field_expression":
+                continue
+            receiver = node.child_by_field_name("argument")
+            if receiver is None:
+                continue
+            if _leading_identifier(self.text(receiver)) not in pointers:
+                continue
+            if self._is_core_grid_use(node):
+                roles[canonical_accessor(self.text(node))].add(("core_grid", None))
+
+        block_bytes = self.hw.chip.block_bytes
+        for node in _walk(root):
+            if node.type != "call_expression":
+                continue
+            func = node.child_by_field_name("function")
+            callee = _callee_base_name(self, func) if func is not None else ""
+            args = _argument_nodes(node)
+            if not args:
+                continue
+            if callee in {"InitBuffer", "InitQueue"} and len(args) >= 2:
+                value = self._buffer_role_value(node)
+                # The extent is the last argument for both the TBuf form and
+                # the TQue form; the depth argument is never a tiling extent.
+                for access in self._feeding_accesses(args[-1], pointers, aliases):
+                    roles[access].add(("buffer", value))
+            elif callee in _DMA_APIS and len(args) > _DMA_PARAMS_INDEX:
+                for access in self._feeding_accesses(
+                    args[_DMA_PARAMS_INDEX], pointers, aliases
+                ):
+                    roles[access].add(("dma_stride", block_bytes))
+            elif _DMA_PARAMS_RE.search(self.text(node)):
+                for access in self._feeding_accesses(node, pointers, aliases):
+                    roles[access].add(("dma_stride", block_bytes))
+
+        for access, observed in sorted(roles.items()):
+            kinds = {kind for kind, _ in observed}
+            values = {value for _, value in observed if value is not None}
+            if "core_grid" in kinds or len(values) != 1:
+                continue  # ambiguous, or deliberately left symbolic
+            # An exact binding - from a manifest, or from the source itself -
+            # always wins; inference only ever fills a gap.
+            if self._global_env.lookup(access) is not None:
+                continue
+            # A manifest binds a field under the conventional receiver
+            # spellings and under its bare name, but a kernel may reach it
+            # through any pointer it likes (``t->tileBytes``).  Re-binding the
+            # supplied value under this spelling is what stops an inference
+            # from shadowing a measured number.
+            field_name = access.rsplit("->", 1)[-1].rsplit(".", 1)[-1]
+            supplied = self._global_env.lookup(field_name)
+            if supplied is not None:
+                self._global_env.define(access, supplied)
+                continue
+            value = values.pop()
+            self._global_env.define(access, value)
+            self._inferred_tiling[access] = value
+
     def _local_env_before(self, call: Node) -> ConstEnv:
         """Globals plus the foldable locals declared before *call* in its scope.
 
@@ -718,7 +1039,6 @@ class ASTVisitor:
         per translation unit lets each function's walker resolve them.
         """
         ambiguous: Set[str] = set()
-        conflicting: Set[str] = set()
         for node in _walk(root):
             if node.type not in {"declaration", "field_declaration"}:
                 continue
@@ -748,6 +1068,19 @@ class ASTVisitor:
                     continue
                 self._pipe_buffers[name] = PipeBuffer(name, position, depth)
 
+        for name in ambiguous:
+            self._pipe_buffers.pop(name, None)
+
+    def _size_pipe_buffers(self, root: Node) -> None:
+        """Evaluate every ``InitBuffer``/``InitQueue`` extent.
+
+        Phase two of the index.  It runs *after* tiling role inference,
+        because an extent is routinely ``InitBuffer(buf, t->tileBytes)``:
+        until that field has a value the call cannot be folded, the buffer
+        never gets an allocation order, and the bump allocator in
+        :meth:`_synthesize_tpipe_layout` blocks its whole domain.
+        """
+        conflicting: Set[str] = set()
         next_order = 0
         for node in _walk(root):
             if node.type != "call_expression":
@@ -791,8 +1124,6 @@ class ASTVisitor:
             )
             next_order += 1
 
-        for name in ambiguous:
-            self._pipe_buffers.pop(name, None)
         for name in conflicting:
             entry = self._pipe_buffers.get(name)
             if entry is not None:
