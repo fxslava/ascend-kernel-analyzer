@@ -318,11 +318,16 @@ class ASTVisitor:
             statements = [c for c in body.named_children if c.type != "comment"]
             if len(statements) != 1 or statements[0].type != "return_statement":
                 continue
-            value = statements[0].child_by_field_name("value")
+            # ``return <expr>;`` exposes the expression as a direct named
+            # child (no field name in this grammar).
+            value = next(
+                (c for c in statements[0].named_children if c.type != "comment"),
+                None,
+            )
             if value is None:
                 continue
             declarator = func.child_by_field_name("declarator")
-            name = self._function_name(func)
+            name = _KernelWalker._function_name(func)
             params = _parameter_names(declarator) if declarator is not None else []
             if not name or name in self._helpers:
                 continue

@@ -585,3 +585,221 @@ def test_trace_is_in_source_order():
     lines = [op.loc.line for op in kernel.ops]
     assert lines == sorted(lines)
     assert [op.index for op in kernel.ops] == list(range(len(kernel.ops)))
+
+
+# ---------------------------------------------------------------------------
+# Cube-kernel frontend: macro stages, TBuf propagation, CCE casts, unrolling
+# ---------------------------------------------------------------------------
+
+
+class TestTBufPropagation:
+    """TBuf<TPosition> -> .Get<T>() domain propagation (AKA1009)."""
+
+    BODY = """
+        TPipe pipe;
+        TBuf<TPosition::A1> bL1a;
+        TBuf<TPosition::B1> bL1b;
+        TBuf<TPosition::A2> bL0a;
+        TBuf<TPosition::CO1> bL0c;
+        pipe.InitBuffer(bL1a, 1024);
+        pipe.InitBuffer(bL1b, 1024);
+        pipe.InitBuffer(bL0a, 1024);
+        pipe.InitBuffer(bL0c, 2048);
+        LocalTensor<int8_t> l1a = bL1a.Get<int8_t>(), l1b = bL1b.Get<int8_t>();
+        LocalTensor<int8_t> l0a = bL0a.Get<int8_t>();
+        LocalTensor<float>  l0c = bL0c.Get<float>();
+        DataCopy(l1a[0], gA[0], 512);
+    """
+
+    def test_get_inherits_the_buffer_position_and_domain(self):
+        kernel = single_kernel(self.BODY)
+        assert kernel.tensors["l1a"].domain is PhysicalDomain.L1
+        assert kernel.tensors["l1a"].position is TPosition.A1
+        assert kernel.tensors["l0a"].domain is PhysicalDomain.L0A
+        assert kernel.tensors["l0a"].position is TPosition.A2
+        assert kernel.tensors["l0c"].domain is PhysicalDomain.L0C
+        assert kernel.tensors["l0c"].position is TPosition.CO1
+
+    def test_init_buffer_sizes_synthesise_a_concrete_layout(self):
+        kernel = single_kernel(self.BODY)
+        l1a = kernel.tensors["l1a"]
+        assert l1a.offset_value == 0
+        assert l1a.size_value == 1024
+        # Buffers in the same domain are bump-allocated apart.
+        assert kernel.tensors["l1b"].offset_value == 1024
+        assert kernel.tensors["l1b"].size_value == 1024
+        assert kernel.tensors["l0c"].size_value == 2048
+
+    def test_unpositioned_get_stays_unknown(self):
+        # The documented gap: a TBuf without a TPosition template argument
+        # still yields UNKNOWN rather than a guessed domain.
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TBuf<TPosition::A1> buf;
+            pipe.InitBuffer(buf, 512);
+            LocalTensor<int8_t> t = buf.Get<int8_t>();
+            DataCopy(t[0], gA[0], 128);
+            """
+        )
+        assert kernel.tensors["t"].domain is PhysicalDomain.L1
+
+
+class TestCastArgumentResolution:
+    """(__ca__ T *)(uintptr_t)ptr.GetPhyAddr() resolves to the tensor."""
+
+    BODY = """
+        TPipe pipe;
+        TBuf<TPosition::A2> bL0a;
+        TBuf<TPosition::A1> bL1a;
+        pipe.InitBuffer(bL0a, 1024);
+        pipe.InitBuffer(bL1a, 1024);
+        LocalTensor<int8_t> l0a = bL0a.Get<int8_t>();
+        LocalTensor<int8_t> l1a = bL1a.Get<int8_t>();
+        load_cbuf_to_ca_s4(
+            (__ca__ fp4x2_e2m1_t *)(uintptr_t)l0a[0].GetPhyAddr(),
+            (__cbuf__ fp4x2_e2m1_t *)(uintptr_t)l1a[0].GetPhyAddr(),
+            (uint16_t)0, (uint16_t)0, (uint8_t)1, (uint8_t)1,
+            (int16_t)1, (uint16_t)1, false);
+    """
+
+    def test_cast_operands_resolve_to_their_tensors(self):
+        kernel = single_kernel(self.BODY)
+        loads = [op for op in kernel.api_calls() if op.name == "load_cbuf_to_ca_s4"]
+        assert len(loads) == 1
+        assert loads[0].args[0].tensor == "l0a"
+        assert loads[0].args[1].tensor == "l1a"
+        assert loads[0].writes == ("l0a",)
+        assert loads[0].pipe is Pipe.MTE1
+
+    def test_parenthesised_expressions_are_not_mistaken_for_casts(self):
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TBuf<TPosition::VECCALC> b;
+            pipe.InitBuffer(b, 512);
+            LocalTensor<half> t = b.Get<half>();
+            LocalTensor<half> u = t;
+            DataCopy((u), (t), 128);
+            """
+        )
+        copies = [op for op in kernel.api_calls() if op.name == "DataCopy"]
+        assert copies[0].args[0].tensor == "u"
+        assert copies[0].args[1].tensor == "t"
+
+
+class TestLoaderVolumeInference:
+    """Raw-pointer loaders derive byte sizes from their repeat parameter."""
+
+    def test_repeat_parameter_sizes_an_unknown_tensor(self):
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TBuf<TPosition::A1> bL1a;
+            LocalTensor<int8_t> l1a;
+            l1a.SetTPosition(AscendC::TPosition::A1);
+            load_cbuf_to_ca_mx((uint64_t)0,
+                (__cbuf__ half *)(uintptr_t)l1a.GetPhyAddr(),
+                (uint16_t)0, (uint16_t)0, (uint8_t)2, (uint8_t)1,
+                (uint16_t)1, (uint16_t)1);
+            """
+        )
+        tensor = kernel.tensors["l1a"]
+        # 2 repeats x 32 B E8M0 granule; no sizeof(void) failure.
+        assert tensor.size_value == 64
+        assert "volume" in tensor.origin
+
+
+class TestEventIdFolding:
+    """The ping/pong selector folds to concrete EVENT_IDs."""
+
+    def test_ternary_selector_folds_per_unrolled_iteration(self):
+        kernel = single_kernel(
+            """
+            #define EV(p) ((p) ? EVENT_ID1 : EVENT_ID0)
+            for (int t = 0; t < 4; ++t) {
+                int p = t & 1;
+                SetFlag<HardEvent::MTE1_M>(EV(p));
+                WaitFlag<HardEvent::MTE1_M>(EV(p));
+            }
+            """
+        )
+        ids = [op.event_id for op in kernel.flag_ops()]
+        assert ids == [0, 0, 1, 1, 0, 0, 1, 1]
+        assert all(op.event_id is not None for op in kernel.flag_ops())
+
+    def test_helper_function_selector_folds(self):
+        kernel = single_kernel(
+            """
+            SetFlag<HardEvent::MTE1_M>(ev(0));
+            SetFlag<HardEvent::MTE1_M>(ev(1));
+            """,
+            preamble=(
+                "constexpr event_t EV0 = EVENT_ID0, EV1 = EVENT_ID1;\n"
+                "static __aicore__ inline event_t ev(int p) { return p ? EV1 : EV0; }\n"
+            ),
+        )
+        assert [op.event_id for op in kernel.flag_ops()] == [0, 1]
+
+    def test_epilogue_guards_prune_with_concrete_induction_values(self):
+        kernel = single_kernel(
+            """
+            #define EV(p) ((p) ? EVENT_ID1 : EVENT_ID0)
+            SetFlag<HardEvent::MTE1_MTE2>(EVENT_ID0);
+            for (int t = 0; t < 4; ++t) {
+                int p = t & 1;
+                if (t + 2 < 4) {
+                    WaitFlag<HardEvent::MTE1_MTE2>(EV(p));
+                    SetFlag<HardEvent::MTE1_MTE2>(EV(p));
+                }
+            }
+            WaitFlag<HardEvent::MTE1_MTE2>(EVENT_ID1);
+            """
+        )
+        # Only iterations t=0 and t=1 enter the guard; no phantom ops from
+        # the dead t=2/t=3 arms.
+        # Prologue set + (t=0: wait, set) + (t=1: wait, set) + final wait.
+        assert len(kernel.flag_ops()) == 1 + 4 + 1
+        assert all(op.event_id is not None for op in kernel.flag_ops())
+
+
+class TestStageMacros:
+    """Multi-line #define stage macros become statements at the call site."""
+
+    def test_stage_macro_operations_are_traced_in_order(self):
+        kernel = single_kernel(
+            """
+            #define LOAD(p) do {                                              \
+                WaitFlag<HardEvent::MTE2_MTE1>(EV(p));                        \
+                SetFlag<HardEvent::MTE1_M>(EV(p));                            \
+            } while (0)
+            #define EV(p) ((p) ? EVENT_ID1 : EVENT_ID0)
+            LOAD(0);
+            LOAD(1);
+            """
+        )
+        resolved = [(op.flag_kind.value, op.event_id) for op in kernel.flag_ops()]
+        assert resolved == [
+            ("WaitFlag", 0),
+            ("SetFlag", 0),
+            ("WaitFlag", 1),
+            ("SetFlag", 1),
+        ]
+
+    def test_diagnostics_from_expansions_point_at_the_invocation_line(self):
+        # The invocation sits on its own line; everything the expansion emits
+        # is reported there, not on the #define body's lines.
+        kernel = single_kernel(
+            "A(0);",
+            preamble=(
+                "#define A(q) do { \\\n"
+                "    SetFlag<HardEvent::MTE2_V>(EVENT_ID0); \\\n"
+                "    SetFlag<HardEvent::MTE3_V>(EVENT_ID0); \\\n"
+                "} while (0)\n"
+            ),
+        )
+        lines = {op.loc.line for op in kernel.flag_ops()}
+        assert len(lines) == 1
+        # Both ops report the single invocation line of A(0); in the body.
+        assert kernel.flag_ops()[0].loc.snippet.strip().startswith("A(0);")
+

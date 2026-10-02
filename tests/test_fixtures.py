@@ -240,3 +240,55 @@ class TestExpectationParsing:
         expectation = Expectation.from_source(KERNEL_DIR / "ub_overflow.cpp")
         assert expectation.codes == {"AKA1001"}
         assert expectation.fatal_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Cube TBuf pipeline fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def cube_tbuf_result():
+    return KernelAnalyzer(AnalyzerOptions()).analyze_file(
+        KERNEL_DIR / "cube_tbuf_pipeline.cpp"
+    )
+
+
+class TestCubeTBufPipeline:
+    """The low-level Cube shape: stage macros, TBuf allocations, CCE casts."""
+
+    def test_is_accepted_with_no_findings(self, cube_tbuf_result):
+        assert cube_tbuf_result.diagnostics == []
+        assert cube_tbuf_result.verdict == "accepted"
+
+    def test_strict_mode_is_also_clean(self):
+        result = KernelAnalyzer(
+            AnalyzerOptions(strict=True)
+        ).analyze_file(KERNEL_DIR / "cube_tbuf_pipeline.cpp")
+        assert result.fatal_count == 0
+        assert result.warning_count == 0
+
+    def test_tbuf_tensors_have_concrete_layouts(self, cube_tbuf_result):
+        kernel = cube_tbuf_result.unit.kernels[0]
+        l1a = kernel.tensors["l1a"]
+        assert l1a.domain.value == "L1"
+        assert l1a.position.value == "A1"
+        assert (l1a.offset_value, l1a.size_value) == (0, 1024)
+        l0a = kernel.tensors["l0a"]
+        assert l0a.domain.value == "L0A"
+        assert l0a.size_value == 1024
+
+    def test_pingpong_event_ids_resolved_and_paired(self, cube_tbuf_result):
+        graph = cube_tbuf_result.artifacts["sync_graph::cube_tbuf_pipeline"]
+        flags = [p for p in graph["sync_pairs"]]
+        assert flags
+        # Every channel matched with a concrete event id; nothing symbolic.
+        assert all(p["channel"]["event_id"] in (0, 1) for p in flags)
+        assert graph["acyclic"]
+        assert graph["cycles"] == []
+
+    def test_cast_arguments_reached_the_loader(self, cube_tbuf_result):
+        kernel = cube_tbuf_result.unit.kernels[0]
+        loads = [op for op in kernel.api_calls() if op.name.startswith("load_cbuf")]
+        assert loads
+        assert all(op.pipe.value == "PIPE_MTE1" for op in loads)

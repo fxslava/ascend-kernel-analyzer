@@ -121,18 +121,46 @@ for diag in result.diagnostics:
 ```
 source.cpp
     │
+    ├─ macro expand ─── inline #include "local.h", blank #define directives,
+    │                  expand function-like macro invocations (stage macros,
+    │                  ping/pong event selectors), fold f<<<cfg>>>(args)
+    │                  launches - tracking which original line each output
+    │                  line came from
+    │
     ├─ preprocess ──── rewrite __ubuf__ → /*ubuf*/  (equal length, so every
-    │                  line and column still matches the original file)
+    │                  line and column still matches the parse basis)
     │
     ├─ tree-sitter-cpp ──── C++ syntax tree
     │
     ├─ ASTVisitor ──── KernelIR: an ordered operation trace + a tensor table
-    │                  with symbolic byte offsets, plus loop and scope nesting
+    │                  with symbolic byte offsets, plus loop and scope
+    │                  nesting; small statically-bounded loops whose body
+    │                  uses the induction variable are replayed once per
+    │                  iteration with concrete values
     │
     ├─ MemoryChecker ──── Z3 / interval engine over byte ranges
     │
     └─ DeadlockChecker ── NetworkX marked graph over pipeline dependencies
 ```
+
+### Parsing: macro expansion before tree-sitter
+
+Cube kernels are written as *stage macros* — `#define A_MAD(t, p) do { ... }
+while (0)` blocks of ten-plus lines. `tree-sitter-cpp` cannot digest a
+multi-line function-like macro defined inside a function body: its
+`preproc_function_def` node terminates early and the remaining body lines leak
+into the enclosing function as stray statements, landing every interesting
+construct in `ERROR` nodes.
+
+The macro expander runs *before* tree-sitter and handles exactly what kernels
+need: local `#include "header.h"` files are inlined (CANN and system headers
+stay untouched), `#define`/`#undef` lines are blanked, and function-like
+invocations are expanded with argument substitution and rescanning — so
+`A_MAD(t, p)` becomes the stage's statements at the call site and
+`EV(p)` becomes `((p) ? EVENT_ID1 : EVENT_ID0)`, which folds once `p` is
+concrete. Every output line remembers the original line it came from
+(invocation sites for expansions, the `#include` line for headers), so
+diagnostics still point into the file you are editing.
 
 ### Parsing: the equal-length comment trick
 
@@ -252,7 +280,34 @@ AscendC::LocalTensor<half> t =
 // 5. Global memory
 AscendC::GlobalTensor<half> g;
 g.SetGlobalBuffer(xGm, TILE_ELEMS * TILE_COUNT);
+
+// 6. TPipe buffers: the position and size propagate from the TBuf
+//    declaration and the InitBuffer call, so no annotation is needed.
+AscendC::TPipe pipe;
+AscendC::TBuf<AscendC::TPosition::A2> l0aBuf;
+pipe.InitBuffer(l0aBuf, 2 * TILE_A_BYTES);
+AscendC::LocalTensor<int8_t> l0a = l0aBuf.Get<int8_t>();
 ```
+
+Low-level Cube intrinsics are recognised with their Clang CCE address-space
+casts — the casts are stripped when resolving which tensor an argument
+touches:
+
+```cpp
+load_cbuf_to_ca_s4(
+    (__ca__ fp4x2_e2m1_t *)(uintptr_t)l0a[ping * 512].GetPhyAddr(),
+    (__cbuf__ fp4x2_e2m1_t *)(uintptr_t)l1a[ping * 512].GetPhyAddr(),
+    ...);
+mad_mx((__cc__ float *)(uintptr_t)l0c.GetPhyAddr(), (uint64_t)0,
+       (__ca__ float4_e2m1x2_t *)(uintptr_t)l0a.GetPhyAddr(), (uint64_t)0,
+       (__cb__ float4_e1m2x2_t *)(uintptr_t)l0b.GetPhyAddr(), (uint64_t)0,
+       mmad_t::shape_t(M, K, N), ctl);
+```
+
+Event ids may be any expression that folds: a literal, a macro-expanded
+ternary over the loop's ping/pong selector, or a single-`return` helper
+function such as `static __aicore__ inline event_t ev(int p)
+{ return p ? EV1 : EV0; }` with constant arguments.
 
 Synchronisation is recognised in both the Ascend C and low-level ISASI
 spellings:
@@ -365,17 +420,30 @@ PASSED  all 5 fixtures match their declarations
 
 * **Interprocedural analysis** — only the kernel body is walked. A handshake
   split across a helper function is not tracked.
-* **Conditionals** — both arms of an `if` are walked as if executed, so pairing
-  diagnostics on a conditional path are *softened to warnings* rather than
-  reported as fatal.
+* **Conditionals** — an `if` whose condition folds to a constant keeps only
+  the taken arm (this is what prunes the epilogue guards of an unrolled
+  pipeline loop); a genuinely runtime condition walks both arms as if
+  executed, and pairing diagnostics on such a path are *softened to warnings*
+  rather than reported as fatal.
 * **Loop bounds** — trip counts are recovered from simple `for` headers
-  (`i < N`, `i <= N`, `i += k`). Countdown and `while` loops leave the trip
-  count unknown, and offsets derived from them are treated as unbounded.
+  (`i < N`, `i <= N`, `i += k`). Loops with a known trip count of at most 8
+  whose body references the induction variable are replayed once per
+  iteration with concrete values (so `p = t & 1` and `EV(p)` fold); anything
+  larger, and countdown or `while` loops, stay symbolic with the trip count
+  unknown.
+* **Macro expander** — conditional compilation is not evaluated (`#if` arms
+  are left for tree-sitter), and token pasting, stringification and variadic
+  macros are not supported. Unexpanded constructs degrade as before the
+  expander existed.
+* **TPipe layout synthesis** — buffers are bump-allocated per domain in
+  `InitBuffer` program order. A buffer without a visible `InitBuffer` size
+  keeps a symbolic extent.
 * **Flag depth** — the hardware event counter is modelled as an unbounded
   semaphore; `AKA2007` warns about double-sets but no exact saturation depth is
   enforced.
-* **One translation unit at a time** — no `#include` expansion. Pre-expand
-  macros that span headers if they define layout constants.
+* **One translation unit at a time** — `#include` of headers *next to the
+  source* is inlined for constant folding; CANN headers such as
+  `kernel_operator.h` are not read.
 
 ## Layout
 
