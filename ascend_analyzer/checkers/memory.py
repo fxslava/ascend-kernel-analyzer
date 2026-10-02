@@ -602,8 +602,12 @@ class MemoryChecker(Checker):
                 # The same tensor through both operand ports is served by the
                 # broadcast path; there is no second bank to collide with.
                 continue
-            candidates += 1
             off0, off1 = tensor0.offset_value, tensor1.offset_value
+            if off0 is not None and off0 == off1:
+                # Two names for one region (an alias and its source) is the
+                # broadcast case too: both ports read the same addresses.
+                continue
+            candidates += 1
             if off0 is None or off1 is None:
                 continue  # unresolved layout; _check_extent_known owns that
             evaluated += 1

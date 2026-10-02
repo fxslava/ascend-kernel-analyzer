@@ -38,7 +38,6 @@ from ..hardware import (
     PhysicalDomain,
     Pipe,
     TPosition,
-    TPOSITION_TO_DOMAIN,
 )
 from ..ir import (
     CoreView,
@@ -73,7 +72,7 @@ from .expr_eval import (
     canonical_accessor,
     collect_define_value,
 )
-from .preprocess import PreparedSource, prepare_source, prepare_translation_unit
+from .preprocess import PreparedSource, prepare_translation_unit
 
 __all__ = ["ASTVisitor", "parse_source", "parse_file", "VisitorOptions"]
 
@@ -2225,14 +2224,36 @@ class _KernelWalker:
             return
 
         if value.type == "subscript_expression":
-            base_name = _leading_identifier(self._text(value))
+            argument = value.child_by_field_name("argument")
+            index = _subscript_index(value)
+            base_name = (
+                _leading_identifier(self._text(argument))
+                if argument is not None
+                else _leading_identifier(self._text(value))
+            )
             source = self.ir.tensors.get(base_name or "")
-            index = value.child_by_field_name("index")
             if source is not None:
                 self._alias_from(
-                    decl, source, element_offset=self.v._eval.evaluate(index, self._env)
+                    decl,
+                    source,
+                    element_offset=self.v._eval.evaluate(index, self._env),
                 )
                 decl.origin = "sub-tensor view"
+                return
+            # ``buf.Get<T>()[i]`` - a view carved straight out of an accessor
+            # call.  The buffer, not a tensor, is what has a base, so the view
+            # registers against it and the element shift is applied once the
+            # TPipe layout gives that buffer its byte range.
+            receiver = self._accessor_receiver(argument)
+            if receiver is not None and receiver in self._buffer_positions:
+                self._assign_position(decl, self._buffer_positions[receiver])
+                self._tensor_buffers[decl.name] = receiver
+                decl.source_buffer = receiver
+                decl.view_element_offset = self.v._eval.evaluate(
+                    index, self._env
+                )
+                decl.unbound = True
+                decl.origin = "buffer view"
             return
 
         # Anything else that folds to an integer is treated as a byte offset.
@@ -2249,15 +2270,30 @@ class _KernelWalker:
         if decl.domain is PhysicalDomain.UNKNOWN:
             decl.domain = source.domain
         decl.elem_size = decl.elem_size or source.elem_size
+        # Record the provenance whatever happens below: the source's own base
+        # is usually not known yet (TPipe offsets are synthesised after the
+        # walk), so the view's offset is completed by
+        # :meth:`_propagate_view_offsets` once the source has one.
+        decl.view_source = source.name
+        decl.view_element_offset = element_offset
         base = source.byte_offset
         if element_offset is not None and decl.elem_size:
             shift = mul(element_offset, Const(decl.elem_size))
-            base = simplify(BinOp("+", base, shift)) if base is not None else shift
+            base = simplify(BinOp("+", base, shift)) if base is not None else None
         decl.byte_offset = base
         decl.unbound = base is None
         if decl.elem_count is None:
             decl.elem_count = source.elem_count
         decl.reuse_group = decl.reuse_group or source.reuse_group
+
+    def _accessor_receiver(self, node: Optional[Node]) -> Optional[str]:
+        """The buffer name when *node* is ``buf.Get<T>()`` / ``que.AllocTensor<T>()``."""
+        if node is None or node.type != "call_expression":
+            return None
+        func = node.child_by_field_name("function")
+        if _callee_base_name(self.v, func) not in _PIPE_ACCESSORS:
+            return None
+        return _field_receiver_name(self.v, func)
 
     def _declare_raw_pointers(
         self, node: Node, domain: PhysicalDomain, type_text: str
@@ -2722,6 +2758,7 @@ class _KernelWalker:
     def _finalize_tensors(self) -> None:
         """Derive byte sizes, synthesise TPipe allocations, close scopes."""
         self._synthesize_tpipe_layout()
+        self._propagate_view_offsets()
         for decl in self.ir.tensors.values():
             if decl.byte_size is None and decl.elem_count is not None:
                 if decl.elem_size:
@@ -2812,6 +2849,58 @@ class _KernelWalker:
             decl.reuse_group = decl.reuse_group or f"tpipe:{buffer_name}"
             decl.origin = f"{decl.origin} + TPipe layout"
 
+    def _propagate_view_offsets(self) -> None:
+        """Complete view offsets now that their bases exist.
+
+        A view is declared as ``LocalTensor t = arena[i]``, but at that moment
+        the arena itself has no base - TPipe offsets are only synthesised
+        after the walk - so the declaration records the provenance instead
+        (``view_source`` plus an element offset).  This pass replays it:
+
+        * a view with a ``view_source`` lands at
+          ``offset(source) + element_offset * sizeof(T)``, iterated to a
+          fixpoint so a view of a view resolves too;
+        * a view carved straight out of an accessor call
+          (``buf.Get<T>()[i]``) has no source tensor; its buffer base was
+          just synthesised, so the element shift is applied to that.
+        """
+        # Buffer-rooted views first: their base came from the layout pass.
+        for decl in self.ir.tensors.values():
+            offset = decl.view_element_offset
+            if decl.view_source or offset is None:
+                continue
+            if decl.byte_offset is None or not decl.elem_size:
+                continue
+            decl.byte_offset = simplify(
+                BinOp("+", decl.byte_offset, mul(offset, Const(decl.elem_size)))
+            )
+            decl.unbound = False
+
+        views = [d for d in self.ir.tensors.values() if d.view_source]
+        for _ in range(len(views) or 1):  # fixpoint; each pass binds one level
+            changed = False
+            for decl in views:
+                if decl.byte_offset is not None:
+                    continue  # an explicit binding (annotation, SetAddr) wins
+                source = self.ir.tensors.get(decl.view_source or "")
+                if source is None or source.byte_offset is None:
+                    continue
+                base = source.byte_offset
+                if decl.view_element_offset is not None and decl.elem_size:
+                    base = simplify(
+                        BinOp(
+                            "+",
+                            base,
+                            mul(decl.view_element_offset, Const(decl.elem_size)),
+                        )
+                    )
+                decl.byte_offset = base
+                decl.unbound = False
+                decl.origin = f"{decl.origin} + view offset"
+                changed = True
+            if not changed:
+                break
+
     @staticmethod
     def _function_name(func: Node) -> str:
         declarator = func.child_by_field_name("declarator")
@@ -2854,6 +2943,27 @@ def _argument_nodes(call: Node) -> List[Node]:
     if args is None:
         return []
     return [c for c in args.named_children if c.type != "comment"]
+
+
+def _subscript_index(node: Node) -> Optional[Node]:
+    """The index expression of ``base[index]``.
+
+    tree-sitter-cpp has no ``index`` field on a ``subscript_expression``: the
+    bracketed operand arrives as a ``subscript_argument_list`` child.  Asking
+    for the field by name yields ``None``, which is why sub-tensor views were
+    all recorded without an offset until now.  Both spellings are tried, so
+    the helper survives a grammar that names the field.
+    """
+    index = node.child_by_field_name("index")
+    if index is not None:
+        return index
+    for child in node.children:
+        if child.type != "subscript_argument_list":
+            continue
+        for inner in child.named_children:
+            if inner.type != "comment":
+                return inner
+    return None
 
 
 def _callee_base_name(visitor: ASTVisitor, func: Optional[Node]) -> Optional[str]:

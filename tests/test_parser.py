@@ -286,6 +286,82 @@ class TestTensorBindings:
         assert tensor.size_value == 128  # 64 half
 
 
+class TestSubTensorViews:
+    """``LocalTensor t = arena[i]`` lands at ``offset(arena) + i * sizeof(T)``.
+
+    The arena's own base only exists once the TPipe layout is synthesised
+    after the walk, so the view records its provenance and the offset is
+    completed then.  Until the ``subscript_argument_list`` extraction was
+    fixed, every view kept ``byte_offset=None`` - which is what locked 793 of
+    the fleet's 1,064 AKA3006 candidates in ``chunk_kda_fwd.cpp``.
+    """
+
+    BODY = """
+        AscendC::TPipe pipe;
+        AscendC::TBuf<AscendC::TPosition::VECCALC> vecBuf;
+        pipe.InitBuffer(vecBuf, 8192);
+        uint64_t elems = 16;
+        AscendC::LocalTensor<float> arena = vecBuf.Get<float>();
+        AscendC::LocalTensor<float> head = arena;
+        AscendC::LocalTensor<float> mid = arena[elems];
+        AscendC::LocalTensor<float> tail = arena[2 * elems];
+    """
+
+    def kernel(self):
+        return single_kernel(self.BODY)
+
+    def test_a_view_of_a_bound_tensor_gets_the_shifted_offset(self):
+        tensors = self.kernel().tensors
+        assert tensors["arena"].offset_value == 0
+        assert tensors["mid"].offset_value == 16 * 4
+        assert tensors["tail"].offset_value == 2 * 16 * 4
+
+    def test_a_pure_alias_shares_the_source_offset(self):
+        tensors = self.kernel().tensors
+        assert tensors["head"].offset_value == tensors["arena"].offset_value == 0
+
+    def test_views_inherit_the_buffer_domain(self):
+        tensors = self.kernel().tensors
+        assert tensors["mid"].domain is PhysicalDomain.UB
+
+    def test_a_symbolic_index_stays_symbolic_not_unbound(self):
+        kernel = single_kernel(
+            self.BODY
+            + """
+            uint64_t run = gm[0];
+            AscendC::LocalTensor<float> dyn = arena[run];
+            """
+        )
+        tensor = kernel.tensors["dyn"]
+        assert tensor.byte_offset is not None
+        assert tensor.offset_value is None  # symbolic: honest, not resolved
+
+    def test_a_view_of_a_view_resolves_through_the_chain(self):
+        kernel = single_kernel(
+            self.BODY
+            + """
+            AscendC::LocalTensor<float> inner = tail[4];
+            """
+        )
+        # tail = 2*16*4 = 128; inner = 128 + 4*4 = 144
+        assert kernel.tensors["inner"].offset_value == 144
+
+    def test_a_view_carved_from_the_accessor_call_itself(self):
+        kernel = single_kernel(
+            """
+            AscendC::TPipe pipe;
+            AscendC::TBuf<AscendC::TPosition::VECCALC> vecBuf;
+            pipe.InitBuffer(vecBuf, 8192);
+            AscendC::LocalTensor<half> typed = vecBuf.Get<half>()[128];
+            AscendC::LocalTensor<half> tail = typed[64];
+            """
+        )
+        tensors = kernel.tensors
+        assert tensors["typed"].domain is PhysicalDomain.UB
+        assert tensors["typed"].offset_value == 128 * 2
+        assert tensors["tail"].offset_value == 128 * 2 + 64 * 2
+
+
 # ---------------------------------------------------------------------------
 # Synchronisation extraction
 # ---------------------------------------------------------------------------

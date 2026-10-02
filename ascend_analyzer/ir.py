@@ -204,6 +204,13 @@ class TensorDecl:
     #: Name of the ``TBuf`` this tensor was obtained from via ``.Get()``, so
     #: aggregate budgeting can count the buffer once instead of once per view.
     source_buffer: Optional[str] = None
+    #: Name of the tensor this one was sliced or aliased from
+    #: (``LocalTensor t = arena[i]``), for offset propagation once the
+    #: source's own base becomes known.
+    view_source: Optional[str] = None
+    #: Element offset of the view inside :attr:`view_source` - or inside the
+    #: buffer, when only :attr:`source_buffer` is set - symbolic.
+    view_element_offset: Optional[Expr] = None
     #: Trace indices of first and last observed use; ``None`` when never used.
     first_use: Optional[int] = None
     last_use: Optional[int] = None
