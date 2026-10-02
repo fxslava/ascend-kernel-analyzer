@@ -478,6 +478,7 @@ class ASTVisitor:
         root = tree.root_node
 
         unit = AnalysisUnit(path=self.prepared.path, source=self.prepared.original)
+        self._report_frontend_errors(unit)
         self._report_parse_errors(root, unit)
         self._seed_builtin_constants()
         self._seed_tiling_values()
@@ -558,6 +559,26 @@ class ASTVisitor:
         return self._lines[line - 1] if 1 <= line <= len(self._lines) else ""
 
     # -- file-level passes --------------------------------------------------
+
+    def _report_frontend_errors(self, unit: AnalysisUnit) -> None:
+        """Report a preprocessor fault rather than quietly analyzing less.
+
+        When the token preprocessor cannot finish, the analysis continues on
+        unexpanded source - a partial result beats no result - but every
+        conclusion then rests on a translation unit the compiler would not
+        recognise, so the reader has to be told.
+        """
+        for message in getattr(self.prepared, "frontend_errors", ()):
+            self.diags.add(
+                Code.PARSE_ERROR,
+                Severity.WARNING,
+                f"preprocessing was incomplete: {message}",
+                SourceLoc(file=self.prepared.path, line=1),
+                remediation=(
+                    "Findings for this file may be incomplete. Check that its "
+                    "includes are reachable and UTF-8 encoded."
+                ),
+            )
 
     def _report_parse_errors(self, root: Node, unit: AnalysisUnit) -> None:
         if not root.has_error:

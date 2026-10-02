@@ -3,6 +3,10 @@ tree-sitter>=0.21
 tree-sitter-cpp>=0.21
 networkx>=3.0
 
+# Pure-Python ISO C99/C11 token preprocessor: macro expansion, stringification,
+# token pasting and conditional evaluation for the source frontend.
+pcpp>=1.30
+
 # Optional but recommended: enables the Z3 backend, which proves layout
 # properties over symbolic (loop-varying) offsets and returns concrete
 # counterexamples. Without it the analyzer uses interval arithmetic.

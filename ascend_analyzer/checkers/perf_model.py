@@ -50,6 +50,11 @@ _ISSUE_CYCLES = 1
 #: Operand transfer whose volume cannot be recovered: assume one 32 B block.
 _DEFAULT_TRANSFER_BYTES = 32
 
+#: One token of a shape argument: a name, or an integer literal.  A
+#: dimension reaches here as a name before macro substitution and as a
+#: literal after it, and both spellings have to resolve.
+_SHAPE_TOKEN_RE = re.compile(r"\b([A-Za-z_]\w*)\b|\b(0[xX][0-9a-fA-F]+|\d+)")
+
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 
 
@@ -281,21 +286,34 @@ class PerfModelChecker(Checker):
         """Recover ``(M, K, N)`` from a shape argument.
 
         Cube kernels spell the tile shape as ``mmad_t::shape_t((uint16_t)M,
-        (uint16_t)K, (uint16_t)N)``: the identifiers resolve against the
-        kernel's folded ``constexpr``/``#define`` environment.  Any argument
-        naming three known constants in order is accepted as ``(m, k, n)``.
+        (uint16_t)K, (uint16_t)N)``.  Each dimension may arrive either as an
+        identifier that resolves against the kernel's folded
+        ``constexpr``/``#define`` environment, or as an integer literal -
+        which is what it already is once the token preprocessor has
+        substituted the macro.  The first three of either kind, in source
+        order, are taken as ``(m, k, n)``.
+
+        A type name such as ``uint16_t`` is neither a known constant nor a
+        literal, so the cast around each dimension is skipped; the ``16``
+        inside that name is never seen on its own because the identifier
+        matches as one token.
         """
         constants = kernel.constants
         for arg in op.args:
             if arg.tensor:
                 continue
-            found = [
-                constants[name]
-                for name in _IDENTIFIER_RE.findall(arg.text)
-                if name in constants
-            ]
-            if len(found) >= 3:
-                return (found[0], found[1], found[2])
+            found: List[int] = []
+            for match in _SHAPE_TOKEN_RE.finditer(arg.text):
+                name, literal = match.group(1), match.group(2)
+                if literal is not None:
+                    try:
+                        found.append(int(literal, 0))
+                    except ValueError:
+                        continue
+                elif name in constants:
+                    found.append(constants[name])
+                if len(found) >= 3:
+                    return (found[0], found[1], found[2])
         return None
 
     @staticmethod

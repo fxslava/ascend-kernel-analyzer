@@ -19,12 +19,8 @@ from __future__ import annotations
 
 import pytest
 
+from ascend_analyzer.frontend import normalize_cce_syntax, preprocess_source
 from ascend_analyzer.parsing.ast_visitor import _make_parser, _walk
-from ascend_analyzer.parsing.macro_expand import (
-    _is_operator_argument,
-    _substitute,
-    expand_macros,
-)
 from ascend_analyzer.parsing.preprocess import (
     decoration_only_macro,
     prepare_source,
@@ -32,8 +28,20 @@ from ascend_analyzer.parsing.preprocess import (
 )
 
 
-#: A newline, spelled so no editing pass can mangle the escape.
+#: A newline and a backslash, spelled so no editing pass can mangle them.
 nl = chr(10)
+BS = chr(92)
+
+
+def expand(source: str, path: str = "<test>.cpp") -> str:
+    """The preprocessed text, with whitespace collapsed for comparison.
+
+    Macro expansion is asserted through the real pipeline rather than against
+    an internal, so what these tests pin is the contract the parser sees.
+    """
+    result = preprocess_source(path, source)
+    assert not result.errors, result.errors
+    return " ".join(result.text.split())
 
 
 def parses(source: str, path: str = "<test>.cpp") -> bool:
@@ -209,73 +217,81 @@ class TestGnuAttribute:
 
 
 class TestVariadicMacros:
+    """``__VA_ARGS__`` used to survive unexpanded and take a header with it."""
+
     def test_va_args_is_substituted(self):
-        got = _substitute(
-            "typename std::enable_if<(__VA_ARGS__)>::type* = nullptr",
-            (),
-            ("A::value", "B::value"),
-            variadic=True,
-        )
-        assert got == "typename std::enable_if<(A::value, B::value)>::type* = nullptr"
-
-    def test_variadic_define_is_recognised(self):
-        expansion = expand_macros(
-            "#define REQ(...) typename enable_if<(__VA_ARGS__)>::type\n"
-        )
-        macro = expansion.function_macros["REQ"]
-        assert macro.variadic
-        assert macro.params == ()
-
-    def test_named_parameters_before_the_pack_still_bind(self):
-        expansion = expand_macros("#define LOG(fmt, ...) emit(fmt, __VA_ARGS__)\n")
-        macro = expansion.function_macros["LOG"]
-        assert macro.variadic
-        assert macro.params == ("fmt",)
-        assert _substitute(macro.body, macro.params, ("f", "a", "b"), variadic=True) == \
-            "emit(f, a, b)"
-
-    def test_unexpanded_va_args_no_longer_reaches_the_parser(self):
         source = (
-            "#define REQ(...) typename enable_if<(__VA_ARGS__)>::type* = nullptr\n"
-            "template <class T, REQ(is_int<T>::value)>\n"
-            "T f(T t) { return t; }\n"
+            "#define REQ(...) typename enable_if<(__VA_ARGS__)>::type" + nl
+            + "REQ(A::value, B::value) x;" + nl
+        )
+        assert expand(source) == "typename enable_if<(A::value, B::value)>::type x;"
+
+    def test_named_parameter_before_the_pack(self):
+        source = (
+            "#define LOG(fmt, ...) emit(fmt, __VA_ARGS__)" + nl
+            + "void f() { LOG(m, a, b); }" + nl
+        )
+        assert "emit(m, a, b)" in expand(source)
+
+    def test_empty_pack(self):
+        source = (
+            "#define WRAP(a, ...) call(a __VA_ARGS__)" + nl
+            + "void f() { WRAP(1); }" + nl
+        )
+        assert "call(1" in expand(source)
+
+    def test_sfinae_template_parameter_is_fully_expanded(self):
+        source = (
+            "#define REQ(...) typename enable_if<(__VA_ARGS__)>::type* = nullptr" + nl
+            + "template <class T, REQ(is_int<T>::value)>" + nl
+            + "T f(T t) { return t; }" + nl
         )
         prepared = prepare_translation_unit("<test>.cpp", source)
         assert "__VA_ARGS__" not in prepared.rewritten
 
 
 class TestOperatorArguments:
-    @pytest.mark.parametrize("arg", ["+", "-", "~", "<<", "==", "[]"])
-    def test_operator_tokens_are_recognised(self, arg):
-        assert _is_operator_argument(arg)
+    """An operator token passed as an argument produced ``operator (+)``."""
 
-    @pytest.mark.parametrize("arg", ["x", "a + b", "", "f(1)", "1"])
-    def test_expressions_are_not_operator_tokens(self, arg):
-        assert not _is_operator_argument(arg)
-
-    def test_operator_argument_is_not_parenthesised(self):
-        """``operator (+)`` is not C++; ``operator +`` is."""
-        got = _substitute("C<(OP t)> operator OP (C<t>)", ("OP",), ("+",))
-        assert got == "C<(+ t)> operator + (C<t>)"
-
-    def test_binary_operator_argument(self):
-        got = _substitute("C<(t OP u)> operator OP (C<t>, C<u>)", ("OP",), ("<<",))
-        assert got == "C<(t << u)> operator << (C<t>, C<u>)"
-
-    def test_expression_argument_keeps_its_parentheses(self):
-        """Precedence protection must survive for real expressions."""
-        assert _substitute("(x * 2)", ("x",), ("a + b",)) == "((a + b) * 2)"
-
-    def test_generated_operator_overload_parses(self):
+    def test_generated_unary_operator_parses(self):
         source = (
-            "#define UNARY(OP)                                   \\\n"
-            "    template <int t>                                \\\n"
-            "    constexpr C<(OP t)> operator OP (C<t>) { return {}; }\n"
-            "template <int> struct C {};\n"
-            "UNARY(+)\n"
-            "UNARY(-)\n"
+            "#define UNARY(OP) " + BS + nl
+            + "    template <int t> " + BS + nl
+            + "    constexpr C<(OP t)> operator OP (C<t>) { return {}; }" + nl
+            + "template <int> struct C {};" + nl
+            + "UNARY(+)" + nl
+            + "UNARY(-)" + nl
         )
+        assert "operator + (" in expand(source)
+        assert "operator ( +" not in expand(source)
         assert error_lines(source) == 0
+
+    def test_generated_binary_operator_parses(self):
+        source = (
+            "#define BINARY(OP) " + BS + nl
+            + "    template <int t, int u> " + BS + nl
+            + "    constexpr C<(t OP u)> operator OP (C<t>, C<u>) { return {}; }" + nl
+            + "template <int> struct C {};" + nl
+            + "BINARY(<<)" + nl
+        )
+        assert "operator << (" in expand(source)
+        assert error_lines(source) == 0
+
+    def test_type_argument_is_not_parenthesised(self):
+        """``(SCFABlockCube)<ARGS>`` is not C++; the bare name is."""
+        source = (
+            "#define TRAITS(T) struct Traits<T<ARGS>> {};" + nl
+            + "TRAITS(SCFABlockCube)" + nl
+        )
+        assert expand(source) == "struct Traits<SCFABlockCube<ARGS>> {};"
+
+    def test_compound_argument_keeps_its_meaning(self):
+        """Precedence must survive where it actually matters."""
+        source = (
+            "#define AREA(w, h) ((w) * (h))" + nl
+            + "int x = AREA(1 + 2, 3);" + nl
+        )
+        assert expand(source) == "int x = ((1 + 2) * (3));"
 
 
 class TestCplusplusGuards:
@@ -309,10 +325,15 @@ class TestCplusplusGuards:
         assert "__cplusplus" not in prepared.rewritten
         assert 'extern "C"' in prepared.rewritten
 
-    def test_line_count_is_preserved(self):
-        """Blanking, never deleting: diagnostics still point at real lines."""
+    def test_declaration_maps_back_to_its_original_line(self):
+        """The token preprocessor deletes directive lines, so the contract
+        is a line *mapping* rather than a line count: every output line
+        reports the original line it came from."""
         prepared = prepare_translation_unit("<test>.cpp", self.HEADER)
-        assert prepared.rewritten.count("\n") == self.HEADER.count("\n")
+        lines = prepared.rewritten.split(nl)
+        index = next(i for i, l in enumerate(lines, 1) if "aclnnThing" in l)
+        # "int aclnnThing(int x);" is line 4 of HEADER.
+        assert prepared.origin_line(index) == 4
 
     def test_if_defined_spelling_is_resolved(self):
         source = (
@@ -399,11 +420,16 @@ class TestExternalAttributeMacros:
         )
         assert parses(source)
 
-    def test_decoration_prefix_before_struct_is_blanked(self):
-        """``TEMPLATES_DEF_NO_DEFAULT struct Traits`` - same line."""
-        source = "TEMPLATES_DEF_NO_DEFAULT struct Traits { int x; };\n"
-        prepared = prepare_source("<test>.cpp", source)
+    def test_decoration_prefix_before_struct_is_erased(self):
+        """``TEMPLATES_DEF_NO_DEFAULT struct Traits`` - no reachable define.
+
+        The token preprocessor expands it to nothing because it is listed
+        in ERASED_DECORATION_MACROS; there is no text rule for it.
+        """
+        source = "TEMPLATES_DEF_NO_DEFAULT struct Traits { int x; };" + nl
+        prepared = prepare_translation_unit("<test>.cpp", source)
         assert "TEMPLATES_DEF_NO_DEFAULT" not in prepared.rewritten
+        assert "struct Traits" in prepared.rewritten
         assert parses(source)
 
     def test_short_or_mixed_case_identifiers_are_left_alone(self):
@@ -467,11 +493,14 @@ class TestExternalAttributeMacros:
             "int after = 2;\n"
         )
         assert parses(source)
-        prepared = prepare_source("<test>.cpp", source)
-        assert "ASCENDC_TPL_SEL" not in prepared.rewritten
+        # The DSL block is erased by the pre-lexing normalizer, byte for byte.
+        normalized = normalize_cce_syntax(source)
+        assert "ASCENDC_TPL_SEL" not in normalized
+        assert len(normalized.encode("utf-8")) == len(source.encode("utf-8"))
+        assert normalized.count(nl) == source.count(nl)
         # The declarations around it survive.
-        assert "int before = 1;" in prepared.rewritten
-        assert "int after = 2;" in prepared.rewritten
+        assert "int before = 1;" in normalized
+        assert "int after = 2;" in normalized
 
     def test_single_line_macro_call_is_left_alone(self):
         """A one-line call parses as a declaration; only the multi-line form cascades."""
@@ -538,59 +567,112 @@ class TestStringification:
 
     Left unexpanded the ``#`` reads as a preprocessor directive starting in
     the middle of a statement, which is what made
-    ``GetOpApiFuncAddr(#aclCreateTensor)`` unparseable.
+    ``GetOpApiFuncAddr(#aclCreateTensor)`` unparseable and alone accounted for
+    thousands of error lines in ``torch_binding.cpp``.
     """
 
     def test_argument_becomes_a_string_literal(self):
-        got = _substitute("GetAddr(#name)", ("name",), ("aclCreateTensor",))
-        assert got == 'GetAddr("aclCreateTensor")'
+        source = (
+            "#define NAMEOF(x) #x" + nl
+            + "const char *n = NAMEOF(hello);" + nl
+        )
+        assert expand(source) == 'const char *n = "hello";'
 
-    def test_paste_still_pastes(self):
-        assert _substitute("_##name", ("name",), ("acl",)) == "_acl"
+    def test_paste_pastes(self):
+        source = (
+            "#define JOIN(a, b) a##b" + nl
+            + "int JOIN(foo, bar) = 1;" + nl
+        )
+        assert expand(source) == "int foobar = 1;"
 
     def test_paste_and_stringify_in_one_body(self):
-        got = _substitute("auto _##name = f(#name);", ("name",), ("acl",))
-        assert got == 'auto _acl = f("acl");'
-
-    def test_embedded_quotes_are_escaped(self):
-        got = _substitute("s(#x)", ("x",), ('a"b',))
-        assert got == 's("a' + chr(92) + '"b")'
+        source = (
+            "#define GET(name) auto _##name = f(#name)" + nl
+            + "void k() { GET(acl); }" + nl
+        )
+        got = expand(source)
+        assert "_acl" in got
+        assert '"acl"' in got
 
     def test_the_op_api_idiom_parses(self):
-        nl = chr(10)
         source = (
-            "#define GET_ADDR(name) "
-            "static const auto name = cast<_##name>(GetAddr(#name))" + nl +
-            "void f() { GET_ADDR(aclCreateTensor); }" + nl
+            "#define GET_ADDR(name) " + BS + nl
+            + "    static const auto name = cast<_##name>(GetAddr(#name))" + nl
+            + "void f() { GET_ADDR(aclCreateTensor); }" + nl
         )
         prepared = prepare_translation_unit("<test>.cpp", source)
         assert '"aclCreateTensor"' in prepared.rewritten
         assert "#aclCreateTensor" not in prepared.rewritten
+        assert error_lines(source) == 0
 
 
-class TestSingleTokenArguments:
-    def test_type_argument_is_not_parenthesised(self):
-        """``(SCFABlockCube)<ARGS>`` is not C++; the bare name is."""
-        got = _substitute("struct Traits<T<ARGS>> {};", ("T",), ("SCFABlockCube",))
-        assert got == "struct Traits<SCFABlockCube<ARGS>> {};"
+class TestRecursionAndNesting:
+    """Cases the hand-rolled expander handled badly or not at all."""
 
-    def test_macro_name_argument_is_not_parenthesised(self):
-        got = _substitute("GEN(Q)", ("GEN",), ("GEN_TRAIT_TYPE",))
-        assert got == "GEN_TRAIT_TYPE(Q)"
+    def test_nested_expansion(self):
+        source = (
+            "#define INNER 4" + nl
+            + "#define OUTER (INNER * 2)" + nl
+            + "int x = OUTER;" + nl
+        )
+        assert expand(source) == "int x = (4 * 2);"
 
-    def test_qualified_name_is_not_parenthesised(self):
-        got = _substitute("using X = T;", ("T",), ("ns::Type",))
-        assert got == "using X = ns::Type;"
+    def test_self_referential_macro_terminates(self):
+        """A macro naming itself must not recurse forever."""
+        source = "#define LOOP LOOP + 1" + nl + "int x = LOOP;" + nl
+        assert expand(source) == "int x = LOOP + 1;"
 
-    def test_literal_is_not_parenthesised(self):
-        assert _substitute("f(x)", ("x",), ("42",)) == "f(42)"
+    def test_undef_retires_a_macro(self):
+        source = (
+            "#define TILE 64" + nl
+            + "int a = TILE;" + nl
+            + "#undef TILE" + nl
+            + "int b = TILE;" + nl
+        )
+        got = expand(source)
+        assert "int a = 64;" in got
+        assert "int b = TILE;" in got
 
-    def test_compound_expression_keeps_its_parentheses(self):
-        """Precedence protection must survive where it actually matters."""
-        assert _substitute("x * 2", ("x",), ("a + b",)) == "(a + b) * 2"
+    def test_invocation_before_the_definition_is_not_expanded(self):
+        source = (
+            "int a = TILE;" + nl
+            + "#define TILE 64" + nl
+            + "int b = TILE;" + nl
+        )
+        got = expand(source)
+        assert "int a = TILE;" in got
+        assert "int b = 64;" in got
 
-    def test_call_argument_keeps_its_parentheses(self):
-        assert _substitute("x * 2", ("x",), ("f(1)",)) == "(f(1)) * 2"
+    def test_conditional_on_a_known_macro_is_resolved(self):
+        source = (
+            "#define FEATURE 1" + nl
+            + "#if FEATURE" + nl + "int on = 1;" + nl
+            + "#else" + nl + "int off = 1;" + nl + "#endif" + nl
+        )
+        got = expand(source)
+        assert "int on = 1;" in got
+        assert "int off = 1;" not in got
+
+    def test_conditional_on_an_unknown_macro_is_left_for_the_parser(self):
+        """Both arms must stay analyzable; see ``on_directive_handle``."""
+        source = (
+            "#ifdef SOME_FEATURE" + nl + "int on = 1;" + nl
+            + "#else" + nl + "int off = 1;" + nl + "#endif" + nl
+        )
+        got = expand(source)
+        assert "int on = 1;" in got
+        assert "int off = 1;" in got
+
+
+class TestKernelLaunchSyntax:
+    def test_launch_brackets_are_folded(self):
+        source = "void host() { k<<<cfg>>>(p); }" + nl
+        assert parses(source)
+        assert "<<<" not in normalize_cce_syntax(source)
+
+    def test_shift_operators_are_left_alone(self):
+        source = "int x = a << 3;" + nl
+        assert normalize_cce_syntax(source) == source
 
 
 class TestOffsetInvariants:

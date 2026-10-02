@@ -30,6 +30,9 @@ dependencies = [
     "tree-sitter>=0.21",
     "tree-sitter-cpp>=0.21",
     "networkx>=3.0",
+    # Pure-Python ISO C99/C11 token preprocessor; no compiler or shared
+    # library needed.  Drives the source frontend.
+    "pcpp>=1.30",
 ]
 
 [project.optional-dependencies]

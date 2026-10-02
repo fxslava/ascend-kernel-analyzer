@@ -81,8 +81,11 @@ pip install -e ".[dev]"
 Or just the runtime dependencies:
 
 ```bash
-pip install tree-sitter tree-sitter-cpp networkx z3-solver
+pip install tree-sitter tree-sitter-cpp networkx pcpp z3-solver
 ```
+
+`pcpp` is the source frontend's token preprocessor. It is pure Python, so
+there is no compiler or shared-library dependency.
 
 `z3-solver` is **optional**. Without it the analyzer falls back to interval
 arithmetic, which is exact for fully constant layouts — the common case — but
@@ -203,24 +206,65 @@ source.cpp
     └─ DeadlockChecker ── NetworkX marked graph over pipeline dependencies
 ```
 
-### Parsing: macro expansion before tree-sitter
+### Parsing: a real token preprocessor
 
-Cube kernels are written as *stage macros* — `#define A_MAD(t, p) do { ... }
-while (0)` blocks of ten-plus lines. `tree-sitter-cpp` cannot digest a
-multi-line function-like macro defined inside a function body: its
-`preproc_function_def` node terminates early and the remaining body lines leak
-into the enclosing function as stray statements, landing every interesting
-construct in `ERROR` nodes.
+The frontend is [`pcpp`](https://github.com/ned14/pcpp), a pure-Python ISO
+C99/C11 token preprocessor, wrapped as
+`ascend_analyzer.frontend.AscendCPreprocessor`. Macro expansion, `#`
+stringification, `##` pasting, `__VA_ARGS__`, `#undef` scoping, conditional
+evaluation and local `#include` inlining are all done by a real lexer. It
+replaced a regex-and-string expander, and with it a whole class of bugs:
+corrupted parentheses around arguments used in type position, half-substituted
+variadic macros, stringification left as a stray `#` in mid-statement.
 
-The macro expander runs *before* tree-sitter and handles exactly what kernels
-need: local `#include "header.h"` files are inlined (CANN and system headers
-stay untouched), `#define`/`#undef` lines are blanked, and function-like
-invocations are expanded with argument substitution and rescanning — so
-`A_MAD(t, p)` becomes the stage's statements at the call site and
-`EV(p)` becomes `((p) ? EVENT_ID1 : EVENT_ID0)`, which folds once `p` is
-concrete. Every output line remembers the original line it came from
-(invocation sites for expansions, the `#include` line for headers), so
-diagnostics still point into the file you are editing.
+Four things the wrapper has to add.
+
+**Line fidelity.** `pcpp` does not preserve line numbers — it *deletes*
+directive lines rather than blanking them, so a real kernel drifts by tens of
+lines. It does emit `#line N "file"` markers, and those are consumed to build
+the `line_origins` map the rest of the analyzer already used. Content from an
+included header is attributed to the line of the `#include` that pulled it in,
+because a diagnostic has to name a line the reader can actually open. Columns
+still shift on a line a macro expanded; lines do not.
+
+**Syntax the C lexer cannot read**, normalized *before* tokenizing and byte
+for byte, so offsets still address the original file:
+
+* a location qualifier, `__forceinline__ [host, aicore] void f()`, told apart
+  from a subscript (`buf[host]`), a C++ attribute and a lambda by position;
+* a kernel launch, `f<<<cfg>>>(args)`, folded to `f(  cfg)  (args)`;
+* a parenthesis-free condition, `if ASCEND_IS_AIV {`, which gains its
+  parentheses by giving up the two spaces around the condition;
+* a file-scope tiling-key DSL block, `ASCENDC_TPL_SEL(...)` spanning lines,
+  whose argument list is not valid C even as an expression.
+
+The normalizer runs on *every* file in the unit, through the `on_file_open`
+hook, since a header carries the same constructs. It skips comments, string
+literals and preprocessor directives — a `TORCH_CHECK(cond, "... (see docs)")`
+hides an unbalanced parenthesis inside a string, and erasing a line-continuation
+backslash inside a multi-line `#define` truncates the macro and spills its body
+into file scope.
+
+**The core-split conditionals must survive.** `#ifdef __DAV_C220_CUBE__` /
+`#ifdef __DAV_C220_VEC__` is how a mix kernel divides itself between the Cube
+and Vector cores, and the visitor walks *both* arms to tag each operation with
+the core it compiles into. Defining either macro would make the preprocessor
+pick one arm and delete the other, merging the two event spaces. They are
+passed through for the parser to see.
+
+The same applies to any conditional the preprocessor cannot decide. `#ifdef
+SOME_FEATURE`, where nothing defines `SOME_FEATURE`, is passed through rather
+than resolved to its else arm: this analyzer looks for races and overflows, so
+unexamined code is the expensive failure, and the visitor is built to walk both
+arms. Everything decidable — an include guard, `__cplusplus`, a macro the file
+or the frontend defines — is evaluated normally.
+
+**Encoding.** These headers are UTF-8 and full of Chinese comments. `pcpp`
+otherwise opens an include with the locale encoding, and on Windows the first
+non-ASCII byte aborts the translation unit. When the frontend does fail, the
+file is still analyzed unexpanded — a partial result beats none — but the run
+reports `AKA9001` saying so, rather than presenting a smaller unit as a clean
+one.
 
 ### Parsing: the equal-length comment trick
 
@@ -236,71 +280,19 @@ still matches the original source, so diagnostics point at the real file with
 no mapping table. The qualifiers are not lost: their byte spans are recorded,
 so the visitor can recover each declaration's address space.
 
+These are deliberately *not* erased by the preprocessor, even though they are
+noise to a compiler: `__global__` is how a kernel entry point is identified,
+and the address-space qualifiers are the only record of which physical domain
+a declaration lives in.
+
 The rewrite is comment- and string-aware. Rewriting `__ubuf__` *inside* a block
 comment would inject a `*/` that closes the comment early and spill prose into
 the token stream — and kernel files routinely mention these qualifiers in their
-header comments. Operands of `#ifdef`/`#ifndef`/`#undef` are left alone too:
-`#ifndef __force_inline__` is a guard testing whether a macro is defined, and
-rewriting that name would leave the directive without an identifier.
+header comments. Operands of `#ifdef`/`#ifndef`/`#undef` are left alone too.
 
-### Parsing: CCE declaration decoration
-
-Three further constructs used to turn a whole translation unit into a single
-`ERROR` node. Each is blanked to spaces of the same byte length, so line and
-column coordinates are untouched:
-
-* the **CCE location qualifier**, `__forceinline__ [host, aicore] void f()`.
-  `tree-sitter-cpp` reads the `[` as a lambda capture and never recovers. It is
-  told apart from an array subscript (`buf[host]`), a C++ attribute
-  (`[[nodiscard]]`) and a lambda by three tests: a qualifier is never glued to
-  the preceding token, never doubled, and is always followed by something that
-  starts a type. A list of two or more names skips the first test, since a comma
-  inside a subscript is not valid C++.
-* an object-like macro that expands to **nothing but decoration**, such as
-  `#define HOST_DEVICE __forceinline__ [host, aicore]`. The expander blanks the
-  `#define` but leaves every use standing, and a bare identifier ahead of a
-  constructor derails the rest of the file. Such a macro is detected from its
-  body, not from a hard-coded name list, and blanked at each use.
-* `#ifdef __cplusplus` guarding `extern "C" {`, where the brace opens inside one
-  preprocessor block and closes inside another. `tree-sitter-cpp` requires each
-  block to be brace-balanced. Resolving the guard is exact rather than
-  approximate: this analyzer always parses as C++, so `__cplusplus` *is*
-  defined, the directive lines are inert, and blanking them leaves
-  `extern "C" { ... }` as ordinary balanced code.
-
-Two more constructs come from headers that are **not in the tree at all** —
-Catlass and the CANN tiling-key DSL are external dependencies, so their
-`#define`s can never be found and the body-based test above cannot classify
-them. Both rules are therefore *positional*, keyed on where the identifier
-sits rather than on what it is called:
-
-* a bare ALL-CAPS identifier **alone on its own line** at a declaration
-  boundary, or **directly in front of** `struct`/`class`/`template`/a type
-  keyword. No such line is valid C++ on its own, so either it is decoration —
-  and blanking it fixes the parse — or it expands to a whole declaration, which
-  was already unparseable. `CATLASS_DEVICE` decorates 42 files this way.
-* a **multi-line** ALL-CAPS macro invocation used as a statement, which is how
-  `ASCENDC_TPL_SEL(...)` writes a tiling-key table. Its argument list is not
-  valid C++ even as an expression. Only the multi-line form is blanked: a
-  one-line `FOO(a, b);` parses as an ordinary declaration, and a `)` followed
-  by `{` is a definition whose body is left intact, so `TORCH_LIBRARY` blocks
-  survive.
-
-Macro expansion handles four more cases that cascaded the same way:
-
-* a **variadic** `#define M(...)`, whose `__VA_ARGS__` was never substituted;
-* **stringification** — `GetOpApiFuncAddr(#aclCreateTensor)` left a `#` reading
-  as a directive in mid-statement, which alone accounted for thousands of error
-  lines in `torch_binding.cpp`;
-* an **operator token passed as an argument** — `UNARY_OP(+)` came out as the
-  ill-formed `operator (+)`, because arguments are parenthesised to protect
-  precedence;
-* a **single-token argument**, which was parenthesised for the same reason and
-  so produced `(SCFABlockCube)<ARGS>` in a type position.
-
-The last two share one rule: parentheses protect *precedence within an
-expression*. An argument that is not an expression, or that is a single token,
-has no precedence to protect, so it goes in bare.
+A location qualifier can also *arrive* through an expansion — a kernel that
+defines its own `HOST_DEVICE` wins over the frontend's empty definition — so
+the bracket rule runs again on the expanded text.
 
 ### Memory verification: satisfiability, not guesswork
 
@@ -642,10 +634,16 @@ PASSED  all 5 fixtures match their declarations
   loops with induction-dependent guards or parity are executed as three
   peeled phases (head / steady-state representative cycle / tail — see
   above), and the rest stay symbolic with the trip count unknown.
-* **Macro expander** — conditional compilation is not evaluated, with one
-  exception: an `#ifdef __cplusplus` guard is resolved, because this analyzer
-  always parses as C++. Other `#if` arms are left for tree-sitter.
-  Token pasting, stringification and variadic macros are supported.
+* **Conditional compilation** — a conditional is evaluated only when the
+  frontend can decide it. One on an undefined macro, and one naming a
+  core-split guard, are passed through so the visitor can walk both arms; that
+  keeps feature-gated code analyzable but means both arms are traced as if
+  compiled together. Macro expansion itself is a real token preprocessor, so
+  pasting, stringification and variadic macros are exact.
+* **Vendor headers** — `catlass/`, `tla/` and `kernel_operator.h` are not in
+  the tree, so their declarations are invisible. A decoration macro from one of
+  them is erased by name (`ERASED_DECORATION_MACROS`); anything else they
+  define is simply unknown.
 * **SFINAE template parameters** — `tree-sitter-cpp` cannot parse
   `template <class T, typename std::enable_if<...>::type* = nullptr>`, even in
   its simplest one-line form. Headers in the `tla/` style therefore keep a
@@ -678,10 +676,14 @@ ascend_analyzer/
   ir.py                KernelIR: operation trace, tensor table, scopes, loops
   analyzer.py          the pipeline facade
   cli.py               command line interface
+  baseline.py          finding fingerprints, baseline load/save, regressions
+  frontend/
+    ascend_preprocessor.py  pcpp-based token preprocessor, CCE normalizer,
+                            #line → origin mapping
   parsing/
     preprocess.py      equal-length qualifier rewrite, annotation extraction
     expr_eval.py       tree-sitter nodes → symbolic IR
-    ast_visitor.py     syntax tree → KernelIR
+    ast_visitor.py     syntax tree → KernelIR, tiling role inference
   checkers/
     memory.py          capacity, alignment, aliasing, domain mismatch
     deadlock.py        pairing, priming, marked-graph cycle detection

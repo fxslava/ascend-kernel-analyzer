@@ -22,11 +22,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import List, Mapping, Optional, Sequence, Tuple
 
 from ..hardware import ADDRESS_SPACE_TO_DOMAIN, PhysicalDomain
-from .macro_expand import expand_macros
+from ..frontend import preprocess_source
 
 __all__ = [
     "QualifierSpan",
@@ -356,6 +355,10 @@ class PreparedSource:
     expansion_stats: Mapping[str, int] = field(default_factory=dict)
     #: How many CCE declaration decorations the preparation pass blanked.
     decorations_blanked: int = 0
+    #: Messages from the token preprocessor.  Non-empty means some part of
+    #: the translation unit was not expanded, so a report has to say so
+    #: rather than present the analysis as complete.
+    frontend_errors: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.rewritten_bytes:
@@ -697,154 +700,6 @@ def _cplusplus_guard_spans(raw: bytes) -> List[Tuple[int, int]]:
     return spans
 
 
-#: An attribute macro standing alone on its own line.  ``CATLASS_DEVICE`` is
-#: the one that matters in this fleet: it decorates 42 files' member
-#: declarations and is defined in the Catlass headers, which are an external
-#: dependency and are not in the tree at all - so unlike ``HOST_DEVICE`` its
-#: ``#define`` can never be found, and the body-based test cannot classify it.
-#:
-#: The test is therefore *positional*, not name-based: a bare identifier alone
-#: on a line, at a declaration boundary, with no punctuation of any kind.  No
-#: such line is valid C++ on its own, so one of two things is true - it is a
-#: declaration-decoration macro, and blanking it fixes the parse, or it is a
-#: macro expanding to a whole declaration, which was already unparseable and
-#: so is lost either way.  Requiring ALL-CAPS and a length of four keeps it off
-#: ordinary identifiers.
-_LONE_MACRO_RE_BYTES = re.compile(
-    rb"^[ \t]*([A-Z][A-Z0-9_]{3,})[ \t]*$", re.MULTILINE
-)
-
-#: Bytes that end the previous line when we are *not* at a statement boundary -
-#: the lone identifier is then an operand of a continued expression, and
-#: blanking it would change the program.
-_CONTINUATION_TAILS = (
-    b"=", b"+", b"-", b"*", b"/", b"%", b",", b"(", b"[", b"&", b"|", b"^",
-    b"<", b">", b"?", b":", b"!", b"~", b"\\",
-)
-
-#: Bytes that cannot begin a declaration.  A lone identifier followed by one
-#: of these is a value - an enum member, an initialiser field - not decoration.
-_NOT_A_DECL_START = (b"}", b",", b"=", b")", b";", b":", b"]")
-
-#: Keywords that an all-caps identifier could be, and must not be blanked.
-_CAPS_KEYWORDS = frozenset({b"NULL", b"TRUE", b"FALSE"})
-
-
-def _lone_attribute_macro_spans(
-    raw: bytes, skip: Sequence[Tuple[int, int]]
-) -> List[Tuple[int, int]]:
-    """Spans of bare ALL-CAPS attribute macros occupying a whole line."""
-    spans: List[Tuple[int, int]] = []
-    for match in _LONE_MACRO_RE_BYTES.finditer(raw):
-        start, end = match.start(1), match.end(1)
-        if _in_spans(skip, start):
-            continue
-        if match.group(1) in _CAPS_KEYWORDS:
-            continue
-        # The previous non-blank line has to close a statement, so the
-        # identifier cannot be an operand of a continued expression.
-        probe = match.start() - 1
-        while probe >= 0 and raw[probe] in _SPACE_BYTES:
-            probe -= 1
-        if probe >= 0 and raw[probe : probe + 1] in _CONTINUATION_TAILS:
-            continue
-        # Decoration precedes a *declaration*.  A lone ALL-CAPS identifier
-        # followed by ``}`` is the last member of an enum or an aggregate
-        # initialiser - ``enum E { BARBAZ };`` - and blanking it would delete
-        # a constant the folder needs.  Checking what follows is what tells
-        # the two apart, since both can sit directly after a ``{``.
-        probe = end
-        while probe < len(raw) and raw[probe] in _SPACE_BYTES:
-            probe += 1
-        if probe >= len(raw) or raw[probe : probe + 1] in _NOT_A_DECL_START:
-            continue
-        spans.append((start, end))
-    return spans
-
-
-#: Keywords a declaration can start with.  An ALL-CAPS macro sitting directly
-#: in front of one is decoration - ``TEMPLATES_DEF_NO_DEFAULT struct Traits``
-#: - and, being unexpanded, derails the declaration it decorates.  Matching on
-#: the *following keyword* keeps this positional rather than name-based.
-_DECL_KEYWORD_RE_BYTES = re.compile(
-    rb"(?:^|(?<=[;{}\n]))[ \t]*([A-Z][A-Z0-9_]{3,})[ \t]+"
-    rb"(?=(?:struct|class|template|union|enum|typedef|using|static|inline|"
-    rb"constexpr|void|int|unsigned|signed|float|double|char|bool|auto)\b)"
-)
-
-
-def _decoration_prefix_spans(
-    raw: bytes, skip: Sequence[Tuple[int, int]]
-) -> List[Tuple[int, int]]:
-    """Spans of ALL-CAPS macros standing directly before a declaration keyword."""
-    spans: List[Tuple[int, int]] = []
-    for match in _DECL_KEYWORD_RE_BYTES.finditer(raw):
-        start, end = match.start(1), match.end(1)
-        if _in_spans(skip, start) or match.group(1) in _CAPS_KEYWORDS:
-            continue
-        spans.append((start, end))
-    return spans
-
-
-#: An ALL-CAPS function-like macro invocation opening a statement.
-_MACRO_CALL_RE_BYTES = re.compile(
-    rb"(?:^|(?<=[;{}\n]))([ \t\n]*)([A-Z][A-Z0-9_]{3,})[ \t\n]*\(", re.MULTILINE
-)
-
-
-def _macro_statement_spans(
-    raw: bytes, skip: Sequence[Tuple[int, int]]
-) -> List[Tuple[int, int]]:
-    """Spans of *multi-line* ALL-CAPS macro invocations used as a statement.
-
-    CANN's tiling-key DSL is written as a file-scope macro call spanning
-    dozens of lines::
-
-        ASCENDC_TPL_SEL(
-            ASCENDC_TPL_ARGS_SEL(ASCENDC_TPL_UINT_SEL(X_LAYOUT, ..., 0, 1),
-                                 ...),
-        );
-
-    The macro is defined in the CANN headers, which are not in the tree, so it
-    is never expanded - and its argument list is not valid C++ even as an
-    expression (note the trailing comma), so the whole region becomes one
-    ERROR node that swallows the rest of the file.
-
-    Only invocations that **span more than one line** are blanked.  A
-    single-line ``FOO(x);`` parses as an ordinary declaration and is left
-    alone; the multi-line form is the one that cascades, and an unexpanded
-    macro body carries nothing this analyzer could have modelled anyway.  A
-    definition (``)`` followed by ``{``) is never matched, so a macro-declared
-    function body is left intact.
-    """
-    spans: List[Tuple[int, int]] = []
-    for match in _MACRO_CALL_RE_BYTES.finditer(raw):
-        name_start = match.start(2)
-        if _in_spans(skip, name_start):
-            continue
-        open_paren = match.end() - 1
-        close = _balanced_paren_end(raw, open_paren)
-        if close < 0:
-            continue
-        # Multi-line only: a single-line call is parseable and harmless.
-        if raw.count(bytes([10]), name_start, close) == 0:
-            continue
-        end = close
-        probe = close
-        # Skip every kind of whitespace, newlines included: a macro such
-        # as TORCH_LIBRARY opens its brace on the line after the closing
-        # parenthesis, and stopping at the newline would blank the head of
-        # a definition and orphan its body.
-        while probe < len(raw) and raw[probe] in _SPACE_BYTES:
-            probe += 1
-        if probe < len(raw) and raw[probe : probe + 1] == b"{":
-            continue  # a definition, not a statement; leave the body alone
-        if probe < len(raw) and raw[probe : probe + 1] == b";":
-            end = probe + 1
-        spans.append((name_start, end))
-    return spans
-
-
 #: Public alias: the byte-span scanner is reused by the macro expander.
 non_code_spans = _non_code_spans
 
@@ -936,9 +791,6 @@ def prepare_source(
         + _decoration_macro_spans(
             rewritten_bytes, decoration_skip, attribute_macros
         )
-        + _lone_attribute_macro_spans(rewritten_bytes, decoration_skip)
-        + _macro_statement_spans(rewritten_bytes, decoration_skip)
-        + _decoration_prefix_spans(rewritten_bytes, decoration_skip)
     )
     rewritten_bytes = _blank_spans(rewritten_bytes, decoration_spans)
     rewritten = rewritten_bytes.decode("utf-8")
@@ -970,57 +822,50 @@ def prepare_source(
 
 
 def prepare_translation_unit(path: str, source: str) -> PreparedSource:
-    """Prepare a full translation unit: expand macros, then rewrite qualifiers.
+    """Prepare a full translation unit: preprocess, then rewrite qualifiers.
 
-    This is the front door the AST visitor uses.  When the source contains
-    preprocessor constructs worth handling - local includes or function-like
-    macros - :func:`~ascend_analyzer.parsing.macro_expand.expand_macros` runs
-    first and the qualifier rewrite is applied to the *expanded* text, so
-    qualifier spans line up with the buffer tree-sitter parses.  Everything the
-    checkers see is then translated back to original-file lines through
-    :attr:`PreparedSource.line_origins`.
+    This is the front door the AST visitor uses.
+    :func:`~ascend_analyzer.frontend.preprocess_source` runs a real C token
+    preprocessor over the source - macro expansion, ``#`` stringification,
+    ``##`` pasting, ``__VA_ARGS__``, conditional evaluation and local include
+    inlining - and the qualifier rewrite is then applied to the *expanded*
+    text, so qualifier spans line up with the buffer tree-sitter parses.
+    Everything the checkers see is translated back to original-file lines
+    through :attr:`PreparedSource.line_origins`.
 
-    Sources without ``#define``/``#include`` take the identity path and keep
-    the historical byte-for-byte invariants.
+    The qualifier and decoration rewrites still run afterwards, because a
+    location qualifier can *arrive* through an expansion: a kernel that
+    defines its own ``HOST_DEVICE`` wins over the frontend's empty definition,
+    and the ``[host, aicore]`` in its body then reaches the parse basis.
     """
-    base_dir: Optional[Path]
-    try:
-        # Pseudo paths like "<test>.cpp" resolve to the CWD; the include
-        # lookup simply finds nothing there.
-        base_dir = Path(path).resolve().parent
-    except (OSError, ValueError):
-        base_dir = None
-
-    expansion = expand_macros(source, base_dir=base_dir)
+    result = preprocess_source(path, source)
 
     # Object-like macros that expand to nothing but declaration decoration are
-    # blanked at their use sites.  ``HOST_DEVICE``
-    # (``__forceinline__ [host, aicore]``) is the one that matters most: the
-    # expander blanks its ``#define`` but leaves the 83 uses in a file such as
-    # ``attn_infra/coord.hpp`` standing, and a bare identifier ahead of a
-    # constructor turns the whole translation unit into one ERROR node.
+    # blanked at their use sites.  The token preprocessor already expands every
+    # macro it can see, so this now only catches one left standing because its
+    # definition was never reachable.
     attribute_macros = tuple(
         name
-        for name, body in expansion.object_macros.items()
+        for name, body in result.object_macros.items()
         if decoration_only_macro(body)
     )
 
-    if not expansion.changed:
-        return prepare_source(path, source, attribute_macros)
-
-    prepared = prepare_source(path, expansion.text, attribute_macros)
+    prepared = prepare_source(path, result.text, attribute_macros)
     prepared.original = source
-    prepared.line_origins = expansion.line_origins
-    prepared.macro_object_defs = tuple(expansion.object_macros.items())
-    stats = dict(expansion.stats)
+    prepared.line_origins = result.line_origins
+    prepared.macro_object_defs = tuple(result.object_macros.items())
+    stats = dict(result.stats)
     if prepared.decorations_blanked:
         stats["cce_decorations_blanked"] = prepared.decorations_blanked
+    if result.errors:
+        stats["frontend_errors"] = len(result.errors)
     prepared.expansion_stats = stats
+    prepared.frontend_errors = result.errors
     # Annotations were located on the expanded text; move them to the
     # original lines their expanded positions map back to, so suppression
     # matching against reported locations keeps working.
     prepared.annotations = tuple(
-        replace(ann, line=expansion.origin_line(ann.line))
+        replace(ann, line=result.origin_line(ann.line))
         for ann in prepared.annotations
     )
     return prepared
