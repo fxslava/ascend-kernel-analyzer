@@ -204,6 +204,28 @@ class TestUnresolvedIncludes:
         assert "include" not in expand(source)
 
 
+class TestIncludeNormalizationCache:
+    """A header edited between runs must not come back from the cache."""
+
+    def test_an_edited_include_is_re_normalized(self, tmp_path):
+        header = tmp_path / "svc.h"
+        main = tmp_path / "main.cpp"
+        main.write_text('#include "svc.h"' + nl, encoding="utf-8")
+
+        header.write_text("int first_version = 1;" + nl, encoding="utf-8")
+        one = preprocess_source(str(main), main.read_text(encoding="utf-8"))
+        assert "first_version" in one.text
+
+        # Longer than the first body, so even a coarse mtime cannot mask the
+        # edit: the cache key is (path, mtime_ns, size).
+        header.write_text(
+            "int second_and_longer_version = 2;" + nl, encoding="utf-8"
+        )
+        two = preprocess_source(str(main), main.read_text(encoding="utf-8"))
+        assert "second_and_longer_version" in two.text
+        assert "first_version" not in two.text
+
+
 class TestCommentsInMacroBodies:
     """A comment on a ``#define`` line is not part of the macro.
 

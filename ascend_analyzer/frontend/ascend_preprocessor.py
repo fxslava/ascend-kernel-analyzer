@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import copy
 import io
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -176,6 +177,13 @@ def _rewrite_launches(line: str) -> str:
 
 #: An ``#include`` directive, for attributing inlined content to its site.
 _INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*[<"]([^>"]+)[>"]')
+
+#: Memoised include normalization, keyed by ``(path, mtime_ns, size)`` so an
+#: edited header invalidates itself.  Bounded and evicted FIFO; a long audit
+#: touches far more files than a kernel has unique headers, and the entries
+#: are large (whole normalized headers).
+_INCLUDE_CACHE: Dict[Tuple[str, int, int], str] = {}
+_INCLUDE_CACHE_MAX = 256
 
 
 def _include_sites(source: str) -> Dict[str, int]:
@@ -583,11 +591,31 @@ class AscendCPreprocessor(Preprocessor):
 
         Reading through a buffer also pins the encoding: these headers are
         UTF-8, and decoding one as cp1252 aborts the whole unit.
+
+        Normalized text is memoised per ``(path, mtime, size)``: a fleet audit
+        preprocesses the same shared headers once per translation unit that
+        includes them, and the normalizer is pure-Python byte scanning - the
+        cache is what keeps a thousand-file pass from re-normalizing the same
+        service header a thousand times.
         """
+        try:
+            stat = os.stat(includepath)
+            key = (str(includepath), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            key = None
+        if key is not None:
+            hit = _INCLUDE_CACHE.get(key)
+            if hit is not None:
+                return io.StringIO(hit)
         text = io.open(includepath, "r", encoding="utf-8", errors="replace").read()
         if text.startswith("﻿"):
             text = text[1:]
-        return io.StringIO(normalize_cce_syntax(text))
+        normalized = normalize_cce_syntax(text)
+        if key is not None:
+            if len(_INCLUDE_CACHE) >= _INCLUDE_CACHE_MAX:
+                _INCLUDE_CACHE.pop(next(iter(_INCLUDE_CACHE)))
+            _INCLUDE_CACHE[key] = normalized
+        return io.StringIO(normalized)
 
     def on_error(self, file, line, msg):
         """Collect diagnostics rather than printing them."""
