@@ -95,6 +95,7 @@ class TerminalReporter:
         width: int = 78,
         show_memory_map: bool = True,
         show_sync: bool = True,
+        show_perf: bool = True,
         max_diagnostics: int = 0,
     ) -> None:
         self.stream = stream or sys.stdout
@@ -105,6 +106,7 @@ class TerminalReporter:
         self.width = width
         self.show_memory_map = show_memory_map
         self.show_sync = show_sync
+        self.show_perf = show_perf
         self.max_diagnostics = max_diagnostics
 
     # -- helpers ------------------------------------------------------------
@@ -166,6 +168,10 @@ class TerminalReporter:
         if self.show_sync:
             for kernel in unit.kernels:
                 self._report_sync(kernel, artifacts)
+
+        if self.show_perf:
+            for kernel in unit.kernels:
+                self._report_perf(kernel, artifacts)
 
         self._report_verdict(diagnostics)
 
@@ -328,6 +334,49 @@ class TerminalReporter:
             )
         )
 
+    # -- performance ---------------------------------------------------------
+
+    def _report_perf(self, kernel: KernelIR, artifacts: Dict[str, object]) -> None:
+        profile = artifacts.get(f"perf_profile::{kernel.name}")
+        if not isinstance(profile, dict) or "makespan_cycles" not in profile:
+            return
+        self._heading(f"Pipeline performance - {kernel.name}")
+        makespan = profile["makespan_cycles"]
+        overlap = profile.get("overlap_ratio") or 0.0
+        bottleneck = profile.get("bottleneck") or "NONE"
+        handoff = profile.get("handoff_cycles", 30)
+        self._write(
+            f"  estimated makespan    {makespan} cycles   "
+            + self.palette.dim("(analytical model)")
+        )
+        self._write(
+            f"  concurrency           {overlap:.0%}   "
+            + self.palette.dim(
+                f"overlap across {profile.get('active_pipes', 0)} pipelines"
+            )
+        )
+        self._write(
+            f"  bottleneck            {bottleneck}   "
+            + self.palette.dim(f"per-flag hand-off {handoff} cycles")
+        )
+        drain = profile.get("drain_cycles") or 0
+        if drain:
+            self._write(
+                f"  serialized tail       {drain} cycles   "
+                + self.palette.dim(f"{drain / max(makespan, 1):.0%} of the makespan")
+            )
+
+        self._write()
+        self._write("  " + self.palette.dim("utilization per pipeline"))
+        for pipe in profile.get("pipes") or []:
+            self._write(_utilization_bar(pipe, self.glyphs, self.palette))
+        self._write(
+            "    "
+            + self.palette.dim(
+                "stall = cycles the queue sat at a WaitFlag with nothing else issued"
+            )
+        )
+
     # -- verdict ------------------------------------------------------------
 
     def _report_verdict(self, diagnostics: Sequence[Diagnostic]) -> None:
@@ -360,6 +409,23 @@ class TerminalReporter:
                 "  " + self.palette.ok("ACCEPTED") + "  layout and synchronisation verified."
             )
         self._write()
+
+
+def _utilization_bar(pipe: dict, glyphs: Glyphs, palette: Palette) -> str:
+    """One ASCII gauge per pipeline: filled = busy, empty = idle of makespan."""
+    width = 26
+    utilization = min(1.0, max(0.0, float(pipe.get("utilization") or 0.0)))
+    filled = round(utilization * width)
+    bar = glyphs.fill * filled + glyphs.empty * (width - filled)
+    stall = pipe.get("stall_cycles") or 0
+    stall_note = (
+        palette.warning(f"  stall {stall:>5}") if stall else f"  stall {0:>5}"
+    )
+    return (
+        f"    {str(pipe.get('pipe')):<9} [{bar}] "
+        f"{utilization:>4.0%}  busy {pipe.get('busy_cycles', 0):>5}"
+        + stall_note
+    )
 
 
 def _timeline_glyph(op) -> str:

@@ -61,6 +61,13 @@ $ ascend-analyze vec_add.cpp --chip ascend910b
 | `AKA3001` | `PipeBarrier(PIPE_ALL)` antipattern | Warning. Drains every pipeline, discarding the overlap double buffering exists to create. The fix names the two pipelines that actually share data. |
 | `AKA3006` | UB bank conflict on Vector ALU | Warning. UB is an interleaved 8-bank structure in 32-byte blocks; a dual-operand instruction (`Add`, `Mul`, `Sub`, `Max`, `Min`, ...) whose two sources sit `8k` blocks apart reads both from the same bank and stalls the read ports. Pad one source by +32 bytes (one DaVinci block) for bank-orthogonal bases. Note: this check was specified as "AKA3003", but that code already belongs to `SYMBOLIC_EVENT_ID` and is pinned there by the shipped tests, so the bank conflict carries the next free code in the 3xxx performance block. |
 
+### Performance model and overlap profiling
+
+| Code | Finding | What it means |
+|---|---|---|
+| `AKA4001` | Exposed sync bubbles / pipeline stalls | Warning. Cross-queue `SetFlag`/`WaitFlag` hand-offs each cost ~30 cycles; when they exceed a third of the kernel's issued work, the pipelines are stalling more than computing. The message names the two worst hand-off routes. |
+| `AKA4002` | Cube compute underutilization | Warning. The cube unit is busy under half the modeled makespan while the move engines feed it - the contraction is not the critical path, the feeding chain is. |
+
 `ascend-analyze --list-codes` prints the full table.
 
 ---
@@ -307,6 +314,38 @@ Whenever the SIMT path is present — `__simt_vf__`, `__simt_callee__` or
 `max_usable_ub_bytes` (216 KiB) and raises `AKA1010` when the floor would be
 breached. Other profiles do not partition the UB and are unaffected.
 
+### The analytical performance model
+
+Once the deadlock checker has proven the marked graph acyclic, its
+topological order is a legal issue order - so an as-soon-as-possible schedule
+over the dependency DAG is a faithful first-order performance model. The
+`perf` checker builds one from the chip's latency model:
+
+| Quantity | Model |
+|---|---|
+| MTE2 / MTE1 / Fixpipe(+MTE3) | `bytes / 64 B-per-cycle` sustained transfer bandwidth |
+| Vector unit | one `vector_bytes` (256 B) register footprint per cycle |
+| Cube contraction | `ceil(M/16) · ceil(K/16) · ceil(N/16)` cycles - one 16×16×16 fractal per cycle, with the shape recovered from `mmad_t::shape_t((uint16_t)M, ...)` call sites |
+| `SetFlag` → `WaitFlag` hand-off | ~30 cycles of cross-queue latency per matched pair |
+
+The schedule yields the **critical-path makespan**, per-pipe busy / idle /
+**stall** timestamps (a stall is time a queue sat at a `WaitFlag` with nothing
+else issued), the **overlap ratio** (`Σ busy / (makespan × pipes)`) and a
+bottleneck classification: `DRAIN_BOUND` (a serialized tail nothing overlaps),
+`SYNC_BOUND` (hand-off bubbles dominate), `MEMORY_BOUND` (a move engine drives
+the critical path) or `COMPUTE_BOUND` (the cube/vector unit does). The
+terminal report prints the summary with ASCII utilization bars per pipeline,
+and the JSON report carries the full profile (`--disable perf` skips it;
+`--no-perf-summary` hides the section).
+
+Advisories (`AKA4001`, `AKA4002`) are gated on a modeled makespan of at least
+500 cycles so short kernels' inherent fill/drain bubbles are not nagged - the
+negative-control fixtures stay silent. `tests/kernels/
+nvfp4_pipelined_dequant.cpp` demonstrates both ends: its double-buffered
+Pipeline A still exposes the ~30-cycle `M_FIX` hand-off per small tile, while
+its Pipeline B serializes every stage behind five handshakes and lands at a
+fraction of Pipeline A's overlap.
+
 ---
 
 ## Recognised source forms
@@ -442,7 +481,7 @@ The `ascend910b` profile is the one the regression suite pins; `ascend910c` and
 ```bash
 python tests/harness.py            # the runnable harness, exits non-zero on mismatch
 python tests/harness.py --verbose  # plus the full report per fixture
-python -m pytest                   # 485 tests
+python -m pytest                   # 529 tests
 ```
 
 The harness runs every fixture and checks the findings against expectations
@@ -471,6 +510,7 @@ PASSED  all 5 fixtures match their declarations
 | `bank_conflict_vec.cpp` | A dual-operand `Add` whose sources sit 8 blocks (256 B) apart — same UB bank, `AKA3006` — next to a control pair skewed by one 32-byte block. |
 | `loop_peeling_long.cpp` | A four-channel pipelined kernel with `T = 512` and ping-pong parity: three-phase peeling keeps the sync graph at 32 nodes and the analysis far under 200 ms, with zero findings. |
 | `simt_ub_budget_351x.cpp` | 220 KiB of UB tensors plus `asc_call_vf` calls: fatal `AKA1010` DataCache starvation on `--chip ascend351x` (plain `AKA1001` overflow on the default 910B profile). |
+| `nvfp4_pipelined_dequant.cpp` | The performance-profiler fixture: Pipeline A is double-buffered but its small NVFP4 tiles cannot amortise the `M_FIX` hand-off (`AKA4001`, `AKA4002`), while Pipeline B serializes the identical stages behind five handshakes at half the overlap ratio. |
 
 ---
 

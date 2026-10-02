@@ -146,6 +146,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="omit the pipeline synchronisation summary from the terminal report",
     )
     output.add_argument(
+        "--no-perf-summary", action="store_true",
+        help="omit the analytical performance / utilization section from the "
+        "terminal report",
+    )
+    output.add_argument(
         "--max-findings", type=int, default=0, metavar="N",
         help="show at most N findings in the terminal report (0 = all)",
     )
@@ -369,6 +374,7 @@ def _print_codes() -> None:
         "1xxx  memory layout": "AKA1",
         "2xxx  synchronisation and pipeline": "AKA2",
         "3xxx  performance and analyzability": "AKA3",
+        "4xxx  performance model / overlap profiling": "AKA4",
         "9xxx  analyzer infrastructure": "AKA9",
     }
     for heading, prefix in groups.items():

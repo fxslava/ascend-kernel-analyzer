@@ -92,6 +92,9 @@ def _kernel_json(
     sync = artifacts.get(f"sync_graph::{kernel.name}")
     if isinstance(sync, dict):
         payload["synchronisation"] = sync
+    perf = artifacts.get(f"perf_profile::{kernel.name}")
+    if isinstance(perf, dict):
+        payload["performance"] = perf
     usage = artifacts.get(f"memory_usage::{kernel.name}")
     if usage is not None:
         payload["domain_usage"] = usage

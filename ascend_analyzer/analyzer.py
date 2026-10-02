@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .checkers.base import CheckerContext
 from .checkers.deadlock import DeadlockChecker
 from .checkers.memory import MemoryChecker
+from .checkers.perf_model import PerfModelChecker
 from .diagnostics import Diagnostic, DiagnosticCollector, Severity
 from .hardware import HardwareModel, PhysicalDomain
 from .ir import AnalysisUnit
@@ -25,7 +26,11 @@ __all__ = ["AnalyzerOptions", "AnalysisResult", "KernelAnalyzer", "TOOL_VERSION"
 TOOL_VERSION = "0.1.0"
 
 #: Checker names recognised by ``--disable``.
-AVAILABLE_CHECKERS: Tuple[str, ...] = (MemoryChecker.name, DeadlockChecker.name)
+AVAILABLE_CHECKERS: Tuple[str, ...] = (
+    MemoryChecker.name,
+    DeadlockChecker.name,
+    PerfModelChecker.name,
+)
 
 
 @dataclass
@@ -155,6 +160,10 @@ class KernelAnalyzer:
             MemoryChecker(context, solver=self._solver).run_all()
         if DeadlockChecker.name not in disabled:
             DeadlockChecker(context).run_all()
+        if PerfModelChecker.name not in disabled:
+            # Runs last: the overlap profiler schedules the DAG the deadlock
+            # checker proved acyclic and publishes perf_profile artifacts.
+            PerfModelChecker(context).run_all()
 
         kept, dropped = self._partition(unit, collector.items)
         return AnalysisResult(

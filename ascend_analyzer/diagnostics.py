@@ -47,7 +47,8 @@ class Code(str, enum.Enum):
     """Stable diagnostic identifiers.
 
     The numeric blocks are: ``1xxx`` memory layout, ``2xxx`` synchronisation
-    and pipeline, ``3xxx`` performance and analyzability, ``9xxx`` analyzer
+    and pipeline, ``3xxx`` performance and analyzability, ``4xxx`` the
+    analytical performance model (overlap profiling), ``9xxx`` analyzer
     infrastructure.
     """
 
@@ -88,6 +89,10 @@ class Code(str, enum.Enum):
     # the next free code in the 3xxx performance block.
     UB_BANK_CONFLICT = "AKA3006"
 
+    # -- 4xxx: performance model / overlap profiling ------------------------
+    PERF_SYNC_STALL = "AKA4001"
+    PERF_CUBE_UNDERUTIL = "AKA4002"
+
     # -- 9xxx: analyzer infrastructure -------------------------------------
     PARSE_ERROR = "AKA9001"
     UNRESOLVED_TENSOR = "AKA9002"
@@ -123,6 +128,8 @@ CODE_TITLES: Dict[str, str] = {
     Code.UB_FRAGMENTATION.value: "Fragmented SRAM layout",
     Code.REDUNDANT_BARRIER.value: "Redundant consecutive barrier",
     Code.UB_BANK_CONFLICT.value: "UB bank conflict on Vector ALU",
+    Code.PERF_SYNC_STALL.value: "Exposed sync bubbles / pipeline stalls",
+    Code.PERF_CUBE_UNDERUTIL.value: "Cube compute underutilization",
     Code.PARSE_ERROR.value: "Source could not be parsed cleanly",
     Code.UNRESOLVED_TENSOR.value: "Tensor argument could not be resolved",
     Code.NO_KERNEL_FOUND.value: "No kernel entry point found",

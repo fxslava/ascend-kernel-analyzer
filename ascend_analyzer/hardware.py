@@ -324,6 +324,25 @@ class ChipSpec:
     #: Largest static+dynamic tensor allocation that still leaves the minimum
     #: DataCache: ``ub_total - compiler_reserved - min_datacache``.
     max_usable_ub_bytes: Optional[int] = None
+    # -- analytical performance model ----------------------------------------
+    #: Sustained GM -> L1/UB move-in bandwidth, bytes per cycle (PIPE_MTE2).
+    mte2_bytes_per_cycle: int = 64
+    #: Sustained L1 -> L0A/L0B fractal-load bandwidth, bytes per cycle
+    #: (PIPE_MTE1).
+    mte1_bytes_per_cycle: int = 64
+    #: Sustained L0C -> GM/UB fixpipe drain bandwidth, bytes per cycle
+    #: (PIPE_FIX; PIPE_MTE3 stores share the GM write path and use it too).
+    fixpipe_bytes_per_cycle: int = 64
+    #: Cube contraction throughput in multiply-accumulates per cycle: one
+    #: 16x16x16 fractal multiply per cycle on a full AI core.
+    cube_macs_per_cycle: int = 4096
+    #: Cube operand-read throughput, bytes per cycle, used when the (M, K, N)
+    #: tile shape cannot be recovered from the call site.
+    cube_read_bytes_per_cycle: int = 1024
+    #: Cross-queue synchronisation hand-off penalty in cycles: the latency a
+    #: ``SetFlag`` -> ``WaitFlag`` pair adds between two pipelines even when
+    #: the producing instruction has already completed.
+    sync_handoff_cycles: int = 30
 
     def domain_spec(self, domain: PhysicalDomain) -> Optional[DomainSpec]:
         return self.domains.get(domain)
@@ -343,6 +362,19 @@ class ChipSpec:
             and self.min_datacache_bytes is not None
             and self.max_usable_ub_bytes is not None
         )
+
+    def cube_contraction_cycles(self, m: int, k: int, n: int) -> int:
+        """Cycles for one ``(m, k, n)`` Cube contraction.
+
+        The cube unit retires one 16x16x16 fractal multiply per cycle, so the
+        cost is the product of the ceil-rounded fractal counts along each
+        dimension - exact for whole-fractal tiles and monotone otherwise.
+        """
+        fractal = 16
+        m_f = -(-max(m, 1) // fractal)
+        k_f = -(-max(k, 1) // fractal)
+        n_f = -(-max(n, 1) // fractal)
+        return m_f * k_f * n_f
 
 
 def _domains(**kw: Tuple[int, int, int, int, str]) -> Dict[PhysicalDomain, DomainSpec]:
@@ -536,6 +568,24 @@ class HardwareModel:
                 if "max_usable_ub_bytes" in raw
                 else base.max_usable_ub_bytes
             ),
+            mte2_bytes_per_cycle=int(
+                raw.get("mte2_bytes_per_cycle", base.mte2_bytes_per_cycle)
+            ),
+            mte1_bytes_per_cycle=int(
+                raw.get("mte1_bytes_per_cycle", base.mte1_bytes_per_cycle)
+            ),
+            fixpipe_bytes_per_cycle=int(
+                raw.get("fixpipe_bytes_per_cycle", base.fixpipe_bytes_per_cycle)
+            ),
+            cube_macs_per_cycle=int(
+                raw.get("cube_macs_per_cycle", base.cube_macs_per_cycle)
+            ),
+            cube_read_bytes_per_cycle=int(
+                raw.get("cube_read_bytes_per_cycle", base.cube_read_bytes_per_cycle)
+            ),
+            sync_handoff_cycles=int(
+                raw.get("sync_handoff_cycles", base.sync_handoff_cycles)
+            ),
         )
         return cls(chip=spec)
 
@@ -580,6 +630,24 @@ class HardwareModel:
             return None
         return chip.ub_total_bytes - allocated_bytes - chip.compiler_reserved_bytes
 
+    def pipe_bytes_per_cycle(self, pipe: Pipe) -> Optional[int]:
+        """Modeled sustained throughput of one engine, in bytes per cycle.
+
+        ``None`` for pipes without a bandwidth model (the scalar unit, flag
+        issue, barriers): the performance profiler treats those as costing a
+        nominal issue cycle each rather than moving bulk data.
+        """
+        chip = self.chip
+        return {
+            Pipe.MTE2: chip.mte2_bytes_per_cycle,
+            Pipe.MTE1: chip.mte1_bytes_per_cycle,
+            Pipe.MTE3: chip.fixpipe_bytes_per_cycle,
+            Pipe.FIX: chip.fixpipe_bytes_per_cycle,
+            # The vector unit retires vector_bytes (one full vector register
+            # footprint) per cycle.
+            Pipe.V: chip.vector_bytes,
+        }.get(pipe)
+
     def tracked_sram_domains(self) -> Tuple[PhysicalDomain, ...]:
         return tuple(spec.domain for spec in self.chip.sram_domains())
 
@@ -601,6 +669,14 @@ class HardwareModel:
             }
             if self.chip.enforces_datacache_partition
             else None,
+            "perf_model": {
+                "mte2_bytes_per_cycle": self.chip.mte2_bytes_per_cycle,
+                "mte1_bytes_per_cycle": self.chip.mte1_bytes_per_cycle,
+                "fixpipe_bytes_per_cycle": self.chip.fixpipe_bytes_per_cycle,
+                "cube_macs_per_cycle": self.chip.cube_macs_per_cycle,
+                "cube_read_bytes_per_cycle": self.chip.cube_read_bytes_per_cycle,
+                "sync_handoff_cycles": self.chip.sync_handoff_cycles,
+            },
             "domains": {
                 spec.domain.value: {
                     "capacity_bytes": spec.capacity_bytes,
