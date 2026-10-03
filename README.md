@@ -622,7 +622,16 @@ PASSED  all 5 fixtures match their declarations
 ## Known limits
 
 * **Interprocedural analysis** — only the kernel body is walked. A handshake
-  split across a helper function is not tracked.
+  split across a helper function is not tracked, and this is the main limit on
+  `AKA2010`: the vllm-ascend fleet wraps its handshakes in a
+  `SetWaitFlag<HardEvent::MTE3_V>(...)` helper whose body is the
+  `SetFlag`/`WaitFlag` pair, so the call site shows no flag operation at all.
+  Measured over 1259 sources, 22% of raw `AKA2010` hits sit in files using
+  that helper, and a further 46% in files whose only barrier is
+  `PipeBarrier<PIPE_V>` (2302 uses fleet-wide against 121 global
+  `PIPE_ALL`), which drains the vector queue and so is *not* evidence of
+  cross-pipe ordering. Treat `AKA2010` as a lead to investigate, not a defect
+  count, until sync helpers are inlined.
 * **Conditionals** — an `if` whose condition folds to a constant keeps only
   the taken arm (this is what prunes the epilogue guards of an unrolled
   pipeline loop); a genuinely runtime condition walks both arms as if
