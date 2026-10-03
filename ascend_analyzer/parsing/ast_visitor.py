@@ -358,7 +358,10 @@ _USE_METHODS = frozenset(
 #: Factory calls that yield a fully specified local tensor.
 _TENSOR_FACTORIES = frozenset({"GetLocalTensor", "CreateLocalTensor", "MakeLocalTensor"})
 #: Buffer accessor methods returning a sub-tensor at a byte offset.
-_BUFFER_GET_BYTE_METHODS = frozenset({"GetBufferByByte", "GetWithOffset", "GetBufferAddr"})
+#: Byte-first buffer accessors: the single argument is a byte offset.
+#: (``GetWithOffset`` is NOT here: its CANN signature is
+#: ``(elementCount, byteOffset)`` and gets a dedicated branch.)
+_BUFFER_GET_BYTE_METHODS = frozenset({"GetBufferByByte", "GetBufferAddr"})
 
 _SET_FLAG_NAMES = frozenset({"SetFlag", "set_flag", "SetFlagImpl"})
 _WAIT_FLAG_NAMES = frozenset({"WaitFlag", "wait_flag", "WaitFlagImpl"})
@@ -1065,13 +1068,23 @@ class ASTVisitor:
             type_node = node.child_by_field_name("type")
             type_text = self.text(type_node) if type_node is not None else ""
             decl_text = self.text(node)
-            match = _TBUF_TYPE_RE.search(type_text) or _TBUF_TYPE_RE.search(decl_text)
-            if match is None:
-                continue
-            position = TPosition.parse(match.group("pos"))
-            if position is None:
-                continue
-            depth = _queue_depth(type_text or decl_text)
+            # AST template-argument parse first (named depth constants and
+            # multi-line declarations survive it); textual regex fallback.
+            info = _buffer_template_info(self, type_node)
+            if info is not None:
+                position, depth = info
+                if position is None:
+                    continue
+                if depth is None:
+                    depth = 1  # InitBuffer(que, num, len) overrides this
+            else:
+                match = _TBUF_TYPE_RE.search(type_text) or _TBUF_TYPE_RE.search(decl_text)
+                if match is None:
+                    continue
+                position = TPosition.parse(match.group("pos"))
+                if position is None:
+                    continue
+                depth = _queue_depth(type_text or decl_text)
             for declarator in node.children_by_field_name("declarator"):
                 name_node = _declarator_identifier(declarator)
                 if name_node is None:
@@ -1330,6 +1343,22 @@ class ASTVisitor:
             if base is not None:
                 self._called_functions.add(base)
 
+    def _owner_class_names(self) -> FrozenSet[str]:
+        """Classes that own at least one indexed method in this unit.
+
+        Used to recognise class-typed locals (``CubeStage cube;``) so member
+        calls through a known receiver resolve to that class's method body
+        rather than dying on a same-named sibling method.
+        """
+        try:
+            return self._owner_class_names_cache
+        except AttributeError:
+            cache = frozenset(
+                owner for (owner, _name) in self._functions if owner is not None
+            )
+            self._owner_class_names_cache = cache
+            return cache
+
 
 # ---------------------------------------------------------------------------
 # Per-kernel walker
@@ -1360,6 +1389,12 @@ class _KernelWalker:
         self._buffer_sizes: Dict[str, Expr] = {}
         #: LocalTensor name -> the TBuf it was obtained from via ``.Get()``.
         self._tensor_buffers: Dict[str, str] = {}
+        #: Local variable name -> the stage CLASS it was declared as
+        #: (``CubeStage cube;``).  Member calls through that receiver resolve
+        #: against that class's methods first, which is what disambiguates
+        #: ``cube.Init(...)`` from ``vec.Init(...)`` in a MIX_AIC_1_1 entry
+        #: that instantiates two stage classes with colliding method names.
+        self._var_classes: Dict[str, str] = {}
         #: Per-block length of each queue, which is what one ``AllocTensor``
         #: hands out (``_buffer_sizes`` holds the whole reserved extent).
         self._buffer_blocks: Dict[str, Expr] = {}
@@ -2076,6 +2111,17 @@ class _KernelWalker:
         decl_text = self._text(node)
 
         # Buffer objects carrying an explicit TPosition template argument.
+        # Prefer the AST template-argument parse (handles named depth
+        # constants and multi-line declarations); fall back to the legacy
+        # textual match for malformed-but-regexable spellings.
+        buf_info = _buffer_template_info(self.v, type_node)
+        if buf_info is not None:
+            if buf_info[0] is not None:
+                for declarator in node.children_by_field_name("declarator"):
+                    name_node = _declarator_identifier(declarator)
+                    if name_node is not None:
+                        self._buffer_positions[self._text(name_node)] = buf_info[0]
+            return
         tbuf = _TBUF_TYPE_RE.search(type_text) or _TBUF_TYPE_RE.search(decl_text)
         if tbuf is not None:
             position = TPosition.parse(tbuf.group("pos"))
@@ -2083,6 +2129,19 @@ class _KernelWalker:
                 name_node = _declarator_identifier(declarator)
                 if name_node is not None and position is not None:
                     self._buffer_positions[self._text(name_node)] = position
+            return
+
+        # Class-typed locals (``CubeStage cube;`` / ``StageA a;``): remember
+        # the static type so ``cube.Process()`` resolves to CubeStage's method
+        # even when a sibling class defines the same method name.  Without
+        # this, a MIX entry owning two stage classes cannot resolve either
+        # call and the whole kernel walk collapses to zero operations.
+        bare_type = _bare_type_name(type_text)
+        if bare_type and bare_type in self.v._owner_class_names():
+            for declarator in node.children_by_field_name("declarator"):
+                name_node = _declarator_identifier(declarator)
+                if name_node is not None:
+                    self._var_classes[self._text(name_node)] = bare_type
             return
 
         # Foldable scalar initialisers (``int p = t & 1;`` inside an unrolled
@@ -2095,6 +2154,14 @@ class _KernelWalker:
             self._declare_tensors(node, tensor_match)
             self._scan_for_ops(node)
             return
+
+        # ``auto x = que.AllocTensor<T>();`` / ``auto y = buf.Get<T>();`` --
+        # the initializer's template argument names the element type, so the
+        # tensor is declared exactly as an explicitly typed LocalTensor
+        # declaration would have been.
+        if _bare_type_name(type_text) == "auto":
+            if self._declare_auto_tensors(node):
+                return
 
         # ``constexpr``/``const`` scalars feed the folding environment.
         self.v._collect_constexpr(node, self._env)
@@ -2158,6 +2225,44 @@ class _KernelWalker:
                 self._bind_from_initializer(decl, value_node)
             self.ir.tensors[name] = decl
 
+    def _declare_auto_tensors(self, node: Node) -> bool:
+        """Declare ``auto x = <tensor accessor call>();`` locals as tensors.
+
+        Covers ``que.AllocTensor<T>()``, ``que.DeQue<T>()``, ``buf.Get<T>()``
+        and ``buf.GetWithOffset<T>(count, offset)``: the template argument
+        carries the element type, so the binding below sees a TensorDecl
+        with a real ``elem_size`` and the layout checks cover it like any
+        explicitly typed declaration.  Returns ``True`` when at least one
+        declarator was recognized (the caller then skips generic scanning).
+        """
+        made = False
+        for declarator in node.children_by_field_name("declarator"):
+            if declarator.type != "init_declarator":
+                continue
+            name_node = _declarator_identifier(declarator.child_by_field_name("declarator"))
+            value_node = declarator.child_by_field_name("value")
+            if name_node is None or name_node.type != "identifier" or value_node is None:
+                continue
+            dtype = _auto_tensor_dtype(self.v, value_node)
+            if dtype is None:
+                continue
+            name = self._text(name_node)
+            decl = TensorDecl(
+                name=name,
+                loc=self._loc(declarator),
+                position=None,
+                domain=PhysicalDomain.UNKNOWN,
+                dtype=dtype,
+                elem_size=dtype_size(dtype),
+                scope_id=self._scope_id,
+                origin="auto tensor declaration",
+                unbound=True,
+            )
+            self._bind_from_initializer(decl, value_node)
+            self.ir.tensors[name] = decl
+            made = True
+        return made
+
     def _bind_from_initializer(self, decl: TensorDecl, value: Node) -> None:
         """Resolve ``LocalTensor<T> t = <expr>;`` into a concrete binding."""
         if value.type == "call_expression":
@@ -2165,11 +2270,36 @@ class _KernelWalker:
             args = _argument_nodes(value)
             base = _callee_base_name(self.v, func)
 
+            # ``buf.GetWithOffset<T>(elementCount, byteOffset)`` -- the CANN
+            # parameter order: the element count comes FIRST and supplies the
+            # tensor's extent (count * sizeof(T)); the byte offset into the
+            # buffer comes SECOND and is pool-relative.
+            if base == "GetWithOffset" and func is not None:
+                receiver = _field_receiver_name(self.v, func)
+                if receiver and receiver in self._buffer_positions:
+                    self._assign_position(decl, self._buffer_positions[receiver])
+                    self._tensor_buffers[decl.name] = receiver
+                    decl.source_buffer = receiver
+                if len(args) >= 2:
+                    count = self.v._eval.evaluate(args[0], self._env)
+                    if count is not None:
+                        decl.elem_count = count
+                    decl.byte_offset = self.v._eval.evaluate(args[1], self._env)
+                    decl.unbound = decl.byte_offset is None
+                elif args:
+                    # Degenerate single-argument spelling: byte offset only.
+                    decl.byte_offset = self.v._eval.evaluate(args[0], self._env)
+                    decl.unbound = decl.byte_offset is None
+                decl.origin = "buffer accessor"
+                return
+
             # ``buf.GetBufferByByte<T>(byteOffset)``
             if base in _BUFFER_GET_BYTE_METHODS and func is not None:
                 receiver = _field_receiver_name(self.v, func)
                 if receiver and receiver in self._buffer_positions:
                     self._assign_position(decl, self._buffer_positions[receiver])
+                    self._tensor_buffers[decl.name] = receiver
+                    decl.source_buffer = receiver
                 if args:
                     decl.byte_offset = self.v._eval.evaluate(args[0], self._env)
                     decl.unbound = decl.byte_offset is None
@@ -2385,7 +2515,17 @@ class _KernelWalker:
         """
         if base in self._inline_stack:
             return False
-        entry = self.v.resolve_callee(base, self._owner_class)
+        # Receiver-typed resolution: ``cube.Process()`` where ``cube`` was
+        # declared as ``CubeStage cube;`` resolves against CubeStage's
+        # methods first.  This is what keeps a MIX_AIC_1_1 entry that owns
+        # two stage classes (both typically defining Init/Process) from
+        # collapsing into an unresolvable name collision.
+        func = node.child_by_field_name("function")
+        receiver = _field_receiver_name(self.v, func)
+        receiver_owner = self._var_classes.get(receiver) if receiver else None
+        entry = self.v.resolve_callee(base, receiver_owner or self._owner_class)
+        if entry is None and receiver_owner is not None:
+            entry = self.v.resolve_callee(base, self._owner_class)
         if entry is None:
             return False
         params, body, definition = entry
@@ -2834,11 +2974,20 @@ class _KernelWalker:
             if decl.byte_offset is None:
                 decl.byte_offset = Const(base)
                 decl.unbound = False
+            elif decl.source_buffer == buffer_name:
+                # Accessor views (GetWithOffset / GetBufferByByte) carry a
+                # POOL-RELATIVE offset argument; place it inside the buffer.
+                rel = to_int(decl.byte_offset)
+                if rel is not None:
+                    decl.byte_offset = Const(base + rel)
+                    decl.unbound = False
             # One accessor call hands out one block, not the queue's whole
             # reserved extent, so a depth-2 queue sizes its tensors by block.
+            # A view that already named its element count (GetWithOffset's
+            # first argument) keeps that exact extent.
             block = to_int(self._buffer_blocks.get(buffer_name))
             if block is not None:
-                if decl.byte_size is None:
+                if decl.byte_size is None and decl.elem_count is None:
                     decl.byte_size = Const(block)
                 if decl.elem_count is None and decl.elem_size:
                     decl.elem_count = Const(block // decl.elem_size)
@@ -3005,6 +3154,102 @@ def _field_receiver_name(visitor: ASTVisitor, func: Optional[Node]) -> Optional[
     if argument is None:
         return None
     return _leading_identifier(visitor.text(argument))
+
+
+def _bare_type_name(type_text: str) -> str:
+    """The unqualified, unadorned class name of a declaration's type text.
+
+    ``"AscendC::CubeStage"``/``"const StageA &"``/``"StageB *"`` all reduce to
+    their bare class identifier so it can be matched against the unit's
+    method-owning classes.
+    """
+    if not type_text:
+        return ""
+    for strip in ("*", "&"):
+        type_text = type_text.replace(strip, " ")
+    tokens = type_text.split()
+    if not tokens:
+        return ""
+    return tokens[-1].rsplit("::", 1)[-1].strip()
+
+
+#: Tensor accessors whose template argument names the element type, so an
+#: ``auto x = que.AllocTensor<half>();`` declaration still yields a fully
+#: typed tensor binding.
+_AUTO_INFER_ACCESSORS = frozenset({"AllocTensor", "DeQue", "Get", "GetWithOffset"})
+
+
+def _auto_tensor_dtype(visitor: ASTVisitor, value: Node) -> Optional[str]:
+    """Element type named by ``que.AllocTensor<T>()`` & friends, else ``None``."""
+    if value.type != "call_expression":
+        return None
+    func = value.child_by_field_name("function")
+    if func is None:
+        return None
+    base = _callee_base_name(visitor, func)
+    if base not in _AUTO_INFER_ACCESSORS:
+        return None
+    args = _template_arguments(visitor, func)
+    if not args:
+        return None
+    dtype = args[0].rsplit("::", 1)[-1].strip()
+    return dtype if dtype_size(dtype) else None
+
+
+#: Type templates whose arguments fix a buffer's TPosition and ping-pong depth.
+_BUFFER_TEMPLATE_NAMES = frozenset({"TBuf", "TQue", "TQueBind"})
+
+
+def _buffer_template_info(
+    visitor: ASTVisitor, type_node: Optional[Node]
+) -> Optional[Tuple[Optional[TPosition], Optional[int]]]:
+    """Parse a ``TQue<TPosition::X, depth>`` type node via its AST.
+
+    Walks the ``template_argument_list`` directly instead of regexing the
+    declaration text, so a named depth constant (``TQue<TPosition::VECIN,
+    AIV_QUE_DEPTH>``) resolves through the unit's constant environment and a
+    multi-line declaration cannot defeat the match.  Both ``TPosition::X``
+    and the legacy ``QuePosition::X`` spellings are accepted (the position is
+    taken from the argument's last ``::`` segment).
+
+    Returns ``(position, depth)`` -- position ``None`` when the first
+    argument does not name a position, depth ``None`` when the second
+    argument is absent or does not fold (callers fall back to the InitBuffer
+    ``num`` argument, which overrides it anyway) -- or ``None`` when the type
+    node carries no buffer template at all.
+    """
+    if type_node is None:
+        return None
+    for node in _walk(type_node):
+        if node.type != "template_type":
+            continue
+        name = node.child_by_field_name("name")
+        if name is None:
+            continue
+        if visitor.text(name).rsplit("::", 1)[-1].strip() not in _BUFFER_TEMPLATE_NAMES:
+            continue
+        arguments = node.child_by_field_name("arguments")
+        if arguments is None:
+            continue
+        args = [c for c in arguments.named_children if c.type != "comment"]
+        if not args:
+            return None
+        pos_text = visitor.text(args[0]).strip()
+        position = TPosition.parse(pos_text)
+        if position is None:
+            position = TPosition.parse(pos_text.rsplit("::", 1)[-1])
+        depth: Optional[int] = None
+        if len(args) >= 2:
+            folded = visitor._eval.fold(args[1], visitor._global_env)
+            if folded is None:
+                folded = visitor._eval.evaluate(args[1], visitor._global_env)
+            if folded is not None:
+                try:
+                    depth = int(folded)
+                except (TypeError, ValueError):
+                    depth = None
+        return (position, depth)
+    return None
 
 
 def _template_arguments(visitor: ASTVisitor, func: Node) -> List[str]:

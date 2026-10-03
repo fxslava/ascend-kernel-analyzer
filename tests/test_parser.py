@@ -879,3 +879,236 @@ class TestStageMacros:
         # Both ops report the single invocation line of A(0); in the body.
         assert kernel.flag_ops()[0].loc.snippet.strip().startswith("A(0);")
 
+
+
+# ---------------------------------------------------------------------------
+# auto tensor inference, named queue depths, GetWithOffset, MIX stage classes
+# ---------------------------------------------------------------------------
+
+
+class TestAutoTensorInference:
+    """``auto x = que.AllocTensor<T>()`` declares a fully typed tensor."""
+
+    def test_auto_alloc_tensor_binds_domain_dtype_and_size(self):
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TQue<TPosition::VECIN, 2> que;
+            pipe.InitBuffer(que, 2, 512);
+            auto x = que.AllocTensor<half>();
+            Duplicate(x, (half)1.0f, 256);
+            """
+        )
+        assert "x" in kernel.tensors
+        tensor = kernel.tensors["x"]
+        assert tensor.domain is PhysicalDomain.UB
+        assert tensor.dtype == "half"
+        assert tensor.elem_size == 2
+        assert tensor.size_value == 512  # one block of the depth-2 queue
+
+    def test_auto_deque_tensor_binds_domain(self):
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TQue<TPosition::VECIN, 2> que;
+            pipe.InitBuffer(que, 2, 4096);
+            auto v = que.DeQue<uint8_t>();
+            """
+        )
+        tensor = kernel.tensors["v"]
+        assert tensor.domain is PhysicalDomain.UB
+        assert tensor.dtype == "uint8_t"
+
+    def test_auto_get_tensor_inherits_tbuf_position(self):
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TBuf<TPosition::VECCALC> scratch;
+            pipe.InitBuffer(scratch, 1024);
+            auto y = scratch.Get<half>();
+            """
+        )
+        tensor = kernel.tensors["y"]
+        assert tensor.domain is PhysicalDomain.UB
+        assert tensor.position is TPosition.VECCALC
+
+    def test_auto_get_with_offset_declares_tensor(self):
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TBuf<TPosition::VECCALC> scratch;
+            pipe.InitBuffer(scratch, 2048);
+            auto z = scratch.GetWithOffset<half>(128, 64);
+            """
+        )
+        tensor = kernel.tensors["z"]
+        assert tensor.domain is PhysicalDomain.UB
+        assert tensor.offset_value == 64  # pool base is 0 here
+        assert tensor.size_value == 256  # 128 half elements
+
+
+class TestNamedQueueDepth:
+    """``TQue<TPosition::VECIN, DB>`` with a named depth constant registers."""
+
+    def test_constexpr_depth_constant_registers_the_queue(self):
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TQue<TPosition::VECIN, DB_DEPTH> que;
+            pipe.InitBuffer(que, DB_DEPTH, 512);
+            auto x = que.AllocTensor<half>();
+            Duplicate(x, (half)1.0f, 256);
+            """,
+            preamble="static constexpr int DB_DEPTH = 2;",
+        )
+        assert "x" in kernel.tensors
+        assert kernel.tensors["x"].domain is PhysicalDomain.UB
+
+    def test_define_depth_constant_registers_the_queue(self):
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TQue<TPosition::VECOUT, QD> qo;
+            pipe.InitBuffer(qo, QD, 256);
+            auto o = qo.AllocTensor<half>();
+            """,
+            preamble="#define QD 2",
+        )
+        assert kernel.tensors["o"].domain is PhysicalDomain.UB
+
+    def test_named_depth_folds_through_the_global_env(self):
+        unit = parse(
+            make_kernel(
+                "TPipe pipe; TQue<TPosition::VECIN, DB_DEPTH> que;",
+                preamble="static constexpr int DB_DEPTH = 4;",
+            )
+        )
+        assert unit.constants.get("DB_DEPTH") == 4
+
+
+class TestGetWithOffsetSignature:
+    """CANN order: ``GetWithOffset<T>(elementCount, byteOffset)``."""
+
+    def test_count_first_offset_second(self):
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TBuf<TPosition::VECCALC> scratch;
+            pipe.InitBuffer(scratch, 2048);
+            LocalTensor<half> t = scratch.GetWithOffset<half>(128, 64);
+            """
+        )
+        tensor = kernel.tensors["t"]
+        assert tensor.offset_value == 64  # the SECOND argument
+        assert tensor.size_value == 256  # 128 elements x sizeof(half)
+
+    def test_offset_is_pool_relative(self):
+        # A preceding buffer pushes the pool base past zero; the byte-offset
+        # argument must land INSIDE the pool, not at an absolute address.
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TBuf<TPosition::VECCALC> first;
+            pipe.InitBuffer(first, 256);
+            TBuf<TPosition::VECCALC> scratch;
+            pipe.InitBuffer(scratch, 2048);
+            LocalTensor<half> t = scratch.GetWithOffset<half>(128, 64);
+            """
+        )
+        tensor = kernel.tensors["t"]
+        assert tensor.offset_value == 256 + 64
+        assert tensor.size_value == 256
+
+    def test_footprint_uses_count_not_buffer_block(self):
+        # The count (first argument) sizes the tensor even when the parent
+        # buffer's block length is larger.
+        kernel = single_kernel(
+            """
+            TPipe pipe;
+            TBuf<TPosition::VECCALC> scratch;
+            pipe.InitBuffer(scratch, 512);
+            LocalTensor<int16_t> t = scratch.GetWithOffset<int16_t>(64, 0);
+            """
+        )
+        assert kernel.tensors["t"].size_value == 128  # 64 x 2 B, not 512
+
+
+class TestMixTwoStageClasses:
+    """A MIX_AIC_1_1 entry driving two stage classes must analyze both arms.
+
+    Regression for the symbol-scope collision: the entry is a free function,
+    so ``cube.Init``/``vec.Init`` cannot be resolved by caller context, and
+    both classes define the same method names.  Before the fix the whole
+    walk collapsed to ``ops == 0``.
+    """
+
+    PREAMBLE = """
+        class CubeStage {
+        public:
+            __aicore__ inline void Init(TPipe *pipe) {
+                pipe->InitBuffer(a1, 512);
+            }
+            __aicore__ inline void Process() {
+                SetFlag<HardEvent::MTE1_M>(EVENT_ID0);
+            }
+            TBuf<TPosition::A1> a1;
+        };
+
+        class VecStage {
+        public:
+            __aicore__ inline void Init(TPipe *pipe) {
+                pipe->InitBuffer(scratch, 1024);
+            }
+            __aicore__ inline void Process() {
+                LocalTensor<half> y = scratch.Get<half>();
+                Duplicate(y, (half)1.0f, 512);
+            }
+            TBuf<TPosition::VECCALC> scratch;
+        };
+    """
+
+    BODY = """
+        KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
+        if ASCEND_IS_AIC {
+            AscendC::TPipe pipe;
+            AscendC::CubeStage cube;
+            cube.Init(&pipe);
+            cube.Process();
+        }
+        if ASCEND_IS_AIV {
+            AscendC::TPipe pipe;
+            AscendC::VecStage vec;
+            vec.Init(&pipe);
+            vec.Process();
+        }
+    """
+
+    def test_both_stage_classes_resolve_in_one_entry(self):
+        unit = parse(make_kernel(self.BODY, self.PREAMBLE))
+        assert not unit.had_parse_errors
+        assert len(unit.kernels) == 1, "stage methods must inline, not spawn kernels"
+        kernel = unit.kernels[0]
+        # One op from each arm (InitBuffer sizes land in buffer_sizes, not ops).
+        assert len(kernel.ops) >= 2, f"walk collapsed: {len(kernel.ops)} ops"
+        # The AIC arm's flag op and the AIV arm's vector op both present.
+        flags = [(op.flag_kind.value, op.event_id) for op in kernel.flag_ops()]
+        assert ("SetFlag", 0) in flags
+        # The Duplicate is a PIPE_V op emitted from VecStage::Process.
+        assert any(
+            getattr(op, "name", None) == "Duplicate" for op in kernel.ops_on(Pipe.V)
+        )
+
+    def test_both_stage_buffers_are_sized(self):
+        unit = parse(make_kernel(self.BODY, self.PREAMBLE))
+        kernel = unit.kernels[0]
+        # InitBuffer ran inside BOTH inlined Init methods.
+        assert kernel.buffer_sizes.get("a1") == 512
+        assert kernel.buffer_sizes.get("scratch") == 1024
+
+    def test_receiver_typed_resolution_survives_same_named_methods(self):
+        # The two classes define the SAME method names (Init/Process); the
+        # receiver's declared class type is what disambiguates them.
+        unit = parse(make_kernel(self.BODY, self.PREAMBLE))
+        kernel = unit.kernels[0]
+        inlined = set(kernel.inlined)
+        assert "Init" in inlined and "Process" in inlined
