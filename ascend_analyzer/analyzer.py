@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .checkers.base import CheckerContext
 from .checkers.deadlock import DeadlockChecker
+from .checkers.hazard import HazardChecker
 from .checkers.memory import MemoryChecker
 from .checkers.perf_model import PerfModelChecker
 from .diagnostics import Diagnostic, DiagnosticCollector, Severity
@@ -29,6 +30,7 @@ TOOL_VERSION = "0.1.0"
 AVAILABLE_CHECKERS: Tuple[str, ...] = (
     MemoryChecker.name,
     DeadlockChecker.name,
+    HazardChecker.name,
     PerfModelChecker.name,
 )
 
@@ -173,6 +175,10 @@ class KernelAnalyzer:
             MemoryChecker(context, solver=self._solver).run_all()
         if DeadlockChecker.name not in disabled:
             DeadlockChecker(context).run_all()
+        if HazardChecker.name not in disabled:
+            # Cross-pipeline hazard sufficiency: needs the flags the deadlock
+            # checker validates, but adds no ordering assumptions of its own.
+            HazardChecker(context).run_all()
         if PerfModelChecker.name not in disabled:
             # Runs last: the overlap profiler schedules the DAG the deadlock
             # checker proved acyclic and publishes perf_profile artifacts.

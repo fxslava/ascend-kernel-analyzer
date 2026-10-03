@@ -161,8 +161,17 @@ class TestCliGate:
         base = tmp_path / "base.json"
         main([str(MISMATCH), "--quiet", "--write-baseline", str(base)])
         document = json.loads(base.read_text(encoding="utf-8"))
-        kept = len(document["findings"]) - 1
-        document["findings"] = document["findings"][:kept]
+        # Drop one *fatal* entry: the gate is only red for a fatal surplus
+        # unless --warnings-as-errors is given, and the newest findings on
+        # this fixture (AKA2010 hazard warnings) sort last.
+        # ``Severity`` serialises as "FATAL"; compare case-insensitively so
+        # the test does not depend on that spelling.
+        fatals = [
+            i for i, f in enumerate(document["findings"])
+            if str(f.get("severity", "")).upper() == "FATAL"
+        ]
+        assert fatals, "fixture is expected to carry fatal findings"
+        del document["findings"][fatals[-1]]
         base.write_text(json.dumps(document), encoding="utf-8")
 
         code = main([str(MISMATCH), "--quiet", "--baseline", str(base)])
