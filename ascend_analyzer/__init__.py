@@ -17,12 +17,6 @@ Typical use::
 
 from __future__ import annotations
 
-from .analyzer import (
-    TOOL_VERSION,
-    AnalysisResult,
-    AnalyzerOptions,
-    KernelAnalyzer,
-)
 from .diagnostics import Code, Diagnostic, DiagnosticCollector, Severity, SourceLoc
 from .hardware import (
     CHIP_PROFILES,
@@ -35,7 +29,16 @@ from .hardware import (
 )
 from .ir import AnalysisUnit, KernelIR, TensorDecl
 
+TOOL_VERSION = "0.1.0"
 __version__ = TOOL_VERSION
+
+
+def __getattr__(name):
+    # Importing backend/hardware must not load the C++ or MLIR frontend.
+    if name in {"AnalysisResult", "AnalyzerOptions", "KernelAnalyzer"}:
+        from . import analyzer
+        return getattr(analyzer, name)
+    raise AttributeError(name)
 
 __all__ = [
     "__version__",

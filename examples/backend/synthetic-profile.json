@@ -1,0 +1,12 @@
+{
+  "name": "synthetic-flow-regression",
+  "base": "ascend910b",
+  "provisional": true,
+  "notes": "Synthetic rates and buffers for graph algorithm regression; NOT a hardware calibration.",
+  "flow_rates": {"MTE2": 10, "AIV": 5, "MTE3": 2},
+  "flow_roles": {"MTE2": "dma", "AIV": "compute", "MTE3": "dma"},
+  "flow_buffers": {"input": 10, "output": 10},
+  "queue_depths": {},
+  "supported_routes": ["MTE2_V", "V_MTE3"],
+  "sync_handoff_cycles": 0
+}

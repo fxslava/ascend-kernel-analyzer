@@ -77,6 +77,8 @@ class Code(str, enum.Enum):
     EVENT_ID_OUT_OF_RANGE = "AKA2008"
     SELF_ROUTE_SYNC = "AKA2009"
     MISSING_SYNC = "AKA2010"
+    UNSUPPORTED_ROUTE = "AKA2011"
+    MEMORY_ORDERING = "AKA2012"
 
     # -- 3xxx: performance / analyzability ---------------------------------
     GLOBAL_BARRIER = "AKA3001"
@@ -103,6 +105,8 @@ class Code(str, enum.Enum):
 
 #: One-line human titles for each code, used in report headers.
 CODE_TITLES: Dict[str, str] = {
+    Code.UNSUPPORTED_ROUTE.value: "Unsupported hardware synchronization route",
+    Code.MEMORY_ORDERING.value: "Unordered physical memory accesses (RAW/WAR/WAW)",
     Code.SRAM_OVERFLOW.value: "SRAM capacity overflow",
     Code.BASE_MISALIGNED.value: "Base address alignment violation",
     Code.BUFFER_COLLISION.value: "Buffer aliasing / address collision",

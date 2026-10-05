@@ -50,7 +50,10 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ..diagnostics import Code, Severity
-from ..hardware import REAL_PIPES, Pipe
+from ..hardware import REAL_PIPES, Pipe, PhysicalDomain
+from ..backend.trace import dependency_graph
+from ..backend.safety import Access, unordered_hazards
+import networkx as nx
 from ..ir import ApiCallOp, CoreView, FlagKind, KernelIR, TensorDecl
 from .base import Checker
 
@@ -72,6 +75,8 @@ class HazardChecker(Checker):
     name = "hazard"
 
     def check(self, kernel: KernelIR) -> None:
+        sync = self.ctx.artifacts.get(f"sync_graph::{kernel.name}", {})
+        self._dependencies = dependency_graph(kernel, sync, self.hw)
         sets: Dict[ChannelKey, List[int]] = defaultdict(list)
         waits: Dict[ChannelKey, List[int]] = defaultdict(list)
         for op in kernel.flag_ops():
@@ -137,11 +142,77 @@ class HazardChecker(Checker):
                 ),
             },
         )
+        self._check_interval_hazards(kernel)
+
+    def _check_interval_hazards(self, kernel):
+        if kernel.loops:
+            self.ctx.publish(f"interval_hazard_coverage::{kernel.name}",
+                             {"hazards": [], "skipped": len(kernel.ops),
+                              "scope": "requires iteration-specific extents; use expanded backend graph"})
+            return
+        accesses, operations, skipped = [], {}, 0
+        for op in kernel.api_calls():
+            if op.conditional or op.core_view is CoreView.NONE:
+                skipped += 1
+                continue
+            operations[op.index] = op
+            for mode, names in (("read", op.reads), ("write", op.writes)):
+                for name in names:
+                    tensor = kernel.tensors.get(name)
+                    if tensor is None or self._queue_mediated(kernel, name):
+                        skipped += 1
+                        continue
+                    # Loop-carried access extents require an expanded graph;
+                    # keep the existing loop-aware RAW check for this adapter.
+                    if op.loop_id is not None:
+                        skipped += 1
+                        continue
+                    offset, size = tensor.offset_value, tensor.size_value
+                    upper = offset+size if offset is not None and size is not None else None
+                    resource = tensor.domain.value
+                    if tensor.domain is PhysicalDomain.GM:
+                        # The trace does not retain GM pointer provenance:
+                        # unrelated symbols cannot be diagnosed as definite alias.
+                        root, visited = tensor, set()
+                        while root.view_source and root.name not in visited:
+                            visited.add(root.name)
+                            parent = kernel.tensors.get(root.view_source)
+                            if parent is None:
+                                break
+                            root = parent
+                        resource += ":"+root.name
+                    if tensor.domain is PhysicalDomain.UNKNOWN:
+                        resource += ":"+name
+                    if tensor.domain is not PhysicalDomain.GM:
+                        resource += ":"+op.core_view.value
+                    accesses.append(Access(op.index, resource, mode, offset, upper))
+        candidates = unordered_hazards(self._dependencies, accesses)
+        found = []
+        seen = set()
+        for kind, a, b in candidates:
+            first, second = operations[a.node], operations[b.node]
+            if first.pipe is second.pipe and first.core_view.overlaps(second.core_view):
+                continue
+            if kind == "RAW" and set(first.writes) & set(second.reads) and self._same_view(first, second):
+                continue  # reported by the loop-aware RAW pass above
+            key = (kind, a.node, b.node, a.resource)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append({"kind": kind, "first": a.node, "second": b.node, "resource": a.resource})
+            if len(found) <= _MAX_REPORTS:
+                self.diags.add(Code.MEMORY_ORDERING, Severity.WARNING,
+                               f"{kind} on {a.resource}: {first.name} and {second.name} lack happens-before",
+                               second.loc, hardware_domain=second.pipe.value, hazard_kind=kind,
+                               remediation="Order the shared buffer accesses with a supported synchronization mechanism.")
+        self.ctx.publish(f"interval_hazard_coverage::{kernel.name}",
+                         {"hazards": found, "skipped": skipped,
+                          "scope": "straight-line extents; unrelated GM base provenance unchecked; local core views distinct"})
 
     # -- evidence -----------------------------------------------------------
 
-    @staticmethod
     def _synchronized(
+        self,
         write: ApiCallOp,
         read: ApiCallOp,
         sets: Dict[ChannelKey, List[int]],
@@ -156,6 +227,8 @@ class HazardChecker(Checker):
         checker, which models the semaphores exactly; here the question is
         only whether the program attempted the handshake at all.
         """
+        if write.index < read.index:
+            return nx.has_path(self._dependencies, write.index, read.index)
         for event_id in set(sets) & set(waits):
             src, dst, _ = event_id
             if src is not write.pipe or dst is not read.pipe:
@@ -174,9 +247,7 @@ class HazardChecker(Checker):
     @staticmethod
     def _same_view(write: ApiCallOp, read: ApiCallOp) -> bool:
         """``False`` for pairs split across the AIC/AIV views of a mix kernel."""
-        if write.core_view is CoreView.BOTH or read.core_view is CoreView.BOTH:
-            return True
-        return write.core_view is read.core_view
+        return write.core_view.overlaps(read.core_view)
 
     def _queue_mediated(self, kernel: KernelIR, tensor: str) -> bool:
         """``True`` when the tensor's declaration chain roots in a ``TQue``.
@@ -186,12 +257,12 @@ class HazardChecker(Checker):
         invisible here, so the pair is out of static reach, not unsynchronised.
         """
         decl: Optional[TensorDecl] = kernel.tensors.get(tensor)
-        hop = 0
-        while decl is not None and hop < 16:  # a view chain cannot be deeper
+        visited = set()
+        while decl is not None and decl.name not in visited:
+            visited.add(decl.name)
             if decl.origin.startswith("TQue::"):
                 return True
             decl = kernel.tensors.get(decl.view_source or "")
-            hop += 1
         return False
 
     def _report(

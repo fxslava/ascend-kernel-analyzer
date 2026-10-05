@@ -1,0 +1,25 @@
+{
+  "nodes": [
+    {"id": "load", "duration": 10},
+    {"id": "compute", "duration": 20},
+    {"id": "store", "duration": 50}
+  ],
+  "edges": [
+    {"from": "load", "to": "compute", "tokens": 0},
+    {"from": "compute", "to": "store", "tokens": 0},
+    {"from": "store", "to": "load", "tokens": 2}
+  ],
+  "compute_nodes": ["compute"],
+  "dma_nodes": ["load", "store"],
+  "flow": {
+    "stages": [
+      {"name": "load", "engine": "MTE2", "volume": 100},
+      {"name": "compute", "engine": "AIV", "volume": 100},
+      {"name": "store", "engine": "MTE3", "volume": 100}
+    ],
+    "buffers": [
+      {"name": "ingress", "producer": "load", "consumer": "compute", "storage": "input"},
+      {"name": "egress", "producer": "compute", "consumer": "store", "storage": "output"}
+    ]
+  }
+}

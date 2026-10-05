@@ -18,7 +18,7 @@ from .memory_map import build_memory_maps
 
 __all__ = ["SCHEMA_VERSION", "build_json_report", "dump_json_report"]
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "2.0"  # overlap_ratio now means actual DMA hiding
 
 
 def build_json_report(
@@ -95,6 +95,10 @@ def _kernel_json(
     perf = artifacts.get(f"perf_profile::{kernel.name}")
     if isinstance(perf, dict):
         payload["performance"] = perf
+    for key in ("hazard_coverage", "interval_hazard_coverage", "bank_conflict_coverage"):
+        coverage = artifacts.get(f"{key}::{kernel.name}")
+        if coverage is not None:
+            payload[key] = coverage
     usage = artifacts.get(f"memory_usage::{kernel.name}")
     if usage is not None:
         payload["domain_usage"] = usage

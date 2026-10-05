@@ -399,7 +399,7 @@ class TestVectorBankConflicts:
             "delta_blocks": 16,
         }
         assert "identical UB Bank 0" in diag.message
-        assert "pipeline arbitration stall" in diag.message
+        assert "logical bank model" in diag.message
         assert "0x0" in diag.message and "0x200" in diag.message
 
     def test_remediation_suggests_the_one_block_pad(self):

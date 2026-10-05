@@ -66,7 +66,7 @@ $ ascend-analyze vec_add.cpp --chip ascend910b
 
 | Code | Finding | What it means |
 |---|---|---|
-| `AKA4001` | Exposed sync bubbles / pipeline stalls | Warning. Cross-queue `SetFlag`/`WaitFlag` hand-offs each cost ~30 cycles; when they exceed a third of the kernel's issued work, the pipelines are stalling more than computing. The message names the two worst hand-off routes. |
+| `AKA4001` | Exposed sync bubbles / pipeline stalls | Warning. Measured dependency waits exceeding the configured fraction of issued work indicate exposed pipeline stalls; no fixed handoff latency is invented. The message names the two worst hand-off routes. |
 | `AKA4002` | Cube compute underutilization | Warning. The cube unit is busy under half the modeled makespan while the move engines feed it - the contraction is not the critical path, the feeding chain is. |
 
 `ascend-analyze --list-codes` prints the full table.
@@ -474,11 +474,10 @@ and the JSON report carries the full profile (`--disable perf` skips it;
 
 Advisories (`AKA4001`, `AKA4002`) are gated on a modeled makespan of at least
 500 cycles so short kernels' inherent fill/drain bubbles are not nagged - the
-negative-control fixtures stay silent. `tests/kernels/
-nvfp4_pipelined_dequant.cpp` demonstrates both ends: its double-buffered
-Pipeline A still exposes the ~30-cycle `M_FIX` hand-off per small tile, while
-its Pipeline B serializes every stage behind five handshakes and lands at a
-fraction of Pipeline A's overlap.
+negative-control fixtures stay silent. `tests/kernels/nvfp4_pipelined_dequant.cpp`
+compares buffered and serialized stage dependencies. Accurate transfer counts
+and the zero-extra-delay default keep these small traces below the advisory
+threshold. Explicit buffer pressure is exercised by `tests/backend/test_flow.py`.
 
 ---
 
@@ -644,7 +643,7 @@ PASSED  all 5 fixtures match their declarations
 | `bank_conflict_vec.cpp` | A dual-operand `Add` whose sources sit 8 blocks (256 B) apart — same UB bank, `AKA3006` — next to a control pair skewed by one 32-byte block. |
 | `loop_peeling_long.cpp` | A four-channel pipelined kernel with `T = 512` and ping-pong parity: three-phase peeling keeps the sync graph at 32 nodes and the analysis far under 200 ms, with zero findings. |
 | `simt_ub_budget_351x.cpp` | 220 KiB of UB tensors plus `asc_call_vf` calls: fatal `AKA1010` DataCache starvation on `--chip ascend351x` (plain `AKA1001` overflow on the default 910B profile). |
-| `nvfp4_pipelined_dequant.cpp` | The performance-profiler fixture: Pipeline A is double-buffered but its small NVFP4 tiles cannot amortise the `M_FIX` hand-off (`AKA4001`, `AKA4002`), while Pipeline B serializes the identical stages behind five handshakes at half the overlap ratio. |
+| `nvfp4_pipelined_dequant.cpp` | The performance-profiler fixture compares buffered and serialized dependencies. Small traces remain below the advisory gate with zero extra flag delay. |
 
 ---
 
@@ -736,3 +735,24 @@ ascend_analyzer/
 ## License
 
 Apache-2.0.
+# Graph backend and architecture audit
+
+The frontend-independent backend supports marked dependency graphs, finite
+iteration expansion, physical interval hazards, and explicit continuous-flow
+networks with finite buffer backpressure. Processor descriptions live in
+`ascend_analyzer/processors`; the historical hardware import remains supported.
+
+```powershell
+python -m pytest tests/backend
+python -m ascend_analyzer.backend examples/backend/pipeline.json --profile examples/backend/synthetic-profile.json --iterations 4
+```
+
+The example's rates are synthetic. Source performance reports now distinguish
+DMA latency hiding from mean pipeline utilization and use zero extra flag
+handoff delay unless a profile supplies calibration.
+
+See the [architectural audit](docs/architecture-audit.md),
+[module rationale](docs/module-refactoring.md),
+[hydrodynamic specification](docs/hydrodynamic-overlap.md),
+[hardware evidence audit](docs/hardware-profile-audit.md), and
+[backend testing guide](docs/backend-testing.md).

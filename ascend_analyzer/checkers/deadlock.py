@@ -46,8 +46,9 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import networkx as nx
 
+from ..backend.graph import token_free_subgraph, token_free_cycles
 from ..diagnostics import Code, Severity, SourceLoc
-from ..hardware import REAL_PIPES, HardEventRoute, Pipe
+from ..hardware import HardEventRoute, Pipe
 from ..ir import BarrierOp, CoreView, FlagKind, FlagOp, KernelIR, Operation
 from .base import Checker
 
@@ -178,7 +179,8 @@ class DeadlockChecker(Checker):
                     remediation=(
                         f"Reserved ids on {self.hw.chip.display_name}: "
                         f"{', '.join(f'EVENT_ID{i}' for i in reserved)}. "
-                        f"Use one of EVENT_ID{usable[0]}..EVENT_ID{usable[-1]} instead."
+                        + (f"Use one of EVENT_ID{usable[0]}..EVENT_ID{usable[-1]} instead."
+                           if usable else "This profile exposes no user-managed event IDs.")
                     ),
                     event_id=op.event_id,
                     reserved_ids=reserved,
@@ -198,6 +200,10 @@ class DeadlockChecker(Checker):
 
     def _check_self_routes(self, flags: Sequence[FlagOp]) -> None:
         for op in flags:
+            if op.route is not None and self.hw.supports_route(op.route) is False:
+                self.diags.add(Code.UNSUPPORTED_ROUTE, Severity.FATAL,
+                               f"{op.route.name} is unavailable in the selected processor profile",
+                               op.loc, hardware_domain=op.pipe.value)
             if op.route is not None and op.route.is_self_route:
                 self.diags.add(
                     Code.SELF_ROUTE_SYNC,
@@ -744,7 +750,7 @@ class DeadlockChecker(Checker):
         barriers: Sequence[BarrierOp],
         edges: Sequence[SyncEdge],
     ) -> nx.DiGraph:
-        graph = nx.DiGraph()
+        graph = nx.MultiDiGraph()
         nodes: List[Operation] = sorted(
             list(flags) + list(barriers), key=lambda op: op.index
         )
@@ -760,7 +766,7 @@ class DeadlockChecker(Checker):
 
         # Program order within each pipeline. A global barrier participates in
         # every pipeline's order, which is what makes it a fence.
-        for pipe in REAL_PIPES:
+        for pipe in self.hw.active_pipes():
             chain = [
                 op
                 for op in nodes
@@ -774,6 +780,8 @@ class DeadlockChecker(Checker):
                 graph.add_edge(chain[-1].index, chain[0].index, tokens=1, kind="back")
 
         for edge in edges:
+            if edge.setter.conditional or edge.waiter.conditional:
+                continue  # a conditional flag cannot prove unconditional order
             graph.add_edge(
                 edge.setter.index,
                 edge.waiter.index,
@@ -792,25 +800,10 @@ class DeadlockChecker(Checker):
         A marked graph deadlocks exactly when a directed cycle holds no
         tokens, so acyclicity of this subgraph *is* deadlock freedom.
         """
-        blocked = nx.DiGraph()
-        blocked.add_nodes_from(graph.nodes(data=True))
-        for source, target, data in graph.edges(data=True):
-            if data.get("tokens", 0) == 0:
-                blocked.add_edge(source, target, **data)
-        return blocked
+        return token_free_subgraph(graph)
 
     def _find_token_free_cycles(self, graph: nx.DiGraph) -> List[List[int]]:
-        blocked = self._token_free_subgraph(graph)
-        if nx.is_directed_acyclic_graph(blocked):
-            return []
-        cycles: List[List[int]] = []
-        for cycle in nx.simple_cycles(blocked):
-            cycles.append(list(cycle))
-            if len(cycles) >= _MAX_ENUMERATED_CYCLES:
-                break
-        # Shortest cycles first: they are the tightest explanation of the hang.
-        cycles.sort(key=lambda c: (len(c), min(c)))
-        return cycles
+        return token_free_cycles(graph, _MAX_ENUMERATED_CYCLES)
 
     def _report_cycles(
         self,
@@ -863,7 +856,8 @@ class DeadlockChecker(Checker):
         related: List[Tuple[str, SourceLoc]] = []
         for position, node in enumerate(ordered):
             nxt = ordered[(position + 1) % len(ordered)]
-            data = graph.get_edge_data(node, nxt) or {}
+            places = graph.get_edge_data(node, nxt) or {}
+            data = next((d for d in places.values() if d.get("tokens", 0) == 0), {})
             info = graph.nodes[node]
             arrow = (
                 f"--{data.get('route')}-->"

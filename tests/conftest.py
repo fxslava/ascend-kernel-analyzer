@@ -12,8 +12,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from ascend_analyzer import AnalyzerOptions, KernelAnalyzer  # noqa: E402
-from ascend_analyzer.analyzer import AnalysisResult  # noqa: E402
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ascend_analyzer import AnalyzerOptions, KernelAnalyzer
+    from ascend_analyzer.analyzer import AnalysisResult
 
 KERNEL_DIR = Path(__file__).resolve().parent / "kernels"
 
@@ -50,6 +52,7 @@ def analyze(
     path: str = "<test>.cpp",
 ) -> AnalysisResult:
     """Analyze an inline source string."""
+    from ascend_analyzer import AnalyzerOptions, KernelAnalyzer
     analyzer = KernelAnalyzer(
         AnalyzerOptions(
             chip=chip,
@@ -93,6 +96,7 @@ def kernel_dir() -> Path:
 
 @pytest.fixture(scope="session")
 def analyzer() -> KernelAnalyzer:
+    from ascend_analyzer import AnalyzerOptions, KernelAnalyzer
     return KernelAnalyzer(AnalyzerOptions())
 
 

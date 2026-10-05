@@ -21,7 +21,11 @@ from .kernel_ir import (
     ScopeKind,
     TensorDecl,
 )
-from .mlir_ascend import AscendModule  # noqa: F401  (re-export for convenience)
+def __getattr__(name):
+    if name == "AscendModule":
+        from .mlir_ascend import AscendModule
+        return AscendModule
+    raise AttributeError(name)
 
 __all__ = [
     "FlagKind",

@@ -18,10 +18,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, FrozenSet, Mapping, Optional, Tuple
+from typing import Dict, FrozenSet, Optional, Tuple
 
 from .hardware import PhysicalDomain as D
-from .hardware import Pipe
+from .hardware import Pipe, DEFAULT_TRANSFER_PIPES
 
 __all__ = [
     "ArgRole",
@@ -140,32 +140,10 @@ def _p(role: ArgRole, allowed: Optional[FrozenSet[D]], name: str) -> ParamSpec:
 #: ``(dst_domain, src_domain)`` -> issuing pipeline.  A pair absent from this
 #: table is not a legal single-instruction transfer on DaVinci; the data has
 #: to be staged through an intermediate buffer.
-TRANSFER_PIPE: Mapping[Tuple[D, D], Pipe] = {
-    # move-in: global memory -> on-core SRAM
-    (D.UB, D.GM): Pipe.MTE2,
-    (D.L1, D.GM): Pipe.MTE2,
-    (D.UB, D.L1): Pipe.MTE2,
-    (D.L1, D.L1): Pipe.MTE2,
-    # L1 -> cube input buffers (fractal rearrange)
-    (D.L0A, D.L1): Pipe.MTE1,
-    (D.L0B, D.L1): Pipe.MTE1,
-    (D.L0A, D.UB): Pipe.MTE1,
-    (D.L0B, D.UB): Pipe.MTE1,
-    (D.BT, D.L1): Pipe.MTE1,
-    # move-out: on-core SRAM -> global memory / L1
-    (D.GM, D.UB): Pipe.MTE3,
-    (D.GM, D.L1): Pipe.MTE3,
-    (D.L1, D.UB): Pipe.MTE3,
-    # intra-UB copy runs on the vector unit
-    (D.UB, D.UB): Pipe.V,
-    # cube accumulator drain goes through fixpipe
-    (D.UB, D.L0C): Pipe.FIX,
-    (D.GM, D.L0C): Pipe.FIX,
-    (D.L1, D.L0C): Pipe.FIX,
-}
+TRANSFER_PIPE = DEFAULT_TRANSFER_PIPES
 
 
-def data_copy_pipe(dst: D, src: D) -> Optional[Pipe]:
+def data_copy_pipe(dst: D, src: D, hardware=None) -> Optional[Pipe]:
     """Issuing pipeline for a ``DataCopy`` between two domains.
 
     ``None`` means the pair is not a legal direct transfer.  Unknown domains
@@ -178,7 +156,7 @@ def data_copy_pipe(dst: D, src: D) -> Optional[Pipe]:
         if dst is D.GM:
             return Pipe.MTE3
         return Pipe.MTE2
-    return TRANSFER_PIPE.get((dst, src))
+    return hardware.transfer_pipe(dst, src) if hardware is not None else TRANSFER_PIPE.get((dst, src))
 
 
 # ---------------------------------------------------------------------------

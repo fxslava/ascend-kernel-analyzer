@@ -2797,7 +2797,7 @@ class _KernelWalker:
         # DataCopy and friends: the pipeline follows the (dst, src) domains.
         dst = self._domain_of_arg(args, 0)
         src = self._domain_of_arg(args, 1)
-        return data_copy_pipe(dst, src) or Pipe.MTE2
+        return data_copy_pipe(dst, src, self.v.hw) or Pipe.MTE2
 
     def _domain_of_arg(self, args: Sequence[ArgRef], index: int) -> PhysicalDomain:
         if index >= len(args):

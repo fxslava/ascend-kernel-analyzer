@@ -154,7 +154,7 @@ class TestOptions:
         main([str(BROKEN), "--format", "json", "--disable", "deadlock"])
         payload = json.loads(capsys.readouterr().out)
         assert any(c.startswith("AKA1") for c in payload["summary"]["by_code"])
-        assert not any(c.startswith("AKA2") for c in payload["summary"]["by_code"])
+        assert not any(c in {"AKA2001", "AKA2002", "AKA2004", "AKA2005"} for c in payload["summary"]["by_code"])
 
     @pytest.mark.parametrize("solver", ["z3", "interval", "auto"])
     def test_every_solver_backend_reaches_the_same_verdict(self, solver, capsys):

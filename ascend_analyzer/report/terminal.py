@@ -344,17 +344,18 @@ class TerminalReporter:
         makespan = profile["makespan_cycles"]
         overlap = profile.get("overlap_ratio") or 0.0
         bottleneck = profile.get("bottleneck") or "NONE"
-        handoff = profile.get("handoff_cycles", 30)
+        handoff = profile.get("handoff_cycles", 0)
         self._write(
             f"  estimated makespan    {makespan} cycles   "
             + self.palette.dim("(analytical model)")
         )
         self._write(
-            f"  concurrency           {overlap:.0%}   "
+            f"  DMA latency hidden    {overlap:.0%}   "
             + self.palette.dim(
-                f"overlap across {profile.get('active_pipes', 0)} pipelines"
+                "compute/DMA interval intersection"
             )
         )
+        self._write(f"  concurrency           {profile.get('concurrency_efficiency', 0):.0%} (mean pipeline utilization)")
         self._write(
             f"  bottleneck            {bottleneck}   "
             + self.palette.dim(f"per-flag hand-off {handoff} cycles")

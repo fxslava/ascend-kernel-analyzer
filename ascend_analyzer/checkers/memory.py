@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Dict, List, Optional, Sequence, Set
 
-from ..apis import TRANSFER_PIPE, ArgRole, lookup_api
+from ..apis import ArgRole, lookup_api
 from ..diagnostics import Code, Severity
 from ..hardware import PhysicalDomain, Pipe
 from ..ir import ApiCallOp, KernelIR, TensorDecl
@@ -540,7 +540,7 @@ class MemoryChecker(Checker):
         src = self._domain_of(kernel, op.args[1].tensor)
         if dst is PhysicalDomain.UNKNOWN or src is PhysicalDomain.UNKNOWN:
             return
-        if (dst, src) in TRANSFER_PIPE:
+        if self.hw.transfer_pipe(dst, src) is not None:
             return
         self.diags.add(
             Code.DOMAIN_MISMATCH,
@@ -612,21 +612,21 @@ class MemoryChecker(Checker):
                 continue  # unresolved layout; _check_extent_known owns that
             evaluated += 1
             delta = abs(off0 - off1) // block % banks
-            if delta != 0:
+            if delta != 0 or self.hw.chip.ub_bank_ports >= 2:
                 continue
             conflicts += 1
-            bank = off0 // block % banks
+            bank = self.hw.ub_bank(off0)
             self.diags.add(
                 Code.UB_BANK_CONFLICT,
                 Severity.WARNING,
                 f"Dual-operand vector instruction '{op.name}' reads "
                 f"'{name0}' (offset 0x{off0:X}) and '{name1}' "
                 f"(offset 0x{off1:X}) from identical UB Bank {bank}. "
-                "Causes pipeline arbitration stall.",
+                "Potential arbitration under the profile's logical bank model.",
                 op.loc,
                 hardware_domain="UB",
                 remediation=(
-                    f"Pad the allocation of '{name1}' by +32 bytes (1 DaVinci "
+                    f"Pad the allocation of '{name1}' by +{block} bytes (1 DaVinci "
                     "block) or enforce bank-orthogonal base alignment."
                 ),
                 related=[(f"declaration of {name1!r}", tensor1.loc)],

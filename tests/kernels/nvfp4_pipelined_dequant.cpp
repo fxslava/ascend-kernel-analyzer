@@ -1,34 +1,16 @@
 /*
- * nvfp4_pipelined_dequant.cpp -- fixture for the analytical pipeline
- * performance & overlap profiler (WARNING AKA4001 / AKA4002).
- *
- * Two kernels do the same NVFP4 dequant-and-GEMM work per tile -
- * MTE2 moves packed fp4 A/B tiles GM -> L1, MTE1 fractal-loads them
- * L1 -> L0A/L0B, the cube contracts via mad_mx, and Fixpipe drains L0C
- * back to GM - but with opposite overlap structure:
- *
- *   Pipeline A (nvfp4_dequant_overlap) keeps the textbook double-buffered
- *   skew of cube_tbuf_pipeline.cpp, but with deliberately small tiles
- *   (16x128x16, 1 KiB per operand).  The cube contraction itself is only 8
- *   cycles, so nothing amortises the fixed ~30-cycle M_FIX hand-off or the
- *   per-tile fill/drain bubbles: the profiler must flag the exposed sync
- *   stalls (AKA4001) with the M_FIX route carrying a large share.
- *
- *   Pipeline B (nvfp4_dequant_serial) runs the identical stages one tile at
- *   a time behind five SetFlag/WaitFlag handshakes with single buffers: load,
- *   wait, fractal-load, wait, contract, wait, drain, wait, repeat.  Nothing
- *   overlaps anything; the profiler must report serialized execution - a
- *   SYNC_BOUND bottleneck with the overlap ratio far below Pipeline A.
- *
- * Both kernels are functionally correct (no memory or pairing findings);
- * only performance advisories from the 4xxx block are expected.
+ * nvfp4_pipelined_dequant.cpp -- buffered and serialized dependency traces.
+ * MTE2 loads GM -> L1, MTE1 loads L1 -> L0A/B, mad_mx computes, and Fixpipe
+ * drains L0C. Pipeline A buffers tiles; Pipeline B fences more of the work.
+ * Accurate transfer counts and zero extra uncalibrated flag delay keep both
+ * short traces below the 500-cycle performance advisory gate.
  *
  * The pipeline issues mad_mx (MX microscale multiply-accumulate), a
  * DaVinci v3 instruction, so the fixture declares a v3 target rather
  * than being judged against 910B, which cannot issue it (AKA1011).
  *
  * @ascend-chip: ascend351x
- * @ascend-expect: AKA4001 AKA4002
+ * @ascend-expect:
  * @ascend-expect-fatal: 0
  */
 #include "kernel_operator.h"

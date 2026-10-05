@@ -1,34 +1,10 @@
-"""Analytical pipeline performance and overlap profiler.
+"""KernelIR performance adapter to the graph backend.
 
-Model
------
-Once the deadlock checker has proven the kernel's marked graph acyclic, its
-topological order is a legal issue order - which makes an *as-soon-as-possible*
-schedule over the dependency DAG a faithful first-order performance model:
-
-* every traced operation gets a **service time in cycles** from the chip's
-  latency model: DMA engines are credited ``bytes / bandwidth`` (MTE2 move-in,
-  MTE1 fractal loads, Fixpipe/MTE3 drains), the vector unit retires one
-  ``vector_bytes`` register footprint per cycle, and Cube contractions cost
-  ``ceil(M/16) * ceil(K/16) * ceil(N/16)`` cycles when the tile shape is
-  recoverable from the call site (falling back to an operand-read throughput);
-* **program-order edges** (0 cost) chain each pipeline's in-order instruction
-  queue, including barriers as full fences;
-* **synchronisation edges** - the forward ``SetFlag`` -> ``WaitFlag`` pairs the
-  deadlock checker matched - carry the cross-queue hand-off penalty
-  (``sync_handoff_cycles``, ~30 cycles).  Loop-carried edges hold a token and
-  are already satisfied at issue, so they add nothing.
-
-The ASAP schedule then yields the **critical-path makespan**, per-pipe
-**busy / idle / stall** timestamps (a stall is time a pipeline sat at a
-``WaitFlag`` with its own queue empty - an exposed bubble), the **concurrency
-efficiency** (overlap ratio) and a bottleneck classification:
-``DRAIN_BOUND`` (a serialized tail nothing overlaps), ``SYNC_BOUND``
-(hand-off bubbles dominate), ``MEMORY_BOUND`` (a move engine drives the
-critical path) or ``COMPUTE_BOUND`` (the cube/vector unit does).
-
-Findings are advisories in the 4xxx block: ``AKA4001`` for exposed sync
-bubbles, ``AKA4002`` for cube underutilization.
+Completion fences and pipe order determine a dependency schedule. Throughput
+inputs are estimates; a nonzero synchronization hand-off requires explicit
+calibration. Compute/DMA overlap is measured as an interval intersection.
+Continuous streaming requires explicit buffer-lifetime edges in backend.flow;
+this adapter does not manufacture them from tensor capacity or source order.
 """
 
 from __future__ import annotations
@@ -37,18 +13,15 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from ..backend.graph import overlap_metrics
+from ..backend.trace import schedule_trace
+from ..apis import lookup_api, ArgRole
 from ..diagnostics import Code, Severity
 from ..hardware import REAL_PIPES, PhysicalDomain, Pipe
-from ..ir import ApiCallOp, BarrierOp, FlagKind, FlagOp, KernelIR, Operation
+from ..ir import ApiCallOp, FlagKind, FlagOp, KernelIR, Operation
 from .base import Checker
 
 __all__ = ["PerfModelChecker", "PipeProfile"]
-
-#: Issue cost of a flag, barrier or scalar instruction, in cycles.
-_ISSUE_CYCLES = 1
-
-#: Operand transfer whose volume cannot be recovered: assume one 32 B block.
-_DEFAULT_TRANSFER_BYTES = 32
 
 #: One token of a shape argument: a name, or an integer literal.  A
 #: dimension reaches here as a name before macro substitution and as a
@@ -132,6 +105,11 @@ class PerfModelChecker(Checker):
         overlap = (
             total_busy / (makespan * len(active)) if makespan and active else 0.0
         )
+        work = [op for op in kernel.ops if isinstance(op, ApiCallOp)]
+        timing = overlap_metrics(
+            [(start[op.index], end[op.index]) for op in work if op.pipe in (Pipe.M, Pipe.V)],
+            [(start[op.index], end[op.index]) for op in work if op.pipe in self._MEMORY_PIPES],
+        )
         critical = max(
             active, key=lambda p: p.busy_cycles, default=None
         )
@@ -150,12 +128,22 @@ class PerfModelChecker(Checker):
                     sorted(stall_by_route.items(), key=lambda kv: -kv[1])
                 ),
                 "drain_cycles": drain,
-                "overlap_ratio": round(overlap, 4),
+                "concurrency_efficiency": round(overlap, 4),
+                "overlap_ratio": round(timing["dma_hidden_ratio"], 4),
+                **timing,
+                "model": "dependency-constrained service; uncalibrated throughput estimates",
+                "queue_coverage": "no streaming queues inferred from tensor allocation; use backend.flow with explicit buffer lifetimes",
+                "horizon": "frontend trace (peeled loops are representative, not whole-kernel latency)",
                 "active_pipes": len(active),
                 "critical_pipe": critical.pipe if critical else None,
                 "bottleneck": bottleneck,
                 "pipes": [p.to_json() for p in pipes],
                 "handoff_cycles": self.hw.chip.sync_handoff_cycles,
+                "operation_intervals": [
+                    {"index": op.index, "pipe": op.pipe.value,
+                     "start": start[op.index], "end": end[op.index], "kind": op.kind}
+                    for op in kernel.ops
+                ],
             },
         )
 
@@ -171,89 +159,11 @@ class PerfModelChecker(Checker):
     def _schedule(self, kernel: KernelIR, graph: dict):
         """ASAP-schedule the trace; returns ``(start, end, cycles, stalls)``.
 
-        Every dependency edge runs forward in trace index (program order per
-        pipeline, forward sync pairs), so index order is a topological order
-        and one linear pass settles every timestamp.
+        The backend constructs and topologically sorts dependencies; numeric
+        trace indices need not be a legal issue order.
         """
         cycles = {op.index: self._service_cycles(kernel, op) for op in kernel.ops}
-
-        preds: Dict[int, List[Tuple[int, int, str, str]]] = {}
-        for edge in graph.get("edges") or []:
-            if edge.get("kind") != "sync":
-                continue  # program/back edges are rebuilt below, exactly
-            if edge.get("tokens", 0) != 0:
-                continue  # loop-carried: satisfied by the previous iteration
-            source, target = edge.get("from"), edge.get("to")
-            if not (isinstance(source, int) and isinstance(target, int)):
-                continue
-            if target <= source:
-                continue
-            preds.setdefault(target, []).append(
-                (
-                    source,
-                    self.hw.chip.sync_handoff_cycles,
-                    "sync",
-                    str(edge.get("route", "?")),
-                )
-            )
-
-        start: Dict[int, int] = {}
-        end: Dict[int, int] = {}
-        prev_end_by_pipe: Dict[Pipe, int] = {}
-        fence_by_pipe: Dict[Pipe, int] = {}
-        stall_by_pipe: Dict[str, int] = {}
-        stall_by_route: Dict[str, int] = {}
-
-        def effective_prev(pipe: Pipe) -> int:
-            return max(prev_end_by_pipe.get(pipe, 0), fence_by_pipe.get(pipe, 0))
-
-        for op in kernel.ops:  # trace order == topological order
-            ready = 0
-            binding: Optional[Tuple[int, str]] = None
-            for source, weight, kind, route in preds.get(op.index, ()):
-                arrival = end.get(source, 0) + weight
-                if arrival > ready:
-                    ready = arrival
-                    binding = (source, route)
-
-            if isinstance(op, BarrierOp):
-                # A barrier fences every queue it names, so its issue waits
-                # for them all and they in turn wait for it.
-                fenced = list(REAL_PIPES) if op.target is Pipe.ALL else [op.target]
-                ready = max(ready, max((effective_prev(p) for p in fenced), default=0))
-            else:
-                prev = effective_prev(op.pipe)
-                if prev > ready:
-                    # The pipe's own in-order queue is the binding constraint:
-                    # not a synchronisation bubble.
-                    ready = prev
-                    binding = None
-                elif (
-                    isinstance(op, FlagOp)
-                    and op.flag_kind is FlagKind.WAIT
-                    and binding is not None
-                ):
-                    gap = ready - prev
-                    if gap > 0:
-                        # A cross-queue hand-off held this pipe back while its
-                        # own queue was empty: an exposed bubble.
-                        stall_by_pipe[op.pipe.value] = (
-                            stall_by_pipe.get(op.pipe.value, 0) + gap
-                        )
-                        if binding[1] != "?":
-                            stall_by_route[binding[1]] = (
-                                stall_by_route.get(binding[1], 0) + gap
-                            )
-
-            start[op.index] = ready
-            end[op.index] = ready + cycles[op.index]
-            if isinstance(op, BarrierOp):
-                for pipe in fenced:
-                    fence_by_pipe[pipe] = end[op.index]
-            else:
-                prev_end_by_pipe[op.pipe] = end[op.index]
-
-        return start, end, cycles, stall_by_pipe, stall_by_route
+        return schedule_trace(kernel, graph, cycles, self.hw)
 
     # -- service times ------------------------------------------------------
 
@@ -264,9 +174,9 @@ class PerfModelChecker(Checker):
             bytes_moved = self._transfer_bytes(kernel, op)
             bandwidth = self.hw.pipe_bytes_per_cycle(op.pipe)
             if bandwidth is None:
-                return _ISSUE_CYCLES
+                return self.hw.chip.issue_cycles
             return max(1, -(-bytes_moved // bandwidth))
-        return _ISSUE_CYCLES
+        return self.hw.chip.issue_cycles
 
     def _cube_cycles(self, kernel: KernelIR, op: ApiCallOp) -> int:
         shape = self._cube_shape(kernel, op)
@@ -278,7 +188,7 @@ class PerfModelChecker(Checker):
             if arg.tensor in kernel.tensors
         )
         if operands <= 0:
-            return _ISSUE_CYCLES
+            return self.hw.chip.issue_cycles
         throughput = self.hw.chip.cube_read_bytes_per_cycle
         return max(1, -(-operands // throughput))
 
@@ -316,8 +226,7 @@ class PerfModelChecker(Checker):
                     return (found[0], found[1], found[2])
         return None
 
-    @staticmethod
-    def _transfer_bytes(kernel: KernelIR, op: ApiCallOp) -> int:
+    def _transfer_bytes(self, kernel: KernelIR, op: ApiCallOp) -> int:
         """Volume of one DMA / vector operation, in bytes.
 
         The on-core (SRAM) participant bounds the moved tile: a ``GlobalTensor``
@@ -325,6 +234,15 @@ class PerfModelChecker(Checker):
         that lands in UB/L1/L0.  GM-only calls fall back to the count
         parameter, then to one hardware block.
         """
+        spec = lookup_api(op.name)
+        if spec is not None:
+            for arg in op.args:
+                param = spec.param_at(arg.index)
+                if param is not None and param.role is ArgRole.COUNT and arg.value is not None:
+                    operand = next((kernel.tensors.get(a.tensor) for a in op.args
+                                    if a.tensor and kernel.tensors.get(a.tensor) is not None), None)
+                    if operand is not None and operand.elem_size:
+                        return max(0, arg.value * operand.elem_size)
         on_core: List[int] = []
         global_only: List[int] = []
         for name in (*op.writes, *op.reads):
@@ -344,8 +262,8 @@ class PerfModelChecker(Checker):
                 continue
             dst = kernel.tensors.get(arg.tensor)
             if dst is not None and dst.elem_size:
-                return max(_DEFAULT_TRANSFER_BYTES, arg.value * dst.elem_size)
-        return _DEFAULT_TRANSFER_BYTES
+                return max(self.hw.chip.block_bytes, arg.value * dst.elem_size)
+        return self.hw.chip.block_bytes
 
     # -- metrics --------------------------------------------------------------
 
@@ -452,9 +370,8 @@ class PerfModelChecker(Checker):
                 "Overlap the stages these flags connect: issue the next tile's "
                 "load before waiting on the current tile's result (double "
                 "buffer with two event ids), batch several small tiles into "
-                "one larger transfer so each 30-cycle hand-off amortises, or "
-                "drop handshakes between stages that already have a real "
-                "data dependency."
+                "one larger transfer to amortise measured hand-off costs. "
+                "Keep all synchronization required by data dependencies."
             ),
             makespan_cycles=makespan,
             stall_cycles=total_stall,
