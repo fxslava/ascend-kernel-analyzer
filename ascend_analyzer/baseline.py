@@ -61,7 +61,7 @@ def normalise_path(raw: str, root: Optional[Path] = None) -> str:
             text = f"{text[1]}:{text[2:]}"
     if root is not None:
         try:
-            relative = PurePath(text).relative_to(PurePath(str(root).replace("\\", "/")))
+            relative = PurePath(text).relative_to(PurePath(normalise_path(str(root))))
         except ValueError:
             pass
         else:

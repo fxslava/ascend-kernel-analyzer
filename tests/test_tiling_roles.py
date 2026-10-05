@@ -97,8 +97,8 @@ class TestActivation:
         assert counts["evaluated"] == counts["candidates"]
 
     def test_with_inference_the_real_conflict_is_found(self):
-        """Two depth-4 x 64 B queues land 8 UB blocks apart: one bank."""
-        result = analyze(QUEUED_KERNEL, infer_tiling_roles=True)
+        """Eight blocks share a bank on the 950PR eight-group profile."""
+        result = analyze(QUEUED_KERNEL, infer_tiling_roles=True, chip="ascend950pr")
         assert "AKA3006" in result.codes()
         assert coverage(result)["conflicts"] >= 1
 

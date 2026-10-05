@@ -231,3 +231,26 @@ def test_describe_is_json_serialisable():
     json.dumps(payload)  # must not raise
     assert payload["domains"]["UB"]["capacity_bytes"] == 192 * KIB
     assert payload["reserved_event_ids"] == [6, 7]
+
+
+@pytest.mark.parametrize("alias", ["ascend950pr", "dav-3510", "Ascend950", "Ascend910_9589"])
+def test_950pr_target_invariants(alias):
+    hw = HardwareModel.for_chip(alias)
+    assert hw.capacity(PhysicalDomain.UB) == 256 * KIB
+    assert hw.chip.reserved_event_ids == frozenset({0, 1, 2})
+    assert hw.chip.l0c_base_offsets == (0, 1024)
+    assert hw.chip.features == frozenset({"mx_cube", "simt"})
+    assert not hw.is_event_id_reserved(3)
+    assert not hw.is_event_id_reserved(4)
+
+
+def test_c220_target_invariants():
+    hw = HardwareModel.for_chip("dav-c220")
+    assert hw.capacity(PhysicalDomain.UB) == 192 * KIB
+    assert hw.capacity(PhysicalDomain.L1) == 512 * KIB
+    assert hw.capacity(PhysicalDomain.L0A) == 64 * KIB
+    assert hw.capacity(PhysicalDomain.L0B) == 64 * KIB
+    assert hw.capacity(PhysicalDomain.L0C) == 128 * KIB
+    assert hw.chip.ub_bank_count == 16
+    assert hw.chip.reserved_event_ids == frozenset({6, 7})
+    assert not hw.chip.features

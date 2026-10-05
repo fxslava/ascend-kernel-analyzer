@@ -29,6 +29,8 @@ from typing import Dict, List, Optional, Tuple
 
 from ..ir.mlir_ascend import (
     AllocBufferOp,
+    AscendMemRefType,
+    QueueType,
     AllocTensorOp,
     AscendModule,
     BarrierOp,
@@ -47,7 +49,7 @@ from ..ir.mlir_ascend import (
     VectorOp,
     WaitFlagOp,
 )
-from .bisheng_extractor import is_main_file, node_line
+from .bisheng_extractor import BishengError, is_main_file, node_line
 
 __all__ = ["BridgeOptions", "lower_module", "split_template_args"]
 
@@ -57,6 +59,8 @@ VECTOR_OPS: Tuple[str, ...] = (
     "Add", "Sub", "Mul", "And", "Or", "Xor", "Not",
     "ShiftLeft", "ShiftRight", "Cast", "Max", "Min",
     "Exp", "Reciprocal", "Duplicate", "Gather", "Scatter", "Select",
+    "Adds", "Muls", "Mins", "Maxs", "Compares", "CompareScalar",
+    "CreateVecIndex", "DeInterleave", "ReduceRepeat", "SwiGLU",
 )
 
 #: Queue bookkeeping methods (modelled as queue ops).
@@ -66,7 +70,7 @@ _FREE_METHODS = frozenset({"FreeTensor"})
 #: Statement kinds the walker dispatches on.
 _STMT_KINDS = frozenset({
     "CompoundStmt", "DeclStmt", "IfStmt", "ForStmt", "WhileStmt", "DoStmt",
-    "CXXForRangeStmt", "CallExpr", "CXXMemberCallExpr", "BinaryOperator",
+    "CXXForRangeStmt", "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "BinaryOperator",
     "CompoundAssignOperator", "ReturnStmt", "CXXConstructExpr",
 })
 
@@ -87,7 +91,7 @@ _POSITION_SPACES: Dict[str, MemorySpace] = {
     "VECIN": MemorySpace.UB, "VECOUT": MemorySpace.UB, "VECCALC": MemorySpace.UB,
     "A1": MemorySpace.L1, "B1": MemorySpace.L1, "C1": MemorySpace.L1,
     "A2": MemorySpace.L0A, "B2": MemorySpace.L0B, "CO1": MemorySpace.L0C,
-    "CO2": MemorySpace.L0C, "LCM": MemorySpace.L1, "TSCM": MemorySpace.L1,
+    "CO2": MemorySpace.UB, "LCM": MemorySpace.UB, "TSCM": MemorySpace.L1,
     "GM": MemorySpace.GM,
 }
 
@@ -116,6 +120,8 @@ class BridgeOptions:
     inline_depth: int = 6
     #: Cap on ops per kernel, mirroring ``VisitorOptions.max_ops``.
     max_ops: int = 20000
+    tiling_values: Dict[str, int] = field(default_factory=dict)
+    strict_layout: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +166,7 @@ def _last_scope_name(qualified: str) -> str:
 
 def _template_head(type_text: str) -> str:
     """``AscendC::TQue<...>`` -> ``TQue`` (head name, no arguments)."""
-    return _last_scope_name(type_text.split("<", 1)[0])
+    return _last_scope_name(type_text.split("<", 1)[0]).removeprefix("const ").removeprefix("volatile ")
 
 
 def _normalise_dtype(type_text: str) -> str:
@@ -254,6 +260,8 @@ class _Folder:
                 if qt:
                     return _dtype_size(_last_scope_name(qt))
             return None
+        if kind == "MemberExpr":
+            return self.bound.get(node.get("name", ""))
         if kind == "DeclRefExpr":
             name = _referenced_name(node) or ""
             if name in self.bound:
@@ -412,11 +420,13 @@ def _index_unit(ast: dict, path: str, lines: List[str]) -> AstContext:
 
     def visit(node: dict, record: Optional[str] = None) -> None:
         kind = node.get("kind")
-        if kind in ("FunctionDecl", "CXXMethodDecl"):
+        if kind in ("FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl"):
             name = node.get("name") or ""
             ctx.decls_by_id[node.get("id", "")] = node
-            if kind == "CXXMethodDecl" and record:
-                ctx.methods[(record, name)] = node
+            if kind in ("CXXMethodDecl", "CXXConstructorDecl") and record:
+                existing = ctx.methods.get((record, name))
+                if existing is None or _first_child(existing, "CompoundStmt") is None:
+                    ctx.methods[(record, name)] = node
             elif name:
                 existing = ctx.functions.get(name)
                 if existing is None or _first_child(existing, "CompoundStmt") is None:
@@ -449,7 +459,7 @@ def _index_unit(ast: dict, path: str, lines: List[str]) -> AstContext:
             if name and not node.get("isImplicit"):
                 ctx.records.setdefault(name, node)
                 for child in node.get("inner", []) or []:
-                    if child.get("kind") in ("CXXMethodDecl", "CXXRecordDecl",
+                    if child.get("kind") in ("CXXMethodDecl", "CXXConstructorDecl", "VarDecl", "CXXRecordDecl",
                                              "ClassTemplateSpecializationDecl"):
                         visit(child, name)
                 return
@@ -511,6 +521,7 @@ class _KernelLowering:
         self._loop_seq = 0
         #: Access path -> type text for TQue/TBuf/TPipe objects in scope.
         self.buffer_types: Dict[str, str] = {}
+        self.local_names: Dict[str, str] = {}
         #: Local variable -> type text (for record/base resolution).
         self.var_types: Dict[str, str] = {}
         #: Parameter bindings of the inlined call stack.
@@ -520,7 +531,7 @@ class _KernelLowering:
         #: Loop induction bindings of the innermost unrolled iteration.
         self.loop_env: Dict[str, int] = {}
         #: Folded values of scalar locals declared during the walk.
-        self.scalar_env: Dict[str, int] = {}
+        self.scalar_env: Dict[str, int] = dict(options.tiling_values)
 
     # -- bookkeeping ----------------------------------------------------------
 
@@ -569,9 +580,16 @@ class _KernelLowering:
             if record:
                 return f"{record}.{member}"
             return member or None
+        if kind == "UnaryOperator" and node.get("opcode") in ("&", "*"):
+            return self._expr_name(_first_child(node))
         if kind == "CXXThisExpr":
             record = self._this_record()
             return record
+        if kind == "CXXOperatorCallExpr":
+            kids = _children(node)
+            return self._expr_name(kids[1]) if len(kids) > 1 else None
+        if kind == "CXXMemberCallExpr":
+            return self._expr_name(self._member_base(node))
         if kind == "ArraySubscriptExpr":
             base = _first_child(node)
             if base is not None and base.get("kind") == "CXXMemberCallExpr":
@@ -594,6 +612,8 @@ class _KernelLowering:
         """Resolve a parameter reference through the inline-bind stack."""
         if name is None:
             return None
+        if name in self.local_names:
+            return self.local_names[name]
         for frame in reversed(self.binds):
             bind = frame.get(name)
             if bind is not None:
@@ -665,8 +685,45 @@ class _KernelLowering:
             self._walk_if(kernel, stmt, core, depth, loop_depth, conditional)
         elif kind in ("ForStmt", "WhileStmt", "DoStmt", "CXXForRangeStmt"):
             self._walk_loop(kernel, stmt, core, depth, loop_depth, conditional)
+        elif kind == "CXXOperatorCallExpr":
+            kids = _children(stmt)
+            callee = _skip_casts(kids[0]) if kids else {}
+            if _referenced_name(callee) == "operator=" and len(kids) >= 3:
+                lhs, rhs = _skip_casts(kids[1]), _skip_casts(kids[2])
+                name = self._expr_name(lhs)
+                if name and "LocalTensor" in self._type_text(lhs):
+                    self.register_tensor(kernel, name, lhs, self._dtype_of_tensor_type(self._type_text(lhs)),
+                                         "queue:Get", self._line(stmt))
+                    self._walk_call(kernel, rhs, core, depth, loop_depth, conditional, result_name=name)
         elif kind in ("CallExpr", "CXXMemberCallExpr"):
             self._walk_call(kernel, stmt, core, depth, loop_depth, conditional)
+        elif kind == "CompoundAssignOperator":
+            kids = _children(stmt)
+            if len(kids) == 2:
+                key = self._expr_name(kids[0])
+                lhs, rhs = self._folder().fold(kids[0]), self._folder().fold(kids[1])
+                if key and lhs is not None and rhs is not None:
+                    op = stmt.get("opcode")
+                    if op == "/=" and rhs:
+                        self.scalar_env[key] = lhs // rhs
+                    elif op == "+=":
+                        self.scalar_env[key] = lhs + rhs
+                    elif op == "-=":
+                        self.scalar_env[key] = lhs - rhs
+        elif kind == "BinaryOperator" and stmt.get("opcode") == "=":
+            kids = _children(stmt)
+            if len(kids) == 2:
+                lhs = _skip_casts(kids[0])
+                value = self._folder().fold(kids[1])
+                if value is not None:
+                    key = lhs.get("name") if lhs.get("kind") == "MemberExpr" else self._expr_name(lhs)
+                    if key:
+                        self.scalar_env[key] = value
+                if "LocalTensor" in self._type_text(lhs):
+                    name = self._expr_name(lhs)
+                    self.register_tensor(kernel, name, lhs, self._dtype_of_tensor_type(self._type_text(lhs)),
+                                         "assignment", self._line(stmt))
+                    self._walk_call(kernel, _skip_casts(kids[1]), core, depth, loop_depth, conditional, result_name=name)
         elif kind in ("BinaryOperator", "CompoundAssignOperator", "ReturnStmt",
                       "CXXConstructExpr", "InitListExpr", "ExpressionStmt"):
             pass  # scalar bookkeeping only
@@ -698,17 +755,38 @@ class _KernelLowering:
             self.buffer_types[name] = sugar
             return
 
+        if init is not None and init.get("kind") == "CXXConstructExpr" and head in self.ctx.records:
+            ctor = self.ctx.methods.get((head, head))
+            body = _first_child(ctor, "CompoundStmt")
+            if body is not None:
+                self._inline_call(kernel, ctor, body, _children(init), head, core,
+                                  depth + 1, loop_depth, conditional, preserve_members=True)
+            return
+
         tensor_head = _template_head(desugar)
         if head in ("LocalTensor", "GlobalTensor") or \
                 (sugar == "auto" and tensor_head in ("LocalTensor", "GlobalTensor")):
+            if init is not None and init.get("kind") == "CXXConstructExpr" and len(_children(init)) == 1:
+                init = _skip_casts(_first_child(init))
             effective = desugar if head not in ("LocalTensor", "GlobalTensor") else sugar
             dtype = self._dtype_of_tensor_type(effective)
             origin = "declaration"
             if init is not None and init.get("kind") in ("CXXMemberCallExpr", "CallExpr"):
                 method = self._call_name(init)
                 origin = f"queue:{method}" if method else "declaration"
+            source_name = name
+            if name in kernel.tensors:
+                suffix = 2
+                while f"{source_name}.{suffix}" in kernel.tensors:
+                    suffix += 1
+                name = f"{source_name}.{suffix}"
+            self.local_names[source_name] = name
             self.register_tensor(kernel, name, var, dtype, origin,
                                  self._line(var), type_text=effective)
+            if init is not None and not (init.get("kind") == "CXXMemberCallExpr" and self._call_name(init) == "Get"):
+                value = self._value_of(init)
+                if value.tensor:
+                    kernel.tensors[name]["alias"] = value.name
             if self.options.queue_ops and init is not None and \
                     init.get("kind") in ("CXXMemberCallExpr", "CallExpr"):
                 self._walk_call(kernel, init, core, depth, loop_depth,
@@ -869,13 +947,45 @@ class _KernelLowering:
                     else:
                         trip = span // step + 1 if span >= 0 else 0
 
+        while_trip = None
+        if stmt.get("kind") == "WhileStmt" and cond_node is not None and cond_node.get("kind") == "BinaryOperator":
+            cond_parts = _children(cond_node)
+            update = next((c for c in _stmts(body) if c.get("kind") == "CompoundAssignOperator"), None)
+            if len(cond_parts) == 2 and update is not None:
+                name = self._expr_name(cond_parts[0])
+                parts = _children(update)
+                value = folder.fold(cond_parts[0])
+                divisor = folder.fold(parts[1]) if len(parts) == 2 else None
+                if (name and value is not None and divisor is not None and divisor > 1
+                        and update.get("opcode") == "/=" and self._expr_name(parts[0]) == name):
+                    iterations = 0
+                    probe = folder.child({name: value})
+                    while probe.fold(cond_node) and iterations <= UNROLL_LIMIT:
+                        value //= divisor
+                        probe = folder.child({name: value})
+                        iterations += 1
+                    if iterations <= UNROLL_LIMIT:
+                        while_trip = iterations
+                        induction = name
+                        trip = iterations
+
         self._loop_seq += 1
         loop_id = self._loop_seq
-        kernel.loops.append({
+        loop_info = {
             "id": loop_id, "induction": induction, "start": start, "step": step,
             "trip_count": trip, "loop_depth": loop_depth,
             "line": self._line(stmt), "header": self._snippet(stmt),
-        })
+        }
+        kernel.loops.append(loop_info)
+        body_start = len(kernel.ops)
+
+        if while_trip is not None:
+            for _ in range(while_trip):
+                self.walk_body(kernel, body, core, depth, loop_depth + 1, conditional)
+            loop_info["unrolled"] = True
+            loop_info["ops"] = kernel.ops[body_start:]
+            # The loop's scalar exit state is visible after the loop.
+            return
 
         if trip is not None and 0 < trip <= UNROLL_LIMIT:
             base_val = start if start is not None else 0
@@ -890,10 +1000,17 @@ class _KernelLowering:
                 self.walk_body(kernel, body, core, depth, loop_depth + 1, conditional)
             self.loop_env = saved_env
             self.scalar_env = saved_scalars
+            loop_info["unrolled"] = True
+            loop_info["ops"] = kernel.ops[body_start:]
             return
 
         mark = len(kernel.ops)
+        saved_env = dict(self.loop_env)
+        if induction and start is not None:
+            self.loop_env[induction] = start
         self.walk_body(kernel, body, core, depth, loop_depth + 1, conditional)
+        self.loop_env = saved_env
+        loop_info["ops"] = kernel.ops[body_start:]
         for op in kernel.ops[mark:]:
             if op.loop_id is None:
                 op.loop_id = loop_id
@@ -1053,8 +1170,8 @@ class _KernelLowering:
                                          conditional=conditional))
             return
 
-        if name == "DataCopy":
-            self._walk_data_copy(kernel, args, line, snippet, loop_depth, conditional)
+        if name in ("DataCopy", "DataCopyPad"):
+            self._walk_data_copy(kernel, args, line, snippet, loop_depth, conditional, name)
             return
 
         if name == "Mmad":
@@ -1103,17 +1220,17 @@ class _KernelLowering:
             return
 
         if name in VECTOR_OPS:
-            dst = self._value_of(args[0]) if args else SsaValue("?")
-            if name == "Cast":
-                srcs: Tuple[SsaValue, ...] = (
-                    self._value_of(args[1]),) if len(args) > 1 else ()
-            else:
-                srcs = tuple(self._value_of(a) for a in args[1:3])
-            count = self._folder().fold(args[-1]) if args else 0
-            self._emit(kernel, VectorOp(opcode=name, dst=dst, srcs=srcs,
-                                        elem_count=count or 0, line=line,
-                                        text=snippet, loop_depth=loop_depth,
-                                        conditional=conditional))
+            values = tuple(self._value_of(arg) for arg in args)
+            destinations = (0, 1) if name == "DeInterleave" else (0,)
+            srcs = tuple(value for i, (value, arg) in enumerate(zip(values, args))
+                         if i not in destinations and "LocalTensor" in self._type_text(arg))
+            count_arg = args[2] if name == "ReduceRepeat" and len(args) > 2 else (args[-1] if args else None)
+            count = self._folder().fold(count_arg)
+            self._emit(kernel, VectorOp(opcode=name, dst=values[0] if values else SsaValue("?"),
+                srcs=srcs, api_args=values,
+                extra_dsts=(values[1],) if name == "DeInterleave" else (),
+                elem_count=count or 0, line=line, text=snippet,
+                loop_depth=loop_depth, conditional=conditional))
             return
 
         # User free function with a body: inline.
@@ -1130,9 +1247,17 @@ class _KernelLowering:
                           loop_depth: int, conditional: bool,
                           result_name: Optional[str], line: int,
                           snippet: str) -> None:
+        if method == "SetGlobalBuffer" and base_path:
+            self.register_tensor(kernel, base_path, base or call,
+                                 self._dtype_of_tensor_type(self._type_text(base)),
+                                 "global", line, type_text=self._type_text(base))
+            return
         if method == "InitBuffer" and base_path:
             target = self._expr_name(args[0]) if args else None
             length = self._folder().fold(args[-1]) if args else None
+            if length is None and self.options.strict_layout:
+                raise BishengError(f"{self.ctx.path}:{line}: unresolved InitBuffer size for {target}; "
+                                   "supply runtime geometry with --tiling-data; no zero-byte layout was substituted")
             depth_n = 1
             if len(args) >= 3:
                 folded = self._folder().fold(args[1])
@@ -1144,11 +1269,15 @@ class _KernelLowering:
             order = sum(1 for op in kernel.ops if isinstance(op, AllocBufferOp))
             self._emit(kernel, AllocBufferOp(
                 buffer=target or "", space=space, byte_size=length or 0,
-                depth=depth_n, order=order, line=line, text=snippet,
+                depth=depth_n, order=order,
+                queue_type=QueueType(position or "VECIN", depth_n) if buffer_type and _template_head(buffer_type) == "TQue" else None,
+                line=line, text=snippet,
                 loop_depth=loop_depth, conditional=conditional))
             return
 
         if method == "Get" and base_path:
+            if result_name and args and result_name in kernel.tensors:
+                kernel.tensors[result_name]["view_count"] = self._folder().fold(args[0])
             dtype = self._dtype_of_tensor_type(self._type_text(call)) or "?"
             buffer_type = self._lookup_buffer_type(base_path)
             position = self._position_of(buffer_type) if buffer_type else None
@@ -1202,7 +1331,7 @@ class _KernelLowering:
     def _inline_call(self, kernel: KernelOp, fn: dict, body: dict,
                      args: List[dict], record: Optional[str],
                      core: Optional[CoreType], depth: int,
-                     loop_depth: int, conditional: bool) -> None:
+                     loop_depth: int, conditional: bool, preserve_members: bool = False) -> None:
         parms = _children(fn, "ParmVarDecl")
         frame: Dict[str, _ArgBind] = {}
         for parm, arg in zip(parms, [_skip_casts(a) for a in args]):
@@ -1219,19 +1348,35 @@ class _KernelLowering:
         self.this_stack.append(record)
         saved_env = dict(self.loop_env)
         saved_scalars = dict(self.scalar_env)
+        saved_names = self.local_names
+        self.local_names = {}
         self.loop_env = {}
         self.scalar_env = dict(saved_scalars)
         self.walk_body(kernel, body, core, depth, loop_depth, conditional)
         self.loop_env = saved_env
+        members = {field.get("name") for field in _children(self.ctx.records.get(record, {}), "FieldDecl")}
+        member_values = {name: value for name, value in self.scalar_env.items() if name in members}
         self.scalar_env = saved_scalars
+        if preserve_members:
+            self.scalar_env.update(member_values)
+        self.local_names = saved_names
         self.this_stack.pop()
         self.binds.pop()
 
     def _walk_data_copy(self, kernel: KernelOp, args: List[dict], line: int,
-                        snippet: str, loop_depth: int, conditional: bool) -> None:
+                        snippet: str, loop_depth: int, conditional: bool, api_name: str = "DataCopy") -> None:
         dst_arg = args[0] if args else None
         src_arg = args[1] if len(args) > 1 else None
         count = self._folder().fold(args[2]) if len(args) > 2 else None
+        if api_name == "DataCopyPad" and len(args) > 2:
+            params = _skip_casts(args[2])
+            while params.get("kind") == "CXXFunctionalCastExpr":
+                params = _skip_casts(_first_child(params))
+            fields = _children(params)
+            if len(fields) >= 2:
+                blocks = self._folder().fold(fields[0])
+                length = self._folder().fold(fields[1])
+                count = blocks * length if blocks is not None and length is not None else None
         dst = self._value_of(dst_arg)
         src = self._value_of(src_arg)
         dtype = self._copy_dtype(dst_arg, src_arg)
@@ -1239,7 +1384,7 @@ class _KernelLowering:
         length = (count or 0) * (elem_size or 1)
         route = self._copy_route(dst_arg, src_arg)
         self._emit(kernel, MteCopyOp(src=src, dst=dst, length_bytes=length,
-                                     pipe_route=route, api_name="DataCopy",
+                                     pipe_route=route, api_name=api_name,
                                      line=line, text=snippet,
                                      loop_depth=loop_depth,
                                      conditional=conditional))
@@ -1276,6 +1421,8 @@ class _KernelLowering:
             return False
         node = _skip_casts(arg)
         kind = node.get("kind")
+        if "GlobalTensor" in self._type_text(node):
+            return True
         if kind == "DeclRefExpr":
             qt = node.get("type", {}).get("qualType", "")
             if "GlobalTensor" in qt:
@@ -1298,11 +1445,26 @@ class _KernelLowering:
         if arg is None:
             return SsaValue("?")
         node = _skip_casts(arg)
+        if "Tensor" not in self._type_text(node):
+            folded = self._folder().fold(node)
+            if folded is not None:
+                return SsaValue(str(folded), type_str=self._type_text(node))
+            if node.get("kind") == "FloatingLiteral":
+                return SsaValue(str(node.get("value", "0")))
+        if node.get("kind") == "CXXOperatorCallExpr":
+            kids = _children(node)
+            if len(kids) >= 3:
+                base = self._value_of(kids[1])
+                offset = self._folder().fold(kids[2])
+                return SsaValue(f"{base.name}+{offset}" if offset else base.name,
+                                tensor=base.tensor, type_str=self._type_text(node))
         if node.get("kind") == "CXXMemberCallExpr":
             method = self._call_name(node)
             base = self._member_base(node)
             base_path = self._expr_name(base)
             if method and base_path:
+                if method == "ReinterpretCast":
+                    return SsaValue(base_path, tensor=base_path, type_str=self._type_text(node))
                 suffix = "view" if method == "Get" else method
                 return SsaValue(f"{base_path}.{suffix}",
                                 tensor=f"{base_path}.{suffix}")
@@ -1388,8 +1550,28 @@ def lower_module(ast: dict, path: str, source: str,
 
         walker.walk_body(kernel, _first_child(entry, "CompoundStmt"),
                          core=None, depth=1, loop_depth=0, conditional=False)
+        _resolve_module_layout(kernel)
         module.kernels.append(kernel)
     return module
+
+
+def _resolve_module_layout(kernel: KernelOp) -> None:
+    """Attach concrete bump layout to the dialect, not only the checker IR."""
+    cursors: Dict[MemorySpace, int] = {}
+    buffers: Dict[str, AllocBufferOp] = {}
+    for op in kernel.walk():
+        if isinstance(op, AllocBufferOp):
+            cursor = cursors.get(op.space, 0)
+            op.byte_offset = (cursor + 31) // 32 * 32
+            cursors[op.space] = op.byte_offset + op.byte_size * op.depth
+            buffers[op.buffer] = op
+        elif isinstance(op, GetTensorOp) and op.buffer in buffers:
+            buf = buffers[op.buffer]
+            elem = _dtype_size(op.dtype) or 1
+            count = kernel.tensors.get(op.results[0].name, {}).get("view_count") if op.results else None
+            view_bytes = count * elem if count is not None else buf.byte_size
+            op.memref_type = AscendMemRefType(op.dtype, op.space,
+                (view_bytes // elem,), buf.byte_offset, view_bytes)
 
 
 def _collect_entry_context(walker: _KernelLowering, ast: dict, entry: dict,
@@ -1403,7 +1585,7 @@ def _collect_entry_context(walker: _KernelLowering, ast: dict, entry: dict,
 
     def visit(node: dict) -> None:
         kind = node.get("kind")
-        if kind in ("FunctionDecl", "CXXMethodDecl"):
+        if kind in ("FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl"):
             # Other function bodies are reached through inlining, not scopes.
             return
         if kind == "VarDecl":

@@ -307,6 +307,8 @@ class ChipSpec:
     #: ``EVENT_IDn`` values reserved by the runtime and unusable by kernels.
     reserved_event_ids: FrozenSet[int] = frozenset({6, 7})
     #: Largest legal ``EVENT_IDn`` value (inclusive).
+    ub_bank_count: int = 8
+    l0c_base_offsets: Tuple[int, ...] = (0,)
     max_event_id: int = 7
     #: One block == the hardware's natural SRAM access granule, in bytes.
     block_bytes: int = 32
@@ -410,7 +412,7 @@ CHIP_PROFILES: Dict[str, ChipSpec] = {
     "ascend910b": ChipSpec(
         name="ascend910b",
         display_name="Ascend 910B (Atlas A2 training series)",
-        aliases=("910b", "ascend910b2", "ascend910b3", "atlas-a2", "a2"),
+        aliases=("910b", "ascend910b2", "ascend910b3", "atlas-a2", "a2", "dav-c220", "ascend910b4"),
         domains=_domains(
             UB=(192 * KIB, 32, 32, 32, "Unified Buffer (vector scratchpad)"),
             L1=(512 * KIB, 32, 32, 32, "L1 Buffer (shared staging)"),
@@ -420,7 +422,9 @@ CHIP_PROFILES: Dict[str, ChipSpec] = {
             BT=(1 * KIB, 64, 64, 32, "Bias table"),
             FB=(2 * KIB, 128, 128, 32, "Fixpipe parameter buffer"),
         ),
-        notes="Baseline profile used by the analyzer regression suite.",
+        ub_bank_count=16,
+        notes="192 KiB UB and Cube capacities from NPUs/Ascend910B4.md; "
+              "16 logical bank groups (64 physical banks).",
     ),
     "ascend910c": ChipSpec(
         name="ascend910c",
@@ -439,6 +443,30 @@ CHIP_PROFILES: Dict[str, ChipSpec] = {
         notes="Capacities extrapolated from the 910B profile; override with "
               "--ub-bytes / --l1-bytes or --chip-profile when you have the "
               "SKU datasheet.",
+    ),
+    "ascend950pr": ChipSpec(
+        name="ascend950pr",
+        display_name="Ascend 950PR (dav-3510)",
+        aliases=("950pr", "dav-3510", "Ascend910_9589", "Ascend950"),
+        domains=_domains(
+            UB=(256 * KIB, 32, 32, 32, "Unified Buffer"),
+            L1=(512 * KIB, 32, 32, 32, "L1 Buffer"),
+            L0A=(64 * KIB, 512, 512, 32, "Cube A"),
+            L0B=(64 * KIB, 512, 512, 32, "Cube B"),
+            L0C=(256 * KIB, 1024, 1024, 32, "Cube accumulator"),
+        ),
+        reserved_event_ids=frozenset({0, 1, 2}),
+        ub_bank_count=8,
+        l0c_base_offsets=(0, 1024),
+        features=frozenset({"mx_cube", "simt"}),
+        ub_total_bytes=256 * KIB,
+        compiler_reserved_bytes=8 * KIB,
+        min_datacache_bytes=32 * KIB,
+        max_usable_ub_bytes=216 * KIB,
+        provisional=True,
+        notes="dav-3510 task target: 256 KiB physical UB, TPipe events 0..2 "
+              "reserved. NPUs/Ascend910_9599.md describes dav-c310, a "
+              "different target; do not infer dav-3510 ISA from that SKU.",
     ),
     "ascend351x": ChipSpec(
         name="ascend351x",
@@ -558,6 +586,9 @@ class HardwareModel:
             reserved_event_ids=frozenset(
                 int(x) for x in raw.get("reserved_event_ids", base.reserved_event_ids)
             ),
+            features=frozenset(raw.get("features", base.features)),
+            ub_bank_count=int(raw.get("ub_bank_count", base.ub_bank_count)),
+            l0c_base_offsets=tuple(raw.get("l0c_base_offsets", base.l0c_base_offsets)),
             max_event_id=int(raw.get("max_event_id", base.max_event_id)),
             block_bytes=int(raw.get("block_bytes", base.block_bytes)),
             vector_bytes=int(raw.get("vector_bytes", base.vector_bytes)),

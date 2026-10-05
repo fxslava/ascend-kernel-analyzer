@@ -81,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     analysis = parser.add_argument_group("analysis")
+    analysis.add_argument("--strict-frontend", "--no-fallback", action="store_true",
+                          help="fail with the compiler log if MLIR extraction fails")
+    analysis.add_argument("--mlir-header-mode", choices=("stub", "real"), default="stub")
+    analysis.add_argument("--dump-mlir", type=Path, help="write module.dump() after successful extraction")
+    analysis.add_argument("--verbose", action="store_true", help="include frontend details")
     analysis.add_argument(
         "--frontend",
         choices=("tree-sitter", "mlir"),
@@ -337,6 +342,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tiling_values=_load_tiling_values(args.tiling_data),
                 infer_tiling_roles=args.infer_tiling_roles,
                 frontend=args.frontend,
+                strict_frontend=args.strict_frontend,
+                mlir_header_mode=args.mlir_header_mode,
+                mlir_dump=args.dump_mlir,
             )
         )
     except (KeyError, ValueError, OSError) as exc:
@@ -351,7 +359,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         results = analyzer.analyze_paths(args.paths)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return _EXIT_USAGE
 
@@ -397,6 +405,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result.suppressed.extend(covered)
             baselined_total += len(covered)
 
+    if args.verbose:
+        for result in results:
+            print(f"Frontend: {result.unit.frontend_metadata or {'frontend': 'tree-sitter'}}")
     exit_code = _emit(args, results)
     if args.baseline is not None and not args.quiet and args.format != "json":
         print(

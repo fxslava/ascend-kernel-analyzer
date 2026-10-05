@@ -22,9 +22,10 @@ Two header modes are supported:
 
 Toolchain discovery order:
     1. ``$ASCEND_BISHENG_BIN`` (direct binary path);
-    2. a ``bisheng`` (or ``clang``) on PATH - local or inside
+    2. the CANN 9.2 beta.2 installation on Linux/WSL;
+    3. a ``bisheng`` (or ``clang``) on PATH - local or inside
        ``$ASCEND_BISHENG_CONTAINER_CMD``;
-    3. WSL Docker with image ``$ASCEND_BISHENG_IMAGE`` (default
+    4. WSL Docker with image ``$ASCEND_BISHENG_IMAGE`` (default
        ``cann85-cross-310p:latest``), which ships BiSheng at
        ``/usr/local/Ascend/cann-8.5.0/tools/bisheng_compiler``.
 
@@ -108,9 +109,11 @@ ARCH_DEFINES: Dict[str, str] = {
     "ascend910b": "2201",
     "ascend910c": "2201",
     "ascend351x": "3101",
+    "ascend950pr": "3510",
 }
 
 _FALLBACK_ARCH = "2201"
+CANN92_HOME = Path("/usr/local/Ascend/cann-9.2.0-beta.2")
 
 
 class BishengError(RuntimeError):
@@ -149,6 +152,7 @@ class ExtractionResult:
     arch_define: str = _FALLBACK_ARCH
     #: Where the JSON came from: "live", "cache" or "snapshot".
     origin: str = "live"
+    compiler_log: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -160,13 +164,16 @@ def discover_toolchain(cann_home: Optional[str] = None,
                        source_dir: Optional[str] = None) -> Optional[BishengToolchain]:
     """Find a usable compiler, preferring explicit configuration.
 
-    Order: ``$ASCEND_BISHENG_BIN``, a local ``bisheng``/``clang`` on PATH,
+    Order: ``$ASCEND_BISHENG_BIN``, CANN 9.2 beta.2, a local ``bisheng``/``clang`` on PATH,
     then the WSL-Docker image.  Returns ``None`` only when nothing was found
     (the caller decides whether that is fatal).
     """
     explicit = os.environ.get("ASCEND_BISHENG_BIN")
     if explicit and Path(explicit).exists():
         return _local_toolchain(Path(explicit))
+    cann92_binary = CANN92_HOME / "bin" / "bisheng"
+    if cann92_binary.is_file() and os.access(cann92_binary, os.X_OK):
+        return _local_toolchain(cann92_binary)
     for name in ("bisheng", "bisheng.exe", "clang", "clang.exe"):
         found = shutil.which(name)
         if found:
@@ -207,10 +214,11 @@ def _local_toolchain(binary: Path) -> Optional[BishengToolchain]:
             stdlib += (guess,)
     cann = os.environ.get("ASCEND_CANN_HOME")
     if not cann:
-        for guess in ("/usr/local/Ascend/cann-8.5.0/x86_64-linux",
+        for guess in (str(CANN92_HOME), "/usr/local/Ascend/cann-8.5.0/x86_64-linux",
                       "/usr/local/Ascend/ascend-toolkit/latest"):
             if os.path.isdir(guess):
-                cann = guess
+                installed = Path(guess)
+                cann = str(installed / "x86_64-linux") if (installed / "x86_64-linux").is_dir() else guess
                 break
     return BishengToolchain(
         argv=(str(binary.resolve()),),
@@ -266,15 +274,17 @@ def _docker_runner(stub_dir: str, source_dir: str) -> Optional[Tuple[str, ...]]:
 
 
 def _arch_define(chip: str) -> str:
-    for name, define in ARCH_DEFINES.items():
-        if name in chip or chip in name:
-            return define
-    return _FALLBACK_ARCH
+    from ..hardware import resolve_chip
+
+    try:
+        return ARCH_DEFINES.get(resolve_chip(chip).name, _FALLBACK_ARCH)
+    except KeyError:
+        return _FALLBACK_ARCH
 
 
 def _compose_source(path: str, source: str) -> str:
     """Prefix + ``#line`` re-anchored source, piped to the compiler on stdin."""
-    prefix = PREFIX_HEADER.read_text(encoding="utf-8")
+    prefix = PREFIX_HEADER.read_text(encoding="utf-8").replace("#pragma once\n", "")
     # Forward slashes keep the path usable inside Linux containers.
     normalized = str(path).replace("\\", "/")
     return f"{prefix}\n#line 1 \"{normalized}\"\n{source}"
@@ -282,10 +292,14 @@ def _compose_source(path: str, source: str) -> str:
 
 def _build_args(toolchain: BishengToolchain, path: str, chip: str,
                 header_mode: str) -> List[str]:
+    arch = _arch_define(chip)
+    cce_arch = {"2201": "220", "3101": "310"}.get(arch, arch)
     args: List[str] = [
         "-cc1", "-ast-dump=json", "-std=c++17",
         "-D__CCE_KT_TEST__=1",
         f"-D__NPU_ARCH__={_arch_define(chip)}",
+        f"-D__CCE_AICORE__={cce_arch}",
+        f"-D__DAV_C{cce_arch}__=1",
         "-DASCEND_IS_AIC=__ascend_core_is_aic",
         "-DASCEND_IS_AIV=__ascend_core_is_aiv",
     ]
@@ -300,6 +314,9 @@ def _build_args(toolchain: BishengToolchain, path: str, chip: str,
         stub = CONTAINER_STUB_MOUNT if toolchain.kind == "docker" else \
             str(STUB_INCLUDE_DIR).replace("\\", "/")
         args += ["-I", stub]
+    if toolchain.cann_home:
+        for rel in ("include", "include/kernel_tiling", "include/experiment"):
+            args += ["-I", f"{toolchain.cann_home.rstrip('/')}/{rel}"]
     source_dir = os.path.dirname(os.path.abspath(path)).replace("\\", "/")
     if source_dir:
         mounted = CONTAINER_SRC_MOUNT if toolchain.kind == "docker" else source_dir
@@ -361,8 +378,8 @@ def _content_key(path: str, source: str, chip: str, header_mode: str) -> str:
     digest.update(f"{chip}|{header_mode}|{_arch_define(chip)}".encode("utf-8"))
     digest.update(b"\0")
     digest.update(PREFIX_HEADER.read_bytes())
-    for stub in sorted(STUB_INCLUDE_DIR.glob("*.h")):
-        digest.update(stub.name.encode("utf-8"))
+    for stub in sorted(STUB_INCLUDE_DIR.rglob("*.h")):
+        digest.update(stub.relative_to(STUB_INCLUDE_DIR).as_posix().encode("utf-8"))
         digest.update(stub.read_bytes())
     return digest.hexdigest()
 
@@ -479,7 +496,7 @@ def extract_ast(path: str, source: str, chip: str = "ascend910b",
         errors = _parse_errors(stderr) or [stderr.strip()[-400:] if stderr else "no output"]
         raise BishengError(
             f"AST extraction produced no JSON ({len(errors)} error(s)); first: "
-            f"{errors[0] if errors else '?'}"
+            f"{errors[0] if errors else '?'}\n{stderr}"
         )
     data = json.loads(text)
     errors = _parse_errors(stderr)
@@ -491,7 +508,7 @@ def extract_ast(path: str, source: str, chip: str = "ascend910b",
         except OSError:
             pass
     return ExtractionResult(ast=data, errors=errors, toolchain=toolchain,
-                            header_mode=header_mode, arch_define=arch)
+                            header_mode=header_mode, arch_define=arch, compiler_log=stderr)
 
 
 # ---------------------------------------------------------------------------

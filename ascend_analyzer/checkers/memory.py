@@ -576,16 +576,16 @@ class MemoryChecker(Checker):
     def _check_vector_bank_conflicts(self, kernel: KernelIR) -> None:
         """Flag dual-operand vector reads that share one UB bank (AKA3006).
 
-        The Unified Buffer is an interleaved 8-bank structure addressed in
+        The Unified Buffer uses chip-specific logical bank groups addressed in
         32-byte quantization blocks.  When one Vector ALU instruction reads
         both source operands from base offsets that land in the *same* bank
-        (their 32-byte block delta is a multiple of 8), the two read ports
+        (their 32-byte block delta is a multiple of the bank-group count), the two read ports
         contend for one bank and the hardware arbitrates them into extra
         pipeline bubbles - correct, but silently slower, so this is a
         performance warning rather than a rejection.
         """
         block = self.hw.chip.block_bytes
-        banks = 8
+        banks = self.hw.chip.ub_bank_count
         # Coverage is published whether or not anything is found: a check that
         # silently did not run looks identical to a clean kernel otherwise, and
         # "no conflicts" then means nothing.

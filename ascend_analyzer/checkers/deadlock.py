@@ -651,11 +651,11 @@ class DeadlockChecker(Checker):
         loop = kernel.loops.get(loop_id)
         if loop is None:
             return 0
-        return sum(
-            1
-            for op in entry.sets
-            if op.index < loop.start_index and not loop.contains(op.index)
-        )
+        # Earlier completed loops have already consumed their prologue flags.
+        # Only the outstanding prefix balance can prime this loop's back edge.
+        raised = sum(op.index < loop.start_index for op in entry.sets)
+        consumed = sum(op.index < loop.start_index for op in entry.waits)
+        return max(0, raised - consumed)
 
     def _check_priming(
         self,

@@ -200,3 +200,7 @@ class TestCliGate:
         assert document["findings"]
         for entry in document["findings"]:
             assert entry["file"] == "domain_mismatch.cpp"
+
+
+def test_wsl_root_is_normalised_with_source_path():
+    assert normalise_path("/mnt/c/project/csrc/kernel.cpp", root="/mnt/c/project") == "csrc/kernel.cpp"

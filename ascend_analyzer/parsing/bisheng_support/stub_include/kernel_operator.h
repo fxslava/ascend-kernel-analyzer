@@ -56,6 +56,11 @@ enum class RoundMode {
     CAST_NONE = 0, CAST_RINT, CAST_ROUND, CAST_FLOOR, CAST_CEIL, CAST_ODD,
 };
 
+enum class CMPMODE { EQ, NE, LT, LE, GT, GE };
+enum class SELMODE { VSEL_CMPMASK_SPR, VSEL_TENSOR_SCALAR_MODE, VSEL_TENSOR_TENSOR_MODE };
+enum CoreType { AIC, AIV };
+extern CoreType g_coreType;
+
 enum class MemoryT { L0A = 0, L0B, L0C, BIAS, UB, L1 };
 
 template <typename T>
@@ -110,6 +115,7 @@ public:
 
 class TPipe {
 public:
+    void Destroy();
     template <class T>
     __aicore__ inline void InitBuffer(T& que, uint8_t num, uint32_t len);
     template <TPosition pos>
@@ -242,4 +248,45 @@ __aicore__ inline void mad_mx(__cc__ float* dstC, uint64_t dstGap,
                               __cb__ float4_e1m2x2_t* srcB, uint64_t srcBGap,
                               const mmad_t::shape_t& shape, const mmad_t::control_t& control);
 
+
+template <typename T, typename U>
+void Duplicate(const LocalTensor<T>& dst, U value, uint32_t count);
+template <typename T, typename U>
+void Muls(const LocalTensor<T>& dst, const LocalTensor<T>& src, U value, uint32_t count);
+template <typename T, typename U>
+void Adds(const LocalTensor<T>& dst, const LocalTensor<T>& src, U value, uint32_t count);
+template <typename T, typename U>
+void Mins(const LocalTensor<T>& dst, const LocalTensor<T>& src, U value, uint32_t count);
+template <typename T, typename U>
+void Maxs(const LocalTensor<T>& dst, const LocalTensor<T>& src, U value, uint32_t count);
+template <typename T, typename U>
+void CompareScalar(const LocalTensor<uint8_t>& dst, const LocalTensor<T>& src, U value, CMPMODE mode, uint32_t count);
+template <typename T>
+void Select(const LocalTensor<T>& dst, const LocalTensor<uint8_t>& mask, const LocalTensor<T>& a, const LocalTensor<T>& b, SELMODE mode, uint32_t count);
+template <typename T>
+void Gather(const LocalTensor<T>& dst, const LocalTensor<T>& src, const LocalTensor<uint32_t>& offsets, uint32_t base, uint32_t count);
+template <typename T>
+void ReduceSum(const LocalTensor<T>& dst, const LocalTensor<T>& src, const LocalTensor<T>& scratch, uint32_t count);
+template <typename T, bool reuse>
+void SwiGLU(const LocalTensor<T>& dst, const LocalTensor<T>& src0, const LocalTensor<T>& src1, T beta, uint32_t count);
+
+struct DataCopyParams { uint16_t blockCount, blockLen, srcStride, dstStride; };
+struct DataCopyPadParams { bool isPad; uint8_t leftPadding, rightPadding; uint64_t paddingValue; };
+template <typename T, typename U>
+void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<U>& src, DataCopyParams params, DataCopyPadParams pad);
+template <typename T, typename U>
+void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<U>& src, DataCopyParams params);
+enum class ReduceType { SUM, MAX, MIN };
+enum class ReduceOrder { ORDER_ONLY_VALUE, ORDER_VALUE_INDEX };
+template <ReduceType type, typename T>
+void ReduceRepeat(const LocalTensor<T>& dst, const LocalTensor<T>& src, int32_t count, uint8_t repeat, uint8_t dstStride, uint8_t srcStride, uint8_t repeatStride, ReduceOrder order);
+template <typename T, typename U>
+void CreateVecIndex(const LocalTensor<T>& dst, U start, uint32_t count);
+template <typename T>
+void DeInterleave(const LocalTensor<T>& even, const LocalTensor<T>& odd, const LocalTensor<T>& src, int32_t count);
+template <typename T, typename U>
+void Compares(const LocalTensor<uint8_t>& dst, const LocalTensor<T>& src, U scalar, CMPMODE mode, uint32_t count);
+template <typename T>
+void Select(const LocalTensor<T>& dst, const LocalTensor<uint8_t>& mask, const LocalTensor<T>& src, T scalar, SELMODE mode, uint32_t count);
 }  // namespace AscendC
+#define KERNEL_TASK_TYPE_DEFAULT(...)

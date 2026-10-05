@@ -173,6 +173,8 @@ class AllocBufferOp(AscendOp):
     depth: int = 1
     #: Allocation order within the pipe (fixes the bump-pointer layout).
     order: int = 0
+    byte_offset: Optional[int] = None
+    queue_type: Optional[QueueType] = None
 
     @property
     def op_name(self) -> str:
@@ -180,7 +182,9 @@ class AllocBufferOp(AscendOp):
 
     def print(self) -> str:
         return (f"  %{self.buffer} = ascend.alloc_buffer space={self.space.value} "
-                f"bytes={self.byte_size} depth={self.depth} order={self.order}")
+                f"bytes={self.byte_size} depth={self.depth} order={self.order}"
+                + (f" offset={self.byte_offset}" if self.byte_offset is not None else "")
+                + (f" : {self.queue_type}" if self.queue_type is not None else ""))
 
 
 @dataclass
@@ -190,6 +194,7 @@ class GetTensorOp(AscendOp):
     buffer: str = ""
     dtype: str = ""
     space: MemorySpace = MemorySpace.UB
+    memref_type: Optional[AscendMemRefType] = None
 
     @property
     def op_name(self) -> str:
@@ -197,6 +202,8 @@ class GetTensorOp(AscendOp):
 
     def print(self) -> str:
         name = self.results[0].name if self.results else "_"
+        if self.memref_type is not None:
+            return f"  %{name} = ascend.get_tensor %{self.buffer} : {self.memref_type}"
         return (f"  %{name} = ascend.get_tensor %{self.buffer} : "
                 f"!ascend.memref<?x{self.dtype}, {self.space.mangled()}>")
 
@@ -364,6 +371,8 @@ class VectorOp(AscendOp):
     """``ascend.vector`` - a vector-pipe compute intrinsic (Add, Mul, ...)."""
 
     opcode: str = ""
+    api_args: Tuple[SsaValue, ...] = ()
+    extra_dsts: Tuple[SsaValue, ...] = ()
     dst: SsaValue = field(default_factory=lambda: SsaValue("?"))
     srcs: Tuple[SsaValue, ...] = ()
     elem_count: int = 0
@@ -373,11 +382,12 @@ class VectorOp(AscendOp):
         return "ascend.vector"
 
     def operands(self) -> Sequence[SsaValue]:
-        return (self.dst,) + tuple(self.srcs)
+        return (self.dst,) + self.extra_dsts + tuple(self.srcs)
 
     def print(self) -> str:
         srcs = ", ".join(v.name for v in self.srcs)
-        return f"  ascend.vector {self.opcode} {srcs} -> %{self.dst.name} x{self.elem_count}"
+        dsts = ", ".join("%" + value.name for value in (self.dst,) + self.extra_dsts)
+        return f"  ascend.vector {self.opcode} {srcs} -> {dsts} x{self.elem_count}"
 
 
 @dataclass

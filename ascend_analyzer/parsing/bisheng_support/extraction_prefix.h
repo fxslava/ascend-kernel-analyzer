@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 using std::size_t;
 
 #if defined(__clang__) && defined(__has_attribute)
@@ -377,3 +378,16 @@ void vconv_u82f16(...);
 extern const bool __ascend_core_is_aic;
 extern const bool __ascend_core_is_aiv;
 }
+
+// Alternate CANN memory-space spellings retain address-space information.
+#define __ub__ __ubuf__
+#define __l1__ __cbuf__
+#define __l0a__ __ca__
+#define __l0b__ __cb__
+#define __l0c__ __cc__
+#ifndef ASCEND_IS_AIC
+#define ASCEND_IS_AIC __ascend_core_is_aic
+#endif
+#ifndef ASCEND_IS_AIV
+#define ASCEND_IS_AIV __ascend_core_is_aiv
+#endif

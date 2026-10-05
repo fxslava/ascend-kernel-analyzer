@@ -1,14 +1,14 @@
 /*
  * Vector ALU UB bank-conflict fixture (WARNING AKA3006).
  *
- * The Unified Buffer is an interleaved 8-bank structure addressed in 32-byte
+ * The Unified Buffer is an interleaved 16-bank structure addressed in 32-byte
  * quantization blocks; a dual-operand vector instruction that reads both
  * sources from the same bank stalls the read ports for extra pipeline beats.
  *
- *   * the CONFLICT case reads aBad (0x0) and bBad (0x100): 256 bytes apart,
- *     which is 8 blocks = 0 mod 8 -> both bases sit in UB Bank 0;
- *   * the CONTROL case reads aGood (0x400) and bGood (0x420): the 32-byte
- *     (one-block) skew puts them 9 blocks apart = 1 mod 8 -> distinct banks.
+ *   * the CONFLICT case reads aBad (0x0) and bBad (0x200): 512 bytes apart,
+ *     which is 16 blocks = 0 mod 16 -> both bases sit in UB Bank 0;
+ *   * the CONTROL case reads aGood (0x400) and bGood (0x520): the 32-byte
+ *     (one-block) skew puts them 9 blocks apart = 9 mod 16 -> distinct banks.
  *
  * Code note: this check is specified as "AKA3003", but that code was already
  * assigned to SYMBOLIC_EVENT_ID when the analyzer shipped, so the bank
@@ -25,14 +25,14 @@ constexpr uint32_t TILE_ELEMS = 128;                  /* 256 B of half values */
 
 /* ---- UB layout ------------------------------------------------------------
  * aBad     [   0,  256)  -> bank 0      aGood    [1024, 1280) -> bank 0
- * bBad     [ 256,  512)  -> bank 0      bGood    [1312, 1568) -> bank 1
- * dstBad   [ 512,  768)                 dstGood  [1568, 1824)
+ * bBad     [ 512,  768)  -> bank 0      bGood    [1312, 1568) -> bank 9
+ * dstBad   [ 768, 1024)                 dstGood  [1568, 1824)
  * -------------------------------------------------------------------------- */
 constexpr uint32_t OFF_A_BAD = 0;
-constexpr uint32_t OFF_B_BAD = 256;                   /* 8 blocks -> bank 0   */
-constexpr uint32_t OFF_DST_BAD = 512;
+constexpr uint32_t OFF_B_BAD = 512;                   /* 16 blocks -> bank 0   */
+constexpr uint32_t OFF_DST_BAD = 768;
 constexpr uint32_t OFF_A_GOOD = 1024;                 /* bank 0               */
-constexpr uint32_t OFF_B_GOOD = 1312;                 /* +9 blocks -> bank 1  */
+constexpr uint32_t OFF_B_GOOD = 1312;                 /* +9 blocks -> bank 9  */
 constexpr uint32_t OFF_DST_GOOD = 1568;
 
 extern "C" __global__ __aicore__ void bank_conflict_vec(__gm__ half* gm)
@@ -75,10 +75,10 @@ extern "C" __global__ __aicore__ void bank_conflict_vec(__gm__ half* gm)
     AscendC::DataCopy(aGood, g[4 * TILE_ELEMS], TILE_ELEMS);
     AscendC::DataCopy(bGood, g[6 * TILE_ELEMS], TILE_ELEMS);
 
-    /* CONFLICT: both sources in UB Bank 0 (delta 8 blocks = 0 mod 8). */
+    /* CONFLICT: both sources in UB Bank 0 (delta 16 blocks = 0 mod 16). */
     AscendC::Add(dstBad, aBad, bBad, TILE_ELEMS);
 
-    /* CONTROL: the 32-byte skew separates the banks (delta 9 = 1 mod 8). */
+    /* CONTROL: the 32-byte skew separates the banks (delta 9 = 9 mod 16). */
     AscendC::Add(dstGood, aGood, bGood, TILE_ELEMS);
 
     AscendC::DataCopy(g[0], dstBad, TILE_ELEMS);

@@ -74,6 +74,9 @@ class AnalyzerOptions:
     #: lowered through the ``ascend`` MLIR dialect; falls back to tree-sitter
     #: when no toolchain is reachable).
     frontend: str = "tree-sitter"
+    strict_frontend: bool = False
+    mlir_header_mode: str = "stub"
+    mlir_dump: Optional[Path] = None
 
 
 @dataclass
@@ -162,10 +165,15 @@ class KernelAnalyzer:
             infer_tiling_roles=self.options.infer_tiling_roles,
         )
         if self.options.frontend == "mlir":
-            from .analyzer_mlir import parse_source_mlir
+            from .analyzer_mlir import parse_source_mlir, MlirFrontendOptions
 
             unit = parse_source_mlir(path, source, self.hardware, collector,
-                                     visitor_options=visitor_options)
+                                     visitor_options=visitor_options,
+                                     options=MlirFrontendOptions(
+                                         strict_frontend=self.options.strict_frontend,
+                                         header_mode=self.options.mlir_header_mode,
+                                         tiling_values=self.options.tiling_values,
+                                         dump_path=self.options.mlir_dump))
         else:
             unit = parse_source(path, source, self.hardware, collector,
                                 visitor_options)

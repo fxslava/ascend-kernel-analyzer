@@ -552,6 +552,7 @@ class AnalysisUnit:
     constants: Dict[str, int] = field(default_factory=dict)
     #: ``True`` when tree-sitter reported syntax errors.
     had_parse_errors: bool = False
+    frontend_metadata: Dict[str, object] = field(default_factory=dict)
     parse_error_locs: List[SourceLoc] = field(default_factory=list)
     #: Diagnostic codes silenced per line by ``@ascend-ignore`` annotations.
     suppressions: Dict[int, List[str]] = field(default_factory=dict)

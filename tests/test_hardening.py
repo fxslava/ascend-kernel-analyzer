@@ -394,13 +394,13 @@ class TestVectorBankConflicts:
             "src0": "aBad",
             "src1": "bBad",
             "src0_offset": 0,
-            "src1_offset": 256,
+            "src1_offset": 512,
             "bank": 0,
-            "delta_blocks": 8,
+            "delta_blocks": 16,
         }
         assert "identical UB Bank 0" in diag.message
         assert "pipeline arbitration stall" in diag.message
-        assert "0x0" in diag.message and "0x100" in diag.message
+        assert "0x0" in diag.message and "0x200" in diag.message
 
     def test_remediation_suggests_the_one_block_pad(self):
         result = KernelAnalyzer(AnalyzerOptions()).analyze_file(
@@ -428,7 +428,7 @@ class TestVectorBankConflicts:
 
     @pytest.mark.parametrize(
         "offset, conflicts",
-        [(256, True), (512, True), (1024, True), (288, False), (544, False)],
+        [(256, False), (512, True), (1024, True), (288, False), (544, False)],
     )
     def test_the_delta_model_decides(self, offset, conflicts):
         result = analyze_body(

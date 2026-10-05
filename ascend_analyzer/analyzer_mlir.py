@@ -41,7 +41,7 @@ from .hardware import (
     TPOSITION_TO_DOMAIN,
 )
 from .ir import AnalysisUnit, ArgRef, KernelIR, TensorDecl
-from .ir.kernel_ir import ApiCallOp, BarrierOp as TraceBarrier, CoreView, FlagKind, FlagOp, Operation, Scope, ScopeKind
+from .ir.kernel_ir import LoopInfo, ApiCallOp, BarrierOp as TraceBarrier, CoreView, FlagKind, FlagOp, Operation, Scope, ScopeKind
 from .ir.mlir_ascend import (
     AllocBufferOp,
     AllocTensorOp,
@@ -99,7 +99,13 @@ class MlirFrontendOptions:
                  max_ops: int = 20000,
                  header_mode: str = "stub",
                  use_cache: bool = True,
-                 emit_queue_ops: bool = True) -> None:
+                 emit_queue_ops: bool = True,
+                 strict_frontend: bool = False,
+                 tiling_values: Optional[Dict[str, int]] = None,
+                 dump_path: Optional[Path] = None) -> None:
+        self.dump_path = dump_path
+        self.strict_frontend = strict_frontend
+        self.tiling_values = dict(tiling_values or {})
         self.all_functions = all_functions
         self.max_ops = max_ops
         self.header_mode = header_mode
@@ -122,25 +128,38 @@ def parse_source_mlir(path: str, source: str, hardware: HardwareModel,
     try:
         result = extract_ast(path, source, chip=hardware.chip.name,
                              header_mode=opts.header_mode,
-                             use_cache=opts.use_cache)
+                             use_cache=opts.use_cache and not opts.strict_frontend)
         module = lower_module(
             result.ast, path, source,
             options=BridgeOptions(queue_ops=opts.emit_queue_ops,
-                                  max_ops=opts.max_ops),
+                                  max_ops=opts.max_ops, tiling_values=opts.tiling_values,
+                                  strict_layout=opts.strict_frontend),
             all_functions=opts.all_functions)
     except BishengError as exc:
+        if opts.strict_frontend:
+            raise
         _fallback_info(diagnostics, path, f"BiSheng extraction unavailable ({exc}); "
                                          f"falling back to the tree-sitter frontend")
         return _tree_sitter_fallback(path, source, hardware, diagnostics,
                                      visitor_options)
     if result.errors:
+        if opts.strict_frontend:
+            raise BishengError(f"MLIR extraction failed for {path}:\n{result.compiler_log or chr(10).join(result.errors)}")
         _fallback_info(diagnostics, path,
                        f"source did not typecheck against the Ascend C headers "
                        f"({len(result.errors)} error(s), first: {result.errors[0][:120]}); "
                        f"falling back to the tree-sitter frontend")
         return _tree_sitter_fallback(path, source, hardware, diagnostics,
                                      visitor_options)
-    return lower_to_unit(module, path, source, hardware, diagnostics, opts)
+    if opts.dump_path is not None:
+        opts.dump_path.write_text(module.dump() + chr(10), encoding="utf-8")
+    unit = lower_to_unit(module, path, source, hardware, diagnostics, opts)
+    unit.frontend_metadata = {
+        "frontend": "mlir", "origin": result.origin, "header_mode": result.header_mode,
+        "toolchain": result.toolchain.describe() if result.toolchain else result.origin,
+        "tiling_values": dict(opts.tiling_values), "fallback": False,
+    }
+    return unit
 
 
 def _fallback_info(diagnostics: DiagnosticCollector, path: str, message: str) -> None:
@@ -185,10 +204,10 @@ class _LayoutSynthesizer:
         cursor = self.cursors.get(op.space, 0)
         base = _align_up(cursor, self.ALIGN)
         self.bases[op.buffer] = base
-        self.sizes[op.buffer] = op.byte_size
+        self.sizes[op.buffer] = op.byte_size * max(op.depth, 1)
         self.depths[op.buffer] = max(op.depth, 1)
         self.spaces[op.buffer] = op.space
-        self.cursors[op.space] = base + max(op.byte_size, 0)
+        self.cursors[op.space] = base + max(op.byte_size, 0) * max(op.depth, 1)
         self.slots.setdefault(op.buffer, 0)
 
     def slot_offset(self, buffer: str) -> Optional[int]:
@@ -276,6 +295,17 @@ def _lower_kernel(kernel_op: KernelOp, path: str, lines: List[str],
     state = _TraceState(kernel=kernel, path=path, lines=lines, layout=layout)
     for op in kernel_op.ops:
         _lower_trace_op(state, op, CoreView.BOTH, 0, False)
+    for info in kernel_op.loops:
+        ranges = [state.op_indices[id(op)] for op in info.get("ops", []) if id(op) in state.op_indices]
+        if not ranges:
+            continue
+        kernel.loops[info["id"]] = LoopInfo(
+            id=info["id"], scope_id=0, loc=_loc(path, lines, info["line"]),
+            induction_var=info.get("induction"), trip_count=info.get("trip_count"),
+            start=info.get("start"), step=info.get("step"),
+            unrolled=info.get("unrolled", False),
+            start_index=min(a for a, b in ranges), end_index=max(b for a, b in ranges),
+            header=info.get("header", ""))
     return kernel
 
 
@@ -289,6 +319,7 @@ class _TraceState:
         self.lines = lines
         self.layout = layout
         self.index = 0
+        self.op_indices: Dict[int, Tuple[int, int]] = {}
         kernel.scopes[0] = Scope(id=0, kind=ScopeKind.KERNEL, parent=None,
                                  loc=kernel.loc)
 
@@ -339,7 +370,7 @@ def _lower_tensors(kernel: KernelIR, kernel_op: KernelOp,
                           dtype=dtype, elem_size=_DTYPE_SIZES.get(dtype or "", 1),
                           origin=f"mlir:{origin}")
 
-        if "*" in type_text and "Tensor" not in type_text:
+        if "GlobalTensor" in type_text or ("*" in type_text and "Tensor" not in type_text):
             # Raw pointer locals re-binding GM addresses.
             decl.domain = PhysicalDomain.GM
             decl.position = TPosition.GM
@@ -371,12 +402,36 @@ def _lower_tensors(kernel: KernelIR, kernel_op: KernelOp,
                 if offset is not None:
                     elem = decl.elem_size or 1
                     decl.byte_offset = Const(offset + element_offset * elem)
-                    decl.byte_size = Const(layout.sizes.get(buffer, 0))
+                    decl.byte_size = Const(info["view_count"] * elem if info.get("view_count") is not None else layout.sizes.get(buffer, 0))
                     decl.source_buffer = buffer
+                    decl.origin = "mlir:view"
                     space = _space_of_buffer(kernel_op, buffer)
                     decl.domain = _SPACE_TO_DOMAIN.get(space, PhysicalDomain.UB)
                     decl.position = _position_of_buffer(kernel_op, buffer)
         kernel.tensors[name] = decl
+
+    # Resolve typed aliases after all defining buffer views are materialised.
+    for _ in range(len(kernel_op.tensors)):
+        changed = False
+        for name, info in kernel_op.tensors.items():
+            alias = info.get("alias")
+            if not alias:
+                continue
+            base_name, element_offset = _split_view_offset(alias)
+            base = kernel.tensors.get(base_name)
+            decl = kernel.tensors.get(name)
+            if base is None or decl is None or base.offset_value is None:
+                continue
+            offset = base.offset_value + element_offset * (base.elem_size or 1)
+            if decl.offset_value != offset:
+                decl.byte_offset = Const(offset)
+                decl.byte_size = Const(max(0, (base.size_value or 0) - element_offset * (base.elem_size or 1)))
+                decl.source_buffer = base.source_buffer
+                decl.origin = "mlir:alias"
+                decl.domain, decl.position = base.domain, base.position
+                changed = True
+        if not changed:
+            break
 
     # Views that appear only as operand names (inline ``buf.Get<T>()[i]``
     # expressions) still need their own disjoint byte ranges.
@@ -498,6 +553,14 @@ def _buffer_of_view(kernel_op: KernelOp, name: str,
 
 def _lower_trace_op(state: _TraceState, op, core: CoreView, loop_depth: int,
                     conditional: bool) -> None:
+    start = state.index + 1
+    _lower_trace_operation(state, op, core, loop_depth, conditional)
+    if state.index >= start:
+        state.op_indices[id(op)] = (start, state.index)
+
+
+def _lower_trace_operation(state: _TraceState, op, core: CoreView, loop_depth: int,
+                           conditional: bool) -> None:
     if isinstance(op, CoreRegionOp):
         view = CoreView.AIC if op.core_type.value == "AIC" else CoreView.AIV
         for nested in op.ops:
@@ -530,8 +593,8 @@ def _lower_trace_op(state: _TraceState, op, core: CoreView, loop_depth: int,
     if isinstance(op, MteCopyOp):
         pipe = _ROUTE_TO_PIPE.get(op.pipe_route, Pipe.MTE1)
         args = [
-            ArgRef(index=0, text=op.src.name, tensor=_resolve(state, op.src.name)),
-            ArgRef(index=1, text=op.dst.name, tensor=_resolve(state, op.dst.name)),
+            ArgRef(index=0, text=op.dst.name, tensor=_resolve(state, op.dst.name)),
+            ArgRef(index=1, text=op.src.name, tensor=_resolve(state, op.src.name)),
             ArgRef(index=2, text=str(op.length_bytes), value=op.length_bytes),
         ]
         writes = [t for t in (_resolve(state, op.dst.name),) if t]
@@ -563,9 +626,13 @@ def _lower_trace_op(state: _TraceState, op, core: CoreView, loop_depth: int,
                                tensor=_resolve(state, v.name)))
         args.append(ArgRef(index=len(args), text=str(op.elem_count),
                            value=op.elem_count))
+        if op.api_args:
+            args = [ArgRef(index=i, text=v.name, tensor=_resolve(state, v.name) if v.tensor else None,
+                           value=int(v.name) if v.name.lstrip("-").isdigit() else None)
+                    for i, v in enumerate(op.api_args)]
         _append(state, ApiCallOp(
             name=op.opcode, args=tuple(args),
-            writes=(_resolve(state, op.dst.name) or op.dst.name,),
+            writes=tuple(_resolve(state, v.name) or v.name for v in (op.dst,) + op.extra_dsts),
             reads=tuple(t for t in
                         (_resolve(state, v.name) for v in op.srcs) if t),
             text=op.text or op.opcode, pipe=Pipe.V,
@@ -580,6 +647,8 @@ def _lower_trace_op(state: _TraceState, op, core: CoreView, loop_depth: int,
 
 def _append(state: _TraceState, operation: Operation) -> None:
     state.kernel.ops.append(operation)
+    if isinstance(operation, ApiCallOp):
+        _touch_tensors(state, list(operation.writes) + list(operation.reads))
     if state.kernel.scopes:
         scope = state.kernel.scopes[0]
         scope.end_index = operation.index
