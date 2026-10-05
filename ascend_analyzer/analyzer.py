@@ -69,6 +69,11 @@ class AnalyzerOptions:
     #: plays at its call sites (see
     #: :meth:`~ascend_analyzer.parsing.ast_visitor.ASTVisitor._infer_tiling_roles`).
     infer_tiling_roles: bool = False
+    #: Which parsing frontend to use: ``"tree-sitter"`` (the original
+    #: regex-free text walker) or ``"mlir"`` (BiSheng Clang AST extraction,
+    #: lowered through the ``ascend`` MLIR dialect; falls back to tree-sitter
+    #: when no toolchain is reachable).
+    frontend: str = "tree-sitter"
 
 
 @dataclass
@@ -150,18 +155,20 @@ class KernelAnalyzer:
     def analyze_source(self, path: str, source: str) -> AnalysisResult:
         """Analyze kernel source text."""
         collector = DiagnosticCollector(suppress=self.options.suppress)
-        unit = parse_source(
-            path,
-            source,
-            self.hardware,
-            collector,
-            VisitorOptions(
-                analyze_all_functions=self.options.all_functions,
-                max_ops=self.options.max_ops,
-                tiling_values=dict(self.options.tiling_values),
-                infer_tiling_roles=self.options.infer_tiling_roles,
-            ),
+        visitor_options = VisitorOptions(
+            analyze_all_functions=self.options.all_functions,
+            max_ops=self.options.max_ops,
+            tiling_values=dict(self.options.tiling_values),
+            infer_tiling_roles=self.options.infer_tiling_roles,
         )
+        if self.options.frontend == "mlir":
+            from .analyzer_mlir import parse_source_mlir
+
+            unit = parse_source_mlir(path, source, self.hardware, collector,
+                                     visitor_options=visitor_options)
+        else:
+            unit = parse_source(path, source, self.hardware, collector,
+                                visitor_options)
 
         context = CheckerContext(
             unit=unit,

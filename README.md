@@ -207,6 +207,35 @@ source.cpp
     └─ DeadlockChecker ── NetworkX marked graph over pipeline dependencies
 ```
 
+The pipeline above is the default (`--frontend tree-sitter`). An alternative
+lowering path is available with `--frontend mlir`:
+
+```
+source.cpp
+    │
+    ├─ BiSheng (Clang AST) extraction ─── bisheng -cc1 -ast-dump=json over a
+    │                  #line-anchored copy on stdin, against either the real
+    │                  CANN headers or the bundled API stub; the C++ parser
+    │                  does all template monomorphisation, auto deduction and
+    │                  constant folding
+    │
+    ├─ ascend MLIR dialect ─── alloc_buffer / get_tensor / mte_copy /
+    │                  set_flag / wait_flag / mmad / vector ops in per-core
+    │                  regions (CoreRegionOp), with a canonical printer
+    │                  (module.dump())
+    │
+    └─ lowering ────── the same KernelIR the checkers consume, with concrete
+                       integer byte offsets (TPipe bump layout + queue slots)
+```
+
+When no BiSheng/Clang toolchain is reachable - or a source does not typecheck
+against the headers - the MLIR frontend falls back to the tree-sitter
+frontend with an INFO diagnostic instead of failing the run. Toolchain
+discovery honours `ASCEND_BISHENG_BIN`, a `bisheng`/`clang` on `PATH`, or a
+Docker image via `ASCEND_BISHENG_IMAGE` (WSL-wrapped on Windows); extraction
+results are memoised, and the tests replay committed content-hash-validated
+snapshots from `tests/data/mlir/` so they need no toolchain at all.
+
 ### Parsing: a real token preprocessor
 
 The frontend is [`pcpp`](https://github.com/ned14/pcpp), a pure-Python ISO

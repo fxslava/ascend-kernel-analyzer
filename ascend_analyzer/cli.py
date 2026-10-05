@@ -82,6 +82,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     analysis = parser.add_argument_group("analysis")
     analysis.add_argument(
+        "--frontend",
+        choices=("tree-sitter", "mlir"),
+        default="tree-sitter",
+        help=(
+            "parsing frontend (default: %(default)s). 'mlir' extracts the "
+            "Clang AST with BiSheng and lowers it through the ascend MLIR "
+            "dialect; it falls back to tree-sitter (with an INFO diagnostic) "
+            "when no toolchain is reachable or the source does not typecheck"
+        ),
+    )
+    analysis.add_argument(
         "--solver",
         choices=("auto", "z3", "interval"),
         default="auto",
@@ -325,6 +336,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 honour_inline_ignores=not args.ignore_inline_pragmas,
                 tiling_values=_load_tiling_values(args.tiling_data),
                 infer_tiling_roles=args.infer_tiling_roles,
+                frontend=args.frontend,
             )
         )
     except (KeyError, ValueError, OSError) as exc:

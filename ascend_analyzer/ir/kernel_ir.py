@@ -19,9 +19,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
-from .diagnostics import SourceLoc
-from .hardware import HardEventRoute, PhysicalDomain, Pipe, TPosition
-from .symbolic import Expr, render, to_int
+from ..diagnostics import SourceLoc
+from ..hardware import HardEventRoute, PhysicalDomain, Pipe, TPosition
+from ..symbolic import Expr, render, to_int
 
 __all__ = [
     "FlagKind",
