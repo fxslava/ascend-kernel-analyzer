@@ -287,7 +287,34 @@ class PipeBuffer:
         if self.block_bytes is None:
             return None
         return mul(self.block_bytes, Const(self.depth)) if self.depth > 1 else self.block_bytes
+
+
+@dataclass(frozen=True)
+class TensorField:
+    """A ``LocalTensor``/``GlobalTensor`` declared as a class member.
+
+    Production kernels keep their GM handles (``GlobalTensor<uint16_t>
+    legOutGm_[3];``) as class fields bound by ``SetGlobalBuffer`` in a
+    constructor the per-function walker never enters.  Collecting the fields
+    once per unit lets every kernel's trace resolve ``legOutGm_[i][j]``
+    arguments back to a GM-resident tensor instead of dropping them.
+    """
+
+    dtype: Optional[str]
+    elem_size: Optional[int]
+    is_global: bool
+
+    @property
+    def domain(self) -> PhysicalDomain:
+        return PhysicalDomain.GM if self.is_global else PhysicalDomain.UNKNOWN
+
+
 _LEADING_IDENT_RE = re.compile(r"^\s*\(*\s*(?:[A-Za-z_]\w*::)*(?P<name>[A-Za-z_]\w*)")
+
+#: ``x.ReinterpretCast<T>()`` inside a call argument names the view's dtype.
+_REINTERPRET_RE = re.compile(
+    r"ReinterpretCast\s*<\s*(?:[A-Za-z_]\w*::)*([A-Za-z_]\w*)\s*>"
+)
 
 #: Scalar type words that may appear as the operand of a C-style cast.
 _BUILTIN_TYPE_WORDS = frozenset({
@@ -472,6 +499,10 @@ class ASTVisitor:
         #: size its ``InitBuffer`` reserves.  Unit-wide because the declaration,
         #: the sizing call and the ``Get<T>()`` live in different scopes.
         self._pipe_buffers: Dict[str, "PipeBuffer"] = {}
+        #: Tensor-typed class members (``GlobalTensor<T> out_[3];``), by name.
+        #: Unit-wide for the same reason as the pipe buffers: the declaration
+        #: lives in the class body while every use lives in method bodies.
+        self._tensor_fields: Dict[str, "TensorField"] = {}
 
     # -- entry point --------------------------------------------------------
 
@@ -488,6 +519,7 @@ class ASTVisitor:
         self._collect_helper_functions(root)
         self._collect_scalar_members(root)
         self._collect_pipe_buffers(root)
+        self._collect_tensor_fields(root)
         if self.opts.infer_tiling_roles:
             # Between the two buffer phases: inference needs each
             # buffer's TPosition, and the sizing phase needs the values
@@ -1104,6 +1136,38 @@ class ASTVisitor:
         for name in ambiguous:
             self._pipe_buffers.pop(name, None)
 
+    def _collect_tensor_fields(self, root: Node) -> None:
+        """Index tensor-typed class members: ``GlobalTensor<T> out_[3];``.
+
+        The per-function walker only sees declarations inside the body it is
+        walking, so a GM handle declared as a class field and bound by
+        ``SetGlobalBuffer`` in a constructor would otherwise never enter the
+        tensor table, and every ``out_[i][j]`` DMA argument would resolve to
+        nothing - no domain, no issuing pipe, no hazard pairing.
+        """
+        for node in _walk(root):
+            if node.type != "field_declaration":
+                continue
+            type_node = node.child_by_field_name("type")
+            match = (
+                _TENSOR_TYPE_RE.search(self.text(type_node))
+                if type_node is not None
+                else None
+            ) or _TENSOR_TYPE_RE.search(self.text(node))
+            if match is None:
+                continue
+            dtype = match.group("dtype").rsplit("::", 1)[-1]
+            field = TensorField(
+                dtype=dtype,
+                elem_size=dtype_size(dtype),
+                is_global=match.group("kind") == "GlobalTensor",
+            )
+            for declarator in node.children_by_field_name("declarator"):
+                name_node = _declarator_identifier(declarator)
+                if name_node is None:
+                    continue
+                self._tensor_fields[self.text(name_node)] = field
+
     def _size_pipe_buffers(self, root: Node) -> None:
         """Evaluate every ``InitBuffer``/``InitQueue`` extent.
 
@@ -1400,6 +1464,9 @@ class _KernelWalker:
         self._buffer_blocks: Dict[str, Expr] = {}
         #: Callees currently being inlined, innermost last; the recursion guard.
         self._inline_stack: List[str] = []
+        #: ``callee::param`` keys whose argument types clashed across call
+        #: sites, so their binding resolves to nothing.
+        self._ambiguous_params: Set[str] = set()
         #: Core whose binary the region being walked belongs to.
         self._core_view_current: CoreView = CoreView.BOTH
         #: Class owning the function being walked, so an unqualified call
@@ -1419,6 +1486,20 @@ class _KernelWalker:
                 folded = to_int(total)
                 if folded is not None:
                     self.ir.buffer_sizes[buf.name] = folded
+        # Class-field tensors (GM handles bound in a constructor this walker
+        # never enters) are pre-declared so ``out_[i][j]`` arguments resolve.
+        for name, tensor_field in visitor._tensor_fields.items():
+            self.ir.tensors[name] = TensorDecl(
+                name=name,
+                loc=self.ir.loc,
+                position=TPosition.GM if tensor_field.is_global else None,
+                domain=tensor_field.domain,
+                dtype=tensor_field.dtype,
+                elem_size=tensor_field.elem_size,
+                scope_id=0,
+                origin="class field declaration",
+                unbound=True,
+            )
         self._truncated = False
 
     # -- public -------------------------------------------------------------
@@ -2539,6 +2620,7 @@ class _KernelWalker:
             folded = self.v._eval.fold(arg, self._env)
             if folded is not None:
                 env.define(param, folded)
+        self._bind_tensor_params(params, node, base)
 
         self._inline_stack.append(base)
         self._env_stack.append(env)
@@ -2550,6 +2632,56 @@ class _KernelWalker:
         self.ir.inlined.append(base)
         return True
 
+    def _bind_tensor_params(self, params: Tuple[str, ...], call: Node, callee: str) -> None:
+        """Declare callee tensor parameters as views of their call-site args.
+
+        ``CastToBf16(dst, src, n)`` inlines into the trace, but the body's
+        ``Cast(dst[base], src[base], ...)`` used to reference parameter names
+        that resolve to nothing - no domain, no dtype, no element size - which
+        is exactly what the repeat-stride and split-layout checks need.  A
+        parameter whose argument is (a view of) a known tensor becomes a view
+        of that tensor; ``x.ReinterpretCast<T>()`` arguments carry their own
+        dtype.
+
+        Names are mangled as ``callee::param`` because the tensor table is
+        keyed by source name alone: ``BitAnd(dst, ...)`` and ``CastToBf16(dst,
+        ...)`` are different parameters with different types, and whichever
+        bound last would otherwise win for both.
+        """
+        for param, arg in zip(params, _argument_nodes(call)):
+            if not param:
+                continue
+            text = " ".join(self._text(arg).split())
+            candidate = _leading_identifier(_strip_leading_casts(text))
+            base_name = self._lookup_tensor_name(candidate)
+            base = self.ir.tensors.get(base_name) if base_name else None
+            if base is None:
+                continue
+            reinterpret = _REINTERPRET_RE.search(text)
+            dtype = reinterpret.group(1) if reinterpret else base.dtype
+            key = f"{callee}::{param}"
+            existing = self.ir.tensors.get(key)
+            if existing is not None and existing.dtype != dtype:
+                # The same helper inlined twice with differently-typed
+                # arguments under one parameter: neither binding is
+                # trustworthy, so resolve to nothing rather than mispredict.
+                self.ir.tensors.pop(key, None)
+                self._ambiguous_params.add(key)
+                continue
+            if key in self._ambiguous_params:
+                continue
+            self.ir.tensors[key] = TensorDecl(
+                name=key,
+                loc=self._loc(arg),
+                position=base.position,
+                domain=base.domain,
+                dtype=dtype,
+                elem_size=dtype_size(dtype),
+                scope_id=self._scope_id,
+                origin="inline parameter binding",
+                view_source=base.name,
+                unbound=True,
+            )
     def _handle_init_buffer(self, node: Node) -> None:
         """Record ``pipe.InitBuffer(buf, bytes)`` sizes."""
         args = _argument_nodes(node)
@@ -2734,7 +2866,7 @@ class _KernelWalker:
             if tensor_name is None:
                 continue
             param = spec.param_at(position)
-            if param is not None and param.role is ArgRole.DST:
+            if param is not None and param.role in (ArgRole.DST, ArgRole.DST2):
                 writes.append(tensor_name)
             else:
                 reads.append(tensor_name)
@@ -2811,8 +2943,9 @@ class _KernelWalker:
     def _resolve_tensor_arg(self, node: Node, text: str) -> Optional[str]:
         """Map an argument expression back to a declared tensor name."""
         candidate = _leading_identifier(_strip_leading_casts(text))
-        if candidate and candidate in self.ir.tensors:
-            return candidate
+        resolved = self._lookup_tensor_name(candidate)
+        if resolved is not None:
+            return resolved
         if node.type == "parenthesized_expression":
             inner = next(
                 (c for c in node.named_children if c.type != "comment"), None
@@ -2824,6 +2957,21 @@ class _KernelWalker:
             if value is not None:
                 return self._resolve_tensor_arg(value, self._text(value))
         return None
+
+    def _lookup_tensor_name(self, candidate: Optional[str]) -> Optional[str]:
+        """Resolve a bare identifier to a tensor, honouring inline nesting.
+
+        Inside an inlined body a parameter first resolves under its mangled
+        ``callee::param`` name (innermost callee first), then under its plain
+        source name.
+        """
+        if not candidate:
+            return None
+        for depth in range(len(self._inline_stack) - 1, -1, -1):
+            name = f"{self._inline_stack[depth]}::{candidate}"
+            if name in self.ir.tensors:
+                return name
+        return candidate if candidate in self.ir.tensors else None
 
     # -- post-processing ----------------------------------------------------
 

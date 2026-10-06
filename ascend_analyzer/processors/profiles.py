@@ -340,6 +340,10 @@ class ChipSpec:
     block_bytes: int = 32
     #: Vector register width in bytes (one full vector instruction's footprint).
     vector_bytes: int = 256
+    #: Largest encodable repeat count for one vector instruction.  The repeat
+    #: field is one byte wide in the DaVinci vector instruction encoding, so a
+    #: computed repeat above this wraps silently at run time.
+    max_repeat_count: int = 255
     #: ``True`` when the capacity numbers are inferred rather than documented.
     provisional: bool = False
     notes: str = ""
@@ -669,6 +673,7 @@ class HardwareModel:
             max_event_id=int(raw.get("max_event_id", base.max_event_id)),
             block_bytes=int(raw.get("block_bytes", base.block_bytes)),
             vector_bytes=int(raw.get("vector_bytes", base.vector_bytes)),
+            max_repeat_count=int(raw.get("max_repeat_count", base.max_repeat_count)),
             provisional=bool(raw.get("provisional", True)),
             notes=str(raw.get("notes", f"loaded from {Path(path).name}")),
             ub_total_bytes=(
@@ -821,6 +826,7 @@ class HardwareModel:
             "notes": self.chip.notes,
             "block_bytes": self.chip.block_bytes,
             "max_event_id": self.chip.max_event_id,
+            "max_repeat_count": self.chip.max_repeat_count,
             "reserved_event_ids": sorted(self.chip.reserved_event_ids),
             "flow_model": {"rates": dict(self.chip.flow_rates), "buffers": dict(self.chip.flow_buffers), "roles": dict(self.chip.flow_roles),
                            "queue_depths": dict(self.chip.queue_depths), "calibrated": bool(self.chip.flow_rates)},

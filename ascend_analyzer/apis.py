@@ -40,6 +40,8 @@ class ArgRole(Enum):
     """The semantic role of a positional argument."""
 
     DST = "dst"
+    #: A second written destination, e.g. the odd half of ``DeInterleave``.
+    DST2 = "dst2"
     SRC = "src"
     SRC0 = "src0"
     SRC1 = "src1"
@@ -308,6 +310,35 @@ def _build_table() -> Dict[str, ApiSpec]:
         category="vector",
         doc="Mask-driven gather within UB.",
     ))
+    put(ApiSpec(
+        name="Gather",
+        params=(
+            _p(ArgRole.DST, _UB, "dst"),
+            _p(ArgRole.SRC, _UB, "src"),
+            _p(ArgRole.OTHER, _UB, "offsets"),
+            _p(ArgRole.SCALAR, ANY_TENSOR, "offset"),
+            _p(ArgRole.COUNT, ANY_TENSOR, "count"),
+        ),
+        pipe=Pipe.V,
+        category="vector",
+        doc="Offset-table gather within UB; byte offsets come from a UB tensor.",
+    ))
+    # The split family: one flat source de-interleaved into two destinations.
+    # Pairs of Gathers over a shared offset ramp implement the same shape on
+    # parts without a native de-interleave (see the reduction-bleed check).
+    for name in ("DeInterleave", "DeInterleave2"):
+        put(ApiSpec(
+            name=name,
+            params=(
+                _p(ArgRole.DST, _UB, "even"),
+                _p(ArgRole.DST2, _UB, "odd"),
+                _p(ArgRole.SRC, _UB, "src"),
+                _p(ArgRole.COUNT, ANY_TENSOR, "count"),
+            ),
+            pipe=Pipe.V,
+            category="split",
+            doc="Split alternating elements of a flat UB tensor into two halves.",
+        ))
 
     # -- data movement ------------------------------------------------------
     for name in ("DataCopy", "DataCopyPad"):

@@ -24,6 +24,18 @@ read.  This checker tests exactly that, for every ``(tensor, A, B)`` triple:
   ... DataCopy ... SetFlag`` body shape - the wait guards this iteration's
   read against the previous iteration's write.
 
+It also owns two sharper members of the same family:
+
+* **vacuous handshakes** (below) - a ``SetFlag``/``WaitFlag`` pair that is
+  written like the drain idiom but orders nothing, because the producing
+  pipeline has no outstanding asynchronous work at the set (the fake
+  ``WaitLoad()`` that runs before the loads it claims to guard), or because
+  the flag names a producing pipeline other than the one with the work (a
+  ``SetFlag<HardEvent::MTE2_V>`` that follows vector instructions, not DMA);
+* **loop-invariant GM flushes** (AKA2012) - a store to global memory inside
+  a loop whose destination ignores the loop's induction variable, so every
+  iteration destroys the previous one's partial sums of the inner reduction.
+
 What is deliberately *not* flagged
 ----------------------------------
 * same-pipe pairs - program order already serialises them;
@@ -49,8 +61,15 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from ..diagnostics import Code, Severity
+from ..diagnostics import Code, Severity, SourceLoc
 from ..hardware import REAL_PIPES, Pipe, PhysicalDomain
+from ..backend.parity import (
+    GmStoreProbe,
+    LoopProbe,
+    SyncPairProbe,
+    invariant_flush_loops,
+    vacuous_sync_pairs,
+)
 from ..backend.trace import dependency_graph
 from ..backend.safety import Access, unordered_hazards
 import networkx as nx
@@ -143,6 +162,8 @@ class HazardChecker(Checker):
             },
         )
         self._check_interval_hazards(kernel)
+        self._check_vacuous_handshakes(kernel)
+        self._check_loop_invariant_gm_flush(kernel)
 
     def _check_interval_hazards(self, kernel):
         if kernel.loops:
@@ -208,6 +229,250 @@ class HazardChecker(Checker):
         self.ctx.publish(f"interval_hazard_coverage::{kernel.name}",
                          {"hazards": found, "skipped": skipped,
                           "scope": "straight-line extents; unrelated GM base provenance unchecked; local core views distinct"})
+
+    # -- vacuous handshakes (AKA2010) ----------------------------------------
+
+    def _check_vacuous_handshakes(self, kernel: KernelIR) -> None:
+        """Flag SetFlag/WaitFlag pairs that order nothing (AKA2010).
+
+        The written drain idiom is ``<produce on A>; SetFlag<A_B>(id);
+        WaitFlag<A_B>(id); <consume on B>``: the set is enqueued on the
+        producing pipeline's queue and fires when that pipeline drains
+        through it, so the wait really does order B's continuation after A's
+        work.  The idiom turns *pseudo* when A has no outstanding
+        asynchronous work at the set - the flag fires the instant it issues,
+        and the pair costs two instructions while ordering nothing (the fake
+        ``WaitLoad()`` that sits before the loads it claims to guard) - or
+        when the outstanding work lives on a pipe the route does not name.
+
+        The pairing, adjacency and reachability all come from the sync graph
+        the deadlock checker already published, so the two passes never
+        disagree about which set belongs to which wait.
+        """
+        sync = self.ctx.artifacts.get(f"sync_graph::{kernel.name}")
+        if not isinstance(sync, dict):
+            return
+        pairs: List[SyncPairProbe] = []
+        by_index = {op.index: op for op in kernel.ops}
+        for entry in sync.get("sync_pairs", []):
+            setter = by_index.get(entry.get("set_index"))
+            waiter = by_index.get(entry.get("wait_index"))
+            if setter is None or waiter is None:
+                continue
+            if setter.conditional or waiter.conditional:
+                continue
+            if not setter.core_view.overlaps(waiter.core_view):
+                continue
+            route = setter.route
+            if route is None:
+                continue
+            channel = entry.get("channel") or {}
+            pairs.append(
+                SyncPairProbe(
+                    set_index=setter.index,
+                    wait_index=waiter.index,
+                    src_pipe=route.src.value,
+                    dst_pipe=route.dst.value,
+                    route=route.name,
+                    event_id=channel.get("event_id", entry.get("event_id")),
+                )
+            )
+        if not pairs:
+            return
+        pipe_ops: Dict[str, List[int]] = defaultdict(list)
+        work: Dict[str, List[int]] = defaultdict(list)
+        for op in kernel.ops:
+            pipe_ops[op.pipe.value].append(op.index)
+            if isinstance(op, ApiCallOp):
+                work[op.pipe.value].append(op.index)
+        loop_spans = [
+            (loop.start_index, loop.end_index) for loop in kernel.loops.values()
+        ]
+        for verdict in vacuous_sync_pairs(
+            self._dependencies, pairs, pipe_ops, work, loop_spans
+        ):
+            self._report_vacuous(kernel, verdict, by_index)
+
+    def _report_vacuous(self, kernel: KernelIR, verdict, by_index) -> None:
+        pair = verdict.pair
+        setter = by_index[pair.set_index]
+        waiter = by_index[pair.wait_index]
+        if verdict.kind == "no_producer_work":
+            detail = (
+                f"SetFlag<{pair.route}>({self._id_text(pair.event_id)}) is raised on "
+                f"{pair.src_pipe} with no outstanding asynchronous work behind "
+                f"it, so the flag fires the moment it issues and the paired "
+                f"WaitFlag on {pair.dst_pipe} releases immediately"
+            )
+            if verdict.producer_hint:
+                detail += (
+                    f"; the nearest preceding asynchronous work runs on "
+                    f"{', '.join(verdict.producer_hint)}, not on "
+                    f"{pair.src_pipe} - the route names the wrong producer"
+                )
+            fix = (
+                f"Issue the producing instructions before the "
+                f"SetFlag<HardEvent::{pair.route}>({self._id_text(pair.event_id)}); "
+                f"the set must sit at the tail of {pair.src_pipe}'s work, and "
+                "the wait after it orders the consumer against exactly that work"
+            )
+        else:
+            detail = (
+                f"SetFlag<{pair.route}>({self._id_text(pair.event_id)}) at line "
+                f"{setter.loc.line} orders nothing the program does not "
+                "already order: every asynchronous operation on "
+                f"{pair.src_pipe} before it is reachable from the WaitFlag "
+                "through other synchronisation"
+            )
+            fix = (
+                "Delete the pair, or move the set to a point where it fences "
+                "work that is genuinely outstanding"
+            )
+        self.diags.add(
+            Code.MISSING_SYNC,
+            Severity.WARNING,
+            detail
+            + ". The handshake is pseudo-synchronisation: the code reads as a "
+            "drain, the hardware executes a no-op, and any cross-pipeline "
+            "data movement it was meant to guard stays unordered",
+            waiter.loc,
+            hardware_domain=waiter.pipe.value,
+            remediation=fix,
+            related=[
+                ("flag raised here", setter.loc),
+                ("flag waited here", waiter.loc),
+            ],
+            route=pair.route,
+            event_id=pair.event_id,
+            vacuity=verdict.kind,
+            producer_hint=list(verdict.producer_hint),
+        )
+
+    @staticmethod
+    def _id_text(event_id) -> str:
+        return f"EVENT_ID{event_id}" if event_id is not None else "its event id"
+
+    # -- loop-invariant GM flush (AKA2012) ------------------------------------
+
+    #: Ops that overwrite a global-memory destination in one transaction.
+    _GM_STORES = frozenset({"DataCopy", "DataCopyPad", "Fixpipe"})
+    _ATOMIC_ON = frozenset({"SetAtomicAdd", "SetAtomicMax", "SetAtomicMin"})
+    _ATOMIC_OFF = frozenset({"SetAtomicNone"})
+
+    def _check_loop_invariant_gm_flush(self, kernel: KernelIR) -> None:
+        """Stores to a GM address that their own loop never advances (AKA2012).
+
+        In a ``row0``/``col0`` reduction nest, a store whose destination
+        mentions only the outer induction variable while it sits inside the
+        inner loop rewrites the same GM bytes once per inner iteration.  The
+        accumulated partial sums of the inner dimension are destroyed as
+        they are produced (an early flush); without atomics only the last
+        inner iteration's contribution survives.
+        """
+        stores: List[GmStoreProbe] = []
+        atomic_active = False
+        for op in kernel.api_calls():
+            if op.name in self._ATOMIC_ON:
+                atomic_active = True
+            elif op.name in self._ATOMIC_OFF:
+                atomic_active = False
+            if op.name not in self._GM_STORES or not op.args:
+                continue
+            dst = op.args[0].tensor
+            if not dst:
+                continue
+            decl = kernel.tensors.get(dst)
+            if decl is None or decl.domain is not PhysicalDomain.GM:
+                continue
+            stores.append(
+                GmStoreProbe(
+                    index=op.index,
+                    line=op.loc.line,
+                    dst_text=op.args[0].text,
+                    store_name=op.name,
+                    loop_id=op.loop_id,
+                    conditional=op.conditional,
+                    atomic=atomic_active,
+                )
+            )
+        if not stores:
+            return
+        accumulating = self._accumulating_loops(kernel)
+        loops = {
+            loop.id: LoopProbe(
+                id=loop.id,
+                var=loop.induction_var,
+                parent=loop.parent,
+                trip_count=loop.trip_count,
+                line=loop.loc.line,
+                accumulates=loop.id in accumulating,
+            )
+            for loop in kernel.loops.values()
+        }
+        for verdict in invariant_flush_loops(stores, loops):
+            self._report_flush(kernel, verdict)
+
+    def _accumulating_loops(self, kernel: KernelIR) -> Set[int]:
+        """Loops whose body accumulates into one buffer (``Add(x, x, ...)``)."""
+        accumulating: Set[int] = set()
+        for op in kernel.api_calls():
+            if op.name != "Add" or len(op.args) < 2:
+                continue
+            if op.args[0].tensor and op.args[0].tensor == op.args[1].tensor:
+                if op.loop_id is not None:
+                    accumulating.add(op.loop_id)
+        return accumulating
+
+    def _report_flush(self, kernel: KernelIR, verdict) -> None:
+        store = verdict.store
+        loop = verdict.loop
+        severity = Severity.FATAL if verdict.reduction else Severity.WARNING
+        where = (
+            f"loop at line {loop.line} ('{loop.var}')"
+            if loop.var
+            else f"loop at line {loop.line}"
+        )
+        if verdict.reduction:
+            consequence = (
+                "the loop accumulates a reduction into this buffer, so every "
+                "inner iteration destroys the partial sums of the previous "
+                "one - an early flush that leaves only the last chunk's "
+                "contribution in global memory"
+            )
+            fix = (
+                f"Move the store out of the {loop.var} loop, past its closing "
+                "brace, so the full inner reduction completes first; or index "
+                f"the destination with {loop.var} when a per-iteration "
+                "destination is intended"
+            )
+        else:
+            consequence = (
+                "each iteration overwrites the previous one's bytes without "
+                "accumulating, so only the final iteration's data survives"
+            )
+            fix = (
+                f"Advance the destination with {loop.var} (e.g. out[{loop.var}]) "
+                "or hoist the store out of the loop"
+            )
+        self.diags.add(
+            Code.MEMORY_ORDERING,
+            severity,
+            f"{store.store_name} at line {store.line} writes GM destination "
+            f"'{store.dst_text}' from inside the {where}, but the address does "
+            f"not depend on {loop.var}"
+            + (f" (it depends on {', '.join(verdict.mentioned)} only)"
+               if verdict.mentioned else "")
+            + f"; {consequence}",
+            SourceLoc(file=self.ctx.unit.path, line=store.line),
+            hardware_domain="GM",
+            remediation=fix,
+            hazard_kind="WAW_LOOP_INVARIANT",
+            store=store.store_name,
+            store_line=store.line,
+            loop_line=loop.line,
+            induction_var=loop.var,
+            reduction=verdict.reduction,
+        )
 
     # -- evidence -----------------------------------------------------------
 

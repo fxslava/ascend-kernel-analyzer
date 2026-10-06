@@ -65,6 +65,13 @@ class Code(str, enum.Enum):
     # 351x SIMD/SIMT DataCache headroom below the 32 KiB hardware minimum.
     INSUFFICIENT_DATACACHE = "AKA1010"
     UNSUPPORTED_INTRINSIC = "AKA1011"
+    # A de-interleave/split window shrank below one logical row of a flattened
+    # multi-row buffer, so the split pairs (and the merge tree above it sums)
+    # elements across independent row/batch boundaries.
+    STRIDED_REDUCTION = "AKA1015"
+    # Vector repeat encoding: repeat counter outside the uint8 instruction
+    # field, or block/repeat strides inconsistent with the operand lane ratio.
+    REPEAT_ENCODING = "AKA1020"
 
     # -- 2xxx: synchronisation / pipeline ----------------------------------
     UNMATCHED_SET_FLAG = "AKA2001"
@@ -118,6 +125,8 @@ CODE_TITLES: Dict[str, str] = {
     Code.UNKNOWN_DOMAIN.value: "Undetermined memory domain",
     Code.INSUFFICIENT_DATACACHE.value: "Insufficient UB DataCache headroom (351x SIMT)",
     Code.UNSUPPORTED_INTRINSIC.value: "Intrinsic unsupported on target architecture",
+    Code.STRIDED_REDUCTION.value: "De-interleave crosses row/batch boundaries of a flattened layout",
+    Code.REPEAT_ENCODING.value: "Vector repeat encoding violates ISA limits or lane-ratio strides",
     Code.UNMATCHED_SET_FLAG.value: "SetFlag without matching WaitFlag",
     Code.UNMATCHED_WAIT_FLAG.value: "WaitFlag without matching SetFlag",
     Code.RESERVED_EVENT_ID.value: "Reserved EVENT_ID used",

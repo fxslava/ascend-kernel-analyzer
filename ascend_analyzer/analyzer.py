@@ -16,6 +16,7 @@ from .checkers.deadlock import DeadlockChecker
 from .checkers.hazard import HazardChecker
 from .checkers.memory import MemoryChecker
 from .checkers.perf_model import PerfModelChecker
+from .checkers.vector_isa import VectorIsaChecker
 from .diagnostics import Diagnostic, DiagnosticCollector, Severity
 from .hardware import HardwareModel, PhysicalDomain
 from .ir import AnalysisUnit
@@ -31,6 +32,7 @@ AVAILABLE_CHECKERS: Tuple[str, ...] = (
     MemoryChecker.name,
     DeadlockChecker.name,
     HazardChecker.name,
+    VectorIsaChecker.name,
     PerfModelChecker.name,
 )
 
@@ -194,6 +196,11 @@ class KernelAnalyzer:
             # Cross-pipeline hazard sufficiency: needs the flags the deadlock
             # checker validates, but adds no ordering assumptions of its own.
             HazardChecker(context).run_all()
+        if VectorIsaChecker.name not in disabled:
+            # Numerical-parity ISA checks: split-window bleed and repeat
+            # encoding.  Independent of the sync graph; runs after hazard
+            # only to keep the pass order stable in reports.
+            VectorIsaChecker(context).run_all()
         if PerfModelChecker.name not in disabled:
             # Runs last: the overlap profiler schedules the DAG the deadlock
             # checker proved acyclic and publishes perf_profile artifacts.

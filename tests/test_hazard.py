@@ -138,22 +138,38 @@ class TestSufficientSynchronisation:
 
 class TestInsufficientSynchronisation:
     def test_a_flag_on_the_wrong_channel_does_not_count(self):
-        """`V_MTE2` orders V before MTE2, not MTE2 before V."""
-        body = (
+        """`V_MTE2` orders V before MTE2, not MTE2 before V.
+
+        Two findings are expected: the RAW hazard itself, and the vacuity
+        finding for the same pair - raised on PIPE_V with nothing behind it
+        while the outstanding work (the DataCopy) sits on PIPE_MTE2, which
+        is precisely the route-mismatch evidence.
+        """
+        result = analyze_body(
             DECLS + GLOBAL + MOVE_IN
             + set_flag("V_MTE2") + wait_flag("V_MTE2")
             + COMPUTE
         )
-        assert len(hazards(analyze_body(body))) == 1
+        assert len(hazards(result)) == 2
+        vacuous = [d for d in hazards(result) if d.details.get("vacuity")]
+        assert len(vacuous) == 1
+        assert vacuous[0].details["producer_hint"] == ["PIPE_MTE2"]
 
     def test_a_pair_entirely_before_the_write_does_not_count(self):
-        """The set has to follow the write it is meant to publish."""
-        body = (
+        """The set has to follow the write it is meant to publish.
+
+        The pair ahead of the write also earns its own vacuity finding: it
+        orders nothing, because nothing has been produced yet.
+        """
+        result = analyze_body(
             DECLS + GLOBAL
             + set_flag("MTE2_V") + wait_flag("MTE2_V")
             + MOVE_IN + COMPUTE
         )
-        assert len(hazards(analyze_body(body))) == 1
+        assert len(hazards(result)) == 2
+        vacuous = [d for d in hazards(result) if d.details.get("vacuity")]
+        assert len(vacuous) == 1
+        assert vacuous[0].details["vacuity"] == "no_producer_work"
 
     def test_a_set_without_a_wait_does_not_count(self):
         body = DECLS + GLOBAL + MOVE_IN + set_flag("MTE2_V") + COMPUTE

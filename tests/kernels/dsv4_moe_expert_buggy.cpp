@@ -1,0 +1,652 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software and can be redistributed under the terms
+ * and conditions of the CANN Open Software License Agreement Version 2.0.
+ * See the License for details.
+ */
+
+/*!
+ * DeepSeek-V4 routed expert: BF16 x, E2M1 packed FP4 weights, block-32
+ * E8M0 scales, FP32 accumulators, symmetric gate clamp at +/-10, BF16
+ * round-to-nearest-even activation before the down projection.
+ *
+ * PRE-FIX VARIANT - carries the four numerical-parity bugs the analyzer's
+ * AKA1015/AKA1020/AKA2010/AKA2012 rules exist to catch (see the annotated
+ * sites): the row flush inside the col0 reduction loop, the over-descended
+ * SplitColumns merge tree, the WaitLoad() pseudo-barrier ahead of the loads
+ * it claims to guard, and swapped Cast repeat strides in CastToBf16.
+ * @ascend-expect: AKA1015 AKA1020 AKA2010 AKA2012
+ * @ascend-expect-fatal: 3
+ *
+ * One AIV processes eight rows by <=512 columns at a time. Weight/scale
+ * loads, vector decode and reductions are streamed; there is no Cube work.
+ * FP32 reductions are reassociated relative to the ascending CPU oracle.
+ * Hardware numerical parity is required: compilation is not validation.
+ *
+ * All staging uses TBuf with explicit sync (--cce-auto-sync=off):
+ * id 3: MTE2_V / V_MTE2 weight ring, primed, re-armed per column tile, drained.
+ * id 3: V_MTE3 / MTE3_V output-row ring, primed, re-armed per row tile, drained.
+ * id 4: V_MTE3 output handoff and MTE3_V final output drain.
+ * id 4: MTE2_V input handoff. IDs are distinct within each event namespace;
+ * no helper calls an external event-using kernel. There are no scalar UB
+ * data accesses and no S_* events. Dependent arch220 vector operations have explicit PIPE_V barriers.
+ * E8M0 255 is NaN, not infinity; 0 is the subnormal 2^-127.
+ */
+
+#include "kernel_tiling/kernel_tiling.h"
+#include "kernel_operator.h"
+#include "dsv4_moe_expert_tiling_data.h"
+#include "dsv4_moe_expert_vector_compat.h"
+
+#ifndef CANN_VERSION_MAJOR
+#define CANN_VERSION_MAJOR 8
+#endif
+
+using namespace AscendC;
+
+namespace Dsv4MoeExpertOp {
+
+__aicore__ inline void VectorDependencyBarrier()
+{
+#if __CCE_AICORE__ == 220
+    PipeBarrier<PIPE_V>();
+#endif
+}
+
+// BUG (AKA1020): the repeat strides are the fp32 -> bf16 lane ratio inverted.
+// One 64-element repeat reads 8 src blocks (256 B of fp32) but writes only
+// 4 dst blocks (128 B of bf16); {1, 1, 8, 4} strides the destination as if
+// it were the wide side, so repeat i+1 lands 256 B past repeat i and every
+// other 64-element group of the conversion is never written.
+__aicore__ inline void CastToBf16(const LocalTensor<bfloat16_t>& dst,
+                                const LocalTensor<float>& src, uint32_t count)
+{
+#if __CCE_AICORE__ == 220
+    constexpr uint32_t FLOAT_LANES = 64;
+    const uint16_t repeats = static_cast<uint16_t>(count / FLOAT_LANES);
+    const uint32_t tail = count % FLOAT_LANES;
+    SetMaskNorm();
+    if (repeats != 0) {
+        Cast(dst, src, RoundMode::CAST_RINT, static_cast<uint64_t>(FLOAT_LANES), repeats, {1, 1, 8, 4});
+        PipeBarrier<PIPE_V>();
+    }
+    if (tail != 0) {
+        const uint32_t base = repeats * FLOAT_LANES;
+        Cast(dst[base], src[base], RoundMode::CAST_RINT, static_cast<uint64_t>(tail), 1, {1, 1, 8, 4});
+        PipeBarrier<PIPE_V>();
+    }
+    ResetMask();
+#else
+    Cast(dst, src, RoundMode::CAST_ROUND, count);
+#endif
+}
+
+__aicore__ inline void ReduceHalfBlock(const LocalTensor<float>& dst,
+                                      const LocalTensor<float>& src, int32_t count)
+{
+#if (CANN_VERSION_MAJOR >= 9)
+    ReduceRepeat<ReduceType::SUM>(dst, src, count, 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+#else
+    WholeReduceSum(dst, src, count, 1, 1, 1, 8);
+#endif
+}
+
+template <typename T>
+__aicore__ inline void CompareScalarCompat(const LocalTensor<uint8_t>& dst,
+                                         const LocalTensor<T>& src, T value,
+                                         CMPMODE mode, uint32_t count)
+{
+#if (CANN_VERSION_MAJOR >= 9)
+    Compares(dst, src, value, mode, count);
+#else
+    CompareScalar(dst, src, value, mode, count);
+#endif
+}
+
+constexpr int64_t FP4_BLOCK = 32;       // E8M0 scale span (logical elements)
+constexpr int64_t FP4_PER_BYTE = 2;     // two E2M1 nibbles per storage byte
+constexpr int64_t BYTES_ALIGN = 32;     // MTE 32-byte granularity
+constexpr int64_t OUT_ROW_COUNT = 3;    // gate/up/activated share one staging block
+constexpr int64_t CHUNK_FLAT_ELEMS = 4096;
+constexpr int64_t MIN_CHUNK_ROWS = 8;
+constexpr int64_t MAX_CHUNK_COLS = CHUNK_FLAT_ELEMS / MIN_CHUNK_ROWS;
+constexpr int64_t MAX_MERGE_ELEMS = 2 * CHUNK_FLAT_ELEMS / FP4_BLOCK;
+constexpr int64_t REDUCE_SLOT_ELEMS = BYTES_ALIGN / sizeof(float);
+constexpr int32_t REDUCE_SLOT_BYTE_SHIFT = 5;
+
+constexpr float SWIGLU_BETA = 1.0f;
+
+constexpr uint8_t STAGING_EVENT_ID = 3; // MTE2_V / V_MTE2 weight-staging ring
+constexpr uint8_t ROW_EVENT_ID = 3;     // V_MTE3 / MTE3_V bf16-row ring
+constexpr uint8_t OUT_EVENT_ID = 4;     // V_MTE3 one-shot before CopyOut
+constexpr uint8_t X_EVENT_ID = 4;       // MTE2_V one-shot after the x load
+
+__aicore__ inline int64_t AlignUpBytes(int64_t bytes)
+{
+    return (bytes + BYTES_ALIGN - 1) / BYTES_ALIGN * BYTES_ALIGN;
+}
+
+class Dsv4MoeExpertKernel {
+public:
+    __aicore__ Dsv4MoeExpertKernel(GM_ADDR x, GM_ADDR w1, GM_ADDR w2, GM_ADDR w3, GM_ADDR w1Scale,
+                                   GM_ADDR w2Scale, GM_ADDR w3Scale, GM_ADDR gateOut, GM_ADDR upOut,
+                                   GM_ADDR activatedOut, GM_ADDR downOut, GM_ADDR tilingPtr, TPipe *pipe)
+        : pipe_(pipe)
+    {
+        GET_TILING_DATA_WITH_STRUCT(Dsv4MoeExpertTilingData, tilingData, tilingPtr);
+        hidden_ = tilingData.hiddenSize;
+        inter_ = tilingData.interSize;
+        swigluLimit_ = tilingData.swigluLimit;
+
+        xGmU16_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t *>(x));
+        wqGm_[0].SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t *>(w1));
+        wqGm_[1].SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t *>(w2));
+        wqGm_[2].SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t *>(w3));
+        wqScaleGm_[0].SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t *>(w1Scale));
+        wqScaleGm_[1].SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t *>(w2Scale));
+        wqScaleGm_[2].SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t *>(w3Scale));
+        legOutGm_[0].SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t *>(gateOut));
+        legOutGm_[1].SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t *>(downOut));
+        legOutGm_[2].SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t *>(upOut));
+        activatedGmU16_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t *>(activatedOut));
+
+        InitBuffers();
+        xFloat_ = xFloatBuf_.Get<float>();
+        downAcc_ = xFloatBuf_.Get<float>();
+        gateAcc_ = gateBuf_.Get<float>();
+        upAcc_ = upBuf_.Get<float>();
+        activated_ = activatedBuf_.Get<float>();
+    }
+
+    __aicore__ void Process()
+    {
+        CopyInX();
+        ProjectLeg(LEG_W1, xFloat_, gateAcc_);    // unpack + gate GEMM
+        ProjectLeg(LEG_W3, xFloat_, upAcc_);      // unpack + up GEMM
+        ApplySwiGLU();
+        ProjectLeg(LEG_W2, activated_, downAcc_); // unpack + down GEMM
+        CopyOut();
+    }
+
+private:
+    static constexpr int32_t LEG_W1 = 0;
+    static constexpr int32_t LEG_W2 = 1;
+    static constexpr int32_t LEG_W3 = 2;
+
+    static constexpr int32_t E2M1_HALF_BITS = 0x3F000000; // +0.5
+    static constexpr int32_t E2M1_ZERO_BITS = 0x00000000;
+
+    __aicore__ void InitBuffers()
+    {
+        const int64_t maxCols = hidden_ > inter_ ? hidden_ : inter_;
+        const int64_t xFloatBytes = AlignUpBytes(maxCols * static_cast<int64_t>(sizeof(float)));
+
+        pipe_->InitBuffer(xBitsBuf_, AlignUpBytes(hidden_ * 2));
+        pipe_->InitBuffer(xFloatBuf_, xFloatBytes);
+        pipe_->InitBuffer(gateBuf_, AlignUpBytes(inter_ * static_cast<int64_t>(sizeof(float))));
+        pipe_->InitBuffer(upBuf_, AlignUpBytes(inter_ * static_cast<int64_t>(sizeof(float))));
+        pipe_->InitBuffer(activatedBuf_, AlignUpBytes(inter_ * static_cast<int64_t>(sizeof(float))));
+        pipe_->InitBuffer(interRowBuf_, AlignUpBytes(OUT_ROW_COUNT * inter_ * 2));
+
+        pipe_->InitBuffer(wStagingBuf_, AlignUpBytes(CHUNK_FLAT_ELEMS / FP4_PER_BYTE));
+        pipe_->InitBuffer(sStagingBuf_, AlignUpBytes(MAX_MERGE_ELEMS));
+        pipe_->InitBuffer(stageABuf_, AlignUpBytes(CHUNK_FLAT_ELEMS * 4));
+        pipe_->InitBuffer(stageBBuf_, AlignUpBytes(CHUNK_FLAT_ELEMS * 4));
+        pipe_->InitBuffer(stageCBuf_, AlignUpBytes(CHUNK_FLAT_ELEMS * 4));
+        pipe_->InitBuffer(prodBuf_, CHUNK_FLAT_ELEMS * 4);
+        pipe_->InitBuffer(xEvenBuf_, MAX_CHUNK_COLS / FP4_PER_BYTE * 4);
+        pipe_->InitBuffer(xOddBuf_, MAX_CHUNK_COLS / FP4_PER_BYTE * 4);
+        pipe_->InitBuffer(partHiBuf_, MAX_MERGE_ELEMS * REDUCE_SLOT_ELEMS * 4);
+        pipe_->InitBuffer(partRawBuf_, MAX_MERGE_ELEMS * REDUCE_SLOT_ELEMS * 4);
+        pipe_->InitBuffer(mergeBuf1_, MAX_MERGE_ELEMS * 4);
+        pipe_->InitBuffer(mergeBuf2_, MAX_MERGE_ELEMS * 4);
+        pipe_->InitBuffer(scalesF32Buf_, MAX_MERGE_ELEMS * 4);
+        pipe_->InitBuffer(decMaskBuf_, AlignUpBytes(CHUNK_FLAT_ELEMS / FP4_PER_BYTE * 2));
+        pipe_->InitBuffer(rowBf16Buf_, MAX_MERGE_ELEMS);
+    }
+
+    __aicore__ void WaitLoad()
+    {
+        SetFlag<HardEvent::MTE2_V>(STAGING_EVENT_ID);
+        WaitFlag<HardEvent::MTE2_V>(STAGING_EVENT_ID);
+    }
+
+    __aicore__ void CopyInX()
+    {
+        LocalTensor<uint16_t> xBits = xBitsBuf_.Get<uint16_t>();
+        DataCopy(xBits, xGmU16_, hidden_);
+        SetFlag<HardEvent::MTE2_V>(X_EVENT_ID);
+        WaitFlag<HardEvent::MTE2_V>(X_EVENT_ID);
+        Cast(xFloat_, xBits.ReinterpretCast<bfloat16_t>(), RoundMode::CAST_NONE, static_cast<uint32_t>(hidden_));
+    }
+
+    __aicore__ void ProjectLeg(int32_t legIndex, const LocalTensor<float> &xFull, LocalTensor<float> &legAcc)
+    {
+        const int64_t fullCols = (legIndex == LEG_W2) ? inter_ : hidden_;
+        const int64_t cols = fullCols < MAX_CHUNK_COLS ? fullCols : MAX_CHUNK_COLS;
+        const int64_t rows = (legIndex == LEG_W2) ? hidden_ : inter_;
+        const int64_t chunkRows = MIN_CHUNK_ROWS;
+        const int64_t pow2Blocks = BYTES_ALIGN;
+        const int64_t chunkScales = chunkRows * pow2Blocks;
+
+        LocalTensor<uint8_t> packed = wStagingBuf_.Get<uint8_t>();
+        LocalTensor<uint8_t> scales = sStagingBuf_.Get<uint8_t>();
+        LocalTensor<float> products = prodBuf_.Get<float>();
+        LocalTensor<int32_t> codes = prodBuf_.Get<int32_t>();
+        LocalTensor<int32_t> stageA = stageABuf_.Get<int32_t>();
+        LocalTensor<int32_t> stageB = stageBBuf_.Get<int32_t>();
+        LocalTensor<int32_t> stageC = stageCBuf_.Get<int32_t>();
+        LocalTensor<uint8_t> decMask = decMaskBuf_.Get<uint8_t>();
+        LocalTensor<float> partHi = partHiBuf_.Get<float>();
+        LocalTensor<float> xEven = xEvenBuf_.Get<float>();
+        LocalTensor<float> xOdd = xOddBuf_.Get<float>();
+
+        LocalTensor<float> partRaw = partRawBuf_.Get<float>();
+        LocalTensor<float> merge1 = mergeBuf1_.Get<float>();
+        LocalTensor<float> merge2 = mergeBuf2_.Get<float>();
+        LocalTensor<uint16_t> rowBf16 = rowBf16Buf_.Get<uint16_t>();
+
+        SetFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID);
+        SetFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);
+        for (int64_t row0 = 0; row0 < rows; row0 += chunkRows)
+        {
+            LocalTensor<float> accRow = legAcc[static_cast<uint32_t>(row0)];
+            Duplicate(accRow, 0.0f, static_cast<uint32_t>(chunkRows));
+            for (int64_t col0 = 0; col0 < fullCols; col0 += cols)
+            {
+                const int64_t activeCols = fullCols - col0 < cols ? fullCols - col0 : cols;
+                const int64_t activeHalfCols = activeCols / FP4_PER_BYTE;
+                const int64_t activeBlocks = activeCols / FP4_BLOCK;
+                const int64_t activeBytes = chunkRows * activeHalfCols;
+                SplitColumns(xEven, xOdd, xFull[static_cast<uint32_t>(col0)], static_cast<uint32_t>(activeCols));
+                WaitFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID);  // staging free for refill
+                // BUG (AKA2010): the drain sits ahead of the loads it must
+                // order. At the first column tile nothing is outstanding on
+                // MTE2, the flag fires the instant it is issued and the
+                // WaitFlag releases immediately; the decode below then reads
+                // the staging buffer while the DataCopys underneath it are
+                // still in flight.
+                WaitLoad();
+                for (int64_t r = 0; r < chunkRows; ++r)
+                {
+                    DataCopy(packed[static_cast<uint32_t>(r * activeHalfCols)],
+                             wqGm_[legIndex][((row0 + r) * fullCols + col0) / FP4_PER_BYTE], activeHalfCols);
+                    DataCopyPad(scales[static_cast<uint32_t>(r * pow2Blocks)],
+                                wqScaleGm_[legIndex][((row0 + r) * fullCols + col0) / FP4_BLOCK],
+                                DataCopyParams{1, static_cast<uint16_t>(activeBlocks), 0, 0},
+                                DataCopyPadParams{true, 0, static_cast<uint8_t>(pow2Blocks - activeBlocks), 0});
+                }
+
+                DecodeCodes(packed, codes, stageA, stageB, stageC, decMask, static_cast<uint32_t>(activeBytes));
+
+                for (int64_t r = 0; r < chunkRows; ++r)
+                {
+                    const uint32_t lowOff = static_cast<uint32_t>(r * activeHalfCols);
+                    const uint32_t highOff = static_cast<uint32_t>(activeBytes + r * activeHalfCols);
+                    Mul(products[lowOff], products[lowOff], xEven, static_cast<uint32_t>(activeHalfCols));
+                    Mul(products[highOff], products[highOff], xOdd, static_cast<uint32_t>(activeHalfCols));
+                }
+
+                VectorDependencyBarrier();
+                Duplicate(partRaw, 0.0f, static_cast<uint32_t>(MAX_MERGE_ELEMS * REDUCE_SLOT_ELEMS));
+                Duplicate(partHi, 0.0f, static_cast<uint32_t>(MAX_MERGE_ELEMS * REDUCE_SLOT_ELEMS));
+                VectorDependencyBarrier();
+                const int64_t halfBlock = FP4_BLOCK / FP4_PER_BYTE;
+                for (int64_t r = 0; r < chunkRows; ++r)
+                {
+                    const LocalTensor<float> lowRow = products[static_cast<uint32_t>(r * activeHalfCols)];
+                    const LocalTensor<float> highRow = products[static_cast<uint32_t>(activeBytes + r * activeHalfCols)];
+                    for (int64_t b = 0; b < activeBlocks; ++b)
+                    {
+                        const uint32_t slot = static_cast<uint32_t>((r * pow2Blocks + b) * REDUCE_SLOT_ELEMS);
+                        ReduceHalfBlock(partRaw[slot], lowRow[static_cast<uint32_t>(b * halfBlock)],
+                                        static_cast<int32_t>(halfBlock));
+                        ReduceHalfBlock(partHi[slot], highRow[static_cast<uint32_t>(b * halfBlock)],
+                                        static_cast<int32_t>(halfBlock));
+                    }
+                }
+                VectorDependencyBarrier();
+                LocalTensor<int32_t> offsets = scalesF32Buf_.Get<int32_t>();
+                CreateGatherIndices(offsets, static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                ShiftLeft(offsets, offsets, REDUCE_SLOT_BYTE_SHIFT, static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                VectorDependencyBarrier();
+                Gather(merge1, partRaw, offsets.ReinterpretCast<uint32_t>(), 0,
+                       static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                Gather(merge2, partHi, offsets.ReinterpretCast<uint32_t>(), 0,
+                       static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                VectorDependencyBarrier();
+                Add(partRaw, merge1, merge2, static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                VectorDependencyBarrier();
+
+                DecodeScales(scales, static_cast<uint32_t>(chunkScales));
+                SetFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID);
+                const LocalTensor<float> scaleF32 = scalesF32Buf_.Get<float>();
+                Mul(partRaw, partRaw, scaleF32, static_cast<uint32_t>(chunkScales));
+                VectorDependencyBarrier();
+
+                int64_t mergeLen = chunkRows * pow2Blocks;
+                LocalTensor<float> cur = partRaw;
+                // BUG (AKA1015): the tree descends one level too far. The
+                // loop runs while windows still exceed chunkRows, so the
+                // exit split sees mergeLen == chunkRows == 8 over the live
+                // [8, 2] layout: the de-interleave pairs flat elements 2i
+                // and 2i+1, which are now ROWS 2i and 2i+1 of the batch,
+                // and Add(merge1, merge1, merge2, 8) sums row pairs.
+                while (mergeLen > chunkRows)
+                {
+                    SplitColumns(merge1, merge2, cur, static_cast<uint32_t>(mergeLen));
+                    Add(cur, merge1, merge2, static_cast<uint32_t>(mergeLen / 2));
+                    VectorDependencyBarrier();
+                    mergeLen /= 2;
+                }
+                SplitColumns(merge1, merge2, cur, static_cast<uint32_t>(mergeLen));
+                Add(merge1, merge1, merge2, static_cast<uint32_t>(chunkRows));
+                VectorDependencyBarrier();
+                Add(accRow, accRow, merge1, static_cast<uint32_t>(chunkRows));
+                VectorDependencyBarrier();
+
+                // BUG (AKA2012): the row flush lives inside the col0 loop.
+                // The destination legOutGm_[legIndex][row0] advances with
+                // row0 only, so every column chunk rewrites the same GM row
+                // with its own partial sums - an early flush that destroys
+                // the accumulated inner reduction as it is produced.
+                WaitFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);
+                CastToBf16(rowBf16.ReinterpretCast<bfloat16_t>(), accRow, static_cast<uint32_t>(chunkRows));
+                SetFlag<HardEvent::V_MTE3>(ROW_EVENT_ID);
+                WaitFlag<HardEvent::V_MTE3>(ROW_EVENT_ID);
+                DataCopyPad(legOutGm_[legIndex][row0], rowBf16, DataCopyParams{1, static_cast<uint16_t>(chunkRows * 2), 0, 0});
+                SetFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);
+            }
+        }
+        WaitFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID);
+        WaitFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);
+    }
+
+    __aicore__ void BitAnd(const LocalTensor<int32_t>& dst, const LocalTensor<int32_t>& lhs,
+                          const LocalTensor<int32_t>& rhs, uint32_t count)
+    {
+#if __CCE_AICORE__ == 220
+        And(dst.ReinterpretCast<uint16_t>(), lhs.ReinterpretCast<uint16_t>(),
+            rhs.ReinterpretCast<uint16_t>(), count * 2);
+#else
+        And(dst, lhs, rhs, count);
+#endif
+    }
+
+    __aicore__ void BitOr(const LocalTensor<int32_t>& dst, const LocalTensor<int32_t>& lhs,
+                         const LocalTensor<int32_t>& rhs, uint32_t count)
+    {
+#if __CCE_AICORE__ == 220
+        Or(dst.ReinterpretCast<uint16_t>(), lhs.ReinterpretCast<uint16_t>(),
+           rhs.ReinterpretCast<uint16_t>(), count * 2);
+#else
+        Or(dst, lhs, rhs, count);
+#endif
+    }
+
+    __aicore__ void SplitColumns(const LocalTensor<float>& even, const LocalTensor<float>& odd,
+                                const LocalTensor<float>& src, uint32_t count)
+    {
+#if __CCE_AICORE__ == 220
+        LocalTensor<int32_t> offsets = stageABuf_.Get<int32_t>();
+        const uint32_t halfCount = count / FP4_PER_BYTE;
+        CreateGatherIndices(offsets, halfCount);
+        ShiftLeft(offsets, offsets, 3, halfCount);
+        PipeBarrier<PIPE_V>();
+        Gather(even, src, offsets.ReinterpretCast<uint32_t>(), 0, halfCount);
+        PipeBarrier<PIPE_V>();
+        Adds(offsets, offsets, static_cast<int32_t>(sizeof(float)), halfCount);
+        PipeBarrier<PIPE_V>();
+        Gather(odd, src, offsets.ReinterpretCast<uint32_t>(), 0, halfCount);
+        PipeBarrier<PIPE_V>();
+#else
+        DeInterleave(even, odd, src, static_cast<int32_t>(count));
+#endif
+    }
+
+    __aicore__ void DecodeCodes(const LocalTensor<uint8_t> &packed, const LocalTensor<int32_t> &codes,
+                                const LocalTensor<int32_t> &stageA, const LocalTensor<int32_t> &stageB,
+                                const LocalTensor<int32_t> &stageC, const LocalTensor<uint8_t> &decMask,
+                                uint32_t byteCount)
+    {
+        const uint32_t count = byteCount * FP4_PER_BYTE;
+
+#if __CCE_AICORE__ == 220
+        LocalTensor<uint16_t> wide = stageB.template ReinterpretCast<uint16_t>();
+        Cast(wide, packed, RoundMode::CAST_NONE, byteCount);
+        VectorDependencyBarrier();
+        Cast(stageA.template ReinterpretCast<float>(), wide, RoundMode::CAST_NONE, byteCount);
+        VectorDependencyBarrier();
+        Cast(stageA, stageA.template ReinterpretCast<float>(), RoundMode::CAST_RINT, byteCount);
+        VectorDependencyBarrier();
+#else
+        LocalTensor<uint16_t> wide = stageB.template ReinterpretCast<uint16_t>();
+        Cast(wide, packed, RoundMode::CAST_NONE, byteCount);
+        VectorDependencyBarrier();
+        Cast(stageA.template ReinterpretCast<uint32_t>(), wide, RoundMode::CAST_NONE, byteCount);
+        VectorDependencyBarrier();
+#endif
+
+        Duplicate(stageB, 0x0F, byteCount);
+        VectorDependencyBarrier();
+        BitAnd(codes, stageA, stageB, byteCount);
+        VectorDependencyBarrier();
+        ShiftRight(codes[byteCount], stageA, 4, byteCount);
+        VectorDependencyBarrier();
+
+        Duplicate(stageC, 7, count);
+        VectorDependencyBarrier();
+        BitAnd(stageB, codes, stageC, count);
+        VectorDependencyBarrier();
+
+        ShiftRight(stageA, stageB, 1, count);
+        VectorDependencyBarrier();
+        Adds(stageA, stageA, 126, count);
+        VectorDependencyBarrier();
+        ShiftLeft(stageA, stageA, 23, count);
+        VectorDependencyBarrier();
+        Duplicate(stageC, 1, count);
+        VectorDependencyBarrier();
+        BitAnd(stageC, stageB, stageC, count);
+        VectorDependencyBarrier();
+        ShiftLeft(stageC, stageC, 22, count);
+        VectorDependencyBarrier();
+        BitOr(stageA, stageA, stageC, count);
+        VectorDependencyBarrier();
+
+        Duplicate(stageC, E2M1_HALF_BITS, count);
+        VectorDependencyBarrier();
+        CompareScalarCompat(decMask, stageB, int32_t{1}, CMPMODE::EQ, count);
+        VectorDependencyBarrier();
+#if __CCE_AICORE__ == 220
+        Select(stageA.template ReinterpretCast<uint16_t>(), decMask,
+               stageC.template ReinterpretCast<uint16_t>(), stageA.template ReinterpretCast<uint16_t>(),
+               SELMODE::VSEL_TENSOR_TENSOR_MODE, count * 2);
+        VectorDependencyBarrier();
+#else
+        Select(stageA, decMask, stageC, stageA, SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+        VectorDependencyBarrier();
+#endif
+
+        Duplicate(stageC, E2M1_ZERO_BITS, count);
+        VectorDependencyBarrier();
+        CompareScalarCompat(decMask, stageB, int32_t{0}, CMPMODE::EQ, count);
+        VectorDependencyBarrier();
+#if __CCE_AICORE__ == 220
+        Select(stageA.template ReinterpretCast<uint16_t>(), decMask,
+               stageC.template ReinterpretCast<uint16_t>(), stageA.template ReinterpretCast<uint16_t>(),
+               SELMODE::VSEL_TENSOR_TENSOR_MODE, count * 2);
+        VectorDependencyBarrier();
+#else
+        Select(stageA, decMask, stageC, stageA, SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+        VectorDependencyBarrier();
+#endif
+
+        Duplicate(stageC, 8, count);
+        VectorDependencyBarrier();
+        BitAnd(stageC, codes, stageC, count);
+        VectorDependencyBarrier();
+        ShiftLeft(stageC, stageC, 28, count);
+        VectorDependencyBarrier();
+        BitOr(codes, stageA, stageC, count);
+        VectorDependencyBarrier();
+    }
+
+    __aicore__ void DecodeScales(const LocalTensor<uint8_t> &scales, uint32_t count)
+    {
+        LocalTensor<int32_t> bits = scalesF32Buf_.Get<int32_t>();
+        LocalTensor<int32_t> wrap = mergeBuf2_.Get<int32_t>();
+        LocalTensor<int32_t> scratch = mergeBuf1_.Get<int32_t>();
+        LocalTensor<uint8_t> special = decMaskBuf_.Get<uint8_t>();
+
+#if __CCE_AICORE__ == 220
+        LocalTensor<uint16_t> wide = mergeBuf2_.Get<uint16_t>();
+        Cast(wide, scales, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
+        Cast(mergeBuf1_.Get<float>(), wide, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
+        Cast(bits, mergeBuf1_.Get<float>(), RoundMode::CAST_RINT, count);
+        VectorDependencyBarrier();
+#else
+        LocalTensor<uint32_t> bitsU32 = scalesF32Buf_.Get<uint32_t>();
+        LocalTensor<uint16_t> wide = mergeBuf2_.Get<uint16_t>();
+        Cast(wide, scales, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
+        Cast(bitsU32, wide, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
+#endif
+
+        Adds(wrap, bits, 1, count);
+        VectorDependencyBarrier();
+        Duplicate(scratch, 0xFF, count);
+        VectorDependencyBarrier();
+        BitAnd(wrap, wrap, scratch, count);
+        VectorDependencyBarrier();
+
+#if __CCE_AICORE__ == 220
+        Cast(scratch.ReinterpretCast<float>(), wrap, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
+        CompareScalarCompat(special, scratch.ReinterpretCast<float>(), 2.0f, CMPMODE::LT, count);
+        VectorDependencyBarrier();
+#else
+        CompareScalarCompat(special, wrap, int32_t{2}, CMPMODE::LT, count);
+        VectorDependencyBarrier();
+#endif
+
+        ShiftLeft(bits, bits, 23, count);
+        VectorDependencyBarrier();
+
+        Duplicate(scratch, static_cast<int32_t>(SUBNORMAL_BITS), count);
+        VectorDependencyBarrier();
+
+#if __CCE_AICORE__ == 220
+        Duplicate(wrap, static_cast<int32_t>(ZERO_BITS), count);
+        VectorDependencyBarrier();
+        Select(scratch.ReinterpretCast<uint16_t>(), special,
+               scratch.ReinterpretCast<uint16_t>(), wrap.ReinterpretCast<uint16_t>(),
+               SELMODE::VSEL_TENSOR_TENSOR_MODE, count * 2);
+        VectorDependencyBarrier();
+#else
+        Select(scratch, special, scratch, static_cast<int32_t>(ZERO_BITS), SELMODE::VSEL_TENSOR_SCALAR_MODE,
+               count);
+        VectorDependencyBarrier();
+#endif
+        Add(bits, bits, scratch, count);
+        VectorDependencyBarrier();
+    }
+
+    __aicore__ void ApplySwiGLU()
+    {
+        const uint32_t count = static_cast<uint32_t>(inter_);
+        LocalTensor<float> clampedGate = xFloatBuf_.Get<float>(count);
+        Mins(clampedGate, gateAcc_, swigluLimit_, count);
+        VectorDependencyBarrier();
+        Maxs(clampedGate, clampedGate, -swigluLimit_, count);
+        VectorDependencyBarrier();
+        SwiGLU<float, false>(activated_, upAcc_, clampedGate, SWIGLU_BETA, count);
+        VectorDependencyBarrier();
+        LocalTensor<bfloat16_t> rounded = interRowBuf_.Get<bfloat16_t>(count);
+        CastToBf16(rounded, activated_, count);
+        VectorDependencyBarrier();
+        Cast(activated_, rounded, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
+    }
+
+    __aicore__ void CopyOut()
+    {
+        LocalTensor<uint16_t> interRows = interRowBuf_.Get<uint16_t>();
+        LocalTensor<uint16_t> gateRow = interRows;
+        LocalTensor<uint16_t> upRow = interRows[static_cast<uint32_t>(inter_)];
+        LocalTensor<uint16_t> activatedRow = interRows[static_cast<uint32_t>(2 * inter_)];
+        CastToBf16(gateRow.ReinterpretCast<bfloat16_t>(), gateAcc_, static_cast<uint32_t>(inter_));
+        CastToBf16(upRow.ReinterpretCast<bfloat16_t>(), upAcc_, static_cast<uint32_t>(inter_));
+        CastToBf16(activatedRow.ReinterpretCast<bfloat16_t>(), activated_, static_cast<uint32_t>(inter_));
+        SetFlag<HardEvent::V_MTE3>(OUT_EVENT_ID);
+        WaitFlag<HardEvent::V_MTE3>(OUT_EVENT_ID);
+        DataCopy(legOutGm_[LEG_W1], gateRow, inter_);
+        DataCopy(legOutGm_[LEG_W3], upRow, inter_);
+        DataCopy(activatedGmU16_, activatedRow, inter_);
+        SetFlag<HardEvent::MTE3_V>(OUT_EVENT_ID);
+        WaitFlag<HardEvent::MTE3_V>(OUT_EVENT_ID);
+    }
+
+    static constexpr int32_t SUBNORMAL_BITS = 0x00400000;
+    static constexpr int32_t ZERO_BITS = 0;
+
+    TPipe *pipe_ = nullptr;
+    int64_t hidden_ = 0;
+    int64_t inter_ = 0;
+    float swigluLimit_ = 0.0f;
+
+    GlobalTensor<uint16_t> xGmU16_;
+    GlobalTensor<uint8_t> wqGm_[3];
+    GlobalTensor<uint8_t> wqScaleGm_[3];
+    GlobalTensor<uint16_t> legOutGm_[3];
+    GlobalTensor<uint16_t> activatedGmU16_;
+
+    LocalTensor<float> xFloat_;
+    LocalTensor<float> downAcc_;
+    LocalTensor<float> gateAcc_;
+    LocalTensor<float> upAcc_;
+    LocalTensor<float> activated_;
+
+    TBuf<TPosition::VECCALC> xBitsBuf_;
+    TBuf<TPosition::VECCALC> xFloatBuf_;
+    TBuf<TPosition::VECCALC> gateBuf_;
+    TBuf<TPosition::VECCALC> upBuf_;
+    TBuf<TPosition::VECCALC> activatedBuf_;
+    TBuf<TPosition::VECCALC> interRowBuf_;
+    TBuf<TPosition::VECCALC> wStagingBuf_;
+    TBuf<TPosition::VECCALC> sStagingBuf_;
+    TBuf<TPosition::VECCALC> stageABuf_;
+    TBuf<TPosition::VECCALC> stageBBuf_;
+    TBuf<TPosition::VECCALC> stageCBuf_;
+    TBuf<TPosition::VECCALC> xEvenBuf_;
+    TBuf<TPosition::VECCALC> xOddBuf_;
+    TBuf<TPosition::VECCALC> partHiBuf_;
+    TBuf<TPosition::VECCALC> prodBuf_;
+    TBuf<TPosition::VECCALC> partRawBuf_;
+    TBuf<TPosition::VECCALC> mergeBuf1_;
+    TBuf<TPosition::VECCALC> mergeBuf2_;
+    TBuf<TPosition::VECCALC> scalesF32Buf_;
+    TBuf<TPosition::VECCALC> decMaskBuf_;
+    TBuf<TPosition::VECCALC> rowBf16Buf_;
+};
+} // namespace Dsv4MoeExpertOp
+
+extern "C" __global__ __aicore__ void dsv4_moe_expert(GM_ADDR x, GM_ADDR w1, GM_ADDR w2, GM_ADDR w3,
+                                                      GM_ADDR w1Scale, GM_ADDR w2Scale, GM_ADDR w3Scale,
+                                                      GM_ADDR gateOut, GM_ADDR upOut, GM_ADDR activatedOut,
+                                                      GM_ADDR downOut, GM_ADDR workspace, GM_ADDR tiling)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if (g_coreType == AIC) {
+        return;
+    }
+    REGISTER_TILING_DEFAULT(Dsv4MoeExpertTilingData);
+    TPipe pipe;
+    Dsv4MoeExpertOp::Dsv4MoeExpertKernel op(x, w1, w2, w3, w1Scale, w2Scale, w3Scale, gateOut, upOut, activatedOut,
+                                            downOut, tiling, &pipe);
+    op.Process();
+    pipe.Destroy();
+}
