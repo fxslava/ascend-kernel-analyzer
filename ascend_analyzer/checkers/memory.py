@@ -40,8 +40,10 @@ __all__ = ["MemoryChecker", "DomainUsage"]
 #: isomorphic SIMD/SIMT vector-execution path (DataCache-guarded UB budget).
 _SIMT_MARKERS = (
     "__simt_vf__",
+    "__simd_vf__",
     "__simt_callee__",
     "asc_call_vf",
+    "asc_vf_call",
 )
 
 

@@ -208,6 +208,44 @@ def _gnu_attribute_spans(
         cursor = end
 
 
+#: CUDA/CANN launch-bound attributes on arch35 VF helpers.  The numeric
+#: argument is the warp budget (``__launch_bounds__(1024)``); CANN headers
+#: also spell the upper-case macro form.  Carries nothing for the layout.
+_LAUNCH_BOUND_TOKENS: Tuple[bytes, ...] = (b"__launch_bounds__", b"LAUNCH_BOUND")
+
+
+def _launch_bound_spans(
+    raw: bytes, skip: Sequence[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """Spans of ``__launch_bounds__(N)`` / ``LAUNCH_BOUND(N)``, parens balanced.
+
+    Blanked whole - token *and* argument - because the parentheses are part
+    of the attribute: a comment in their place would leave ``(1024)`` sitting
+    between the specifiers and the return type, derailing the declaration.
+    """
+    spans: List[Tuple[int, int]] = []
+    for needle in _LAUNCH_BOUND_TOKENS:
+        cursor = 0
+        while True:
+            at = raw.find(needle, cursor)
+            if at < 0:
+                break
+            cursor = at + len(needle)
+            if _in_spans(skip, at):
+                continue
+            probe = cursor
+            while probe < len(raw) and raw[probe] in _BLANK_BYTES:
+                probe += 1
+            if probe >= len(raw) or raw[probe] != 0x28:
+                continue
+            end = _balanced_paren_end(raw, probe)
+            if end < 0:
+                continue
+            spans.append((at, end))
+            cursor = end
+    return sorted(spans)
+
+
 def _cce_bracket_spans(
     raw: bytes,
     skip: Sequence[Tuple[int, int]],
@@ -798,6 +836,7 @@ def prepare_source(
     decoration_spans = (
         _cplusplus_guard_spans(rewritten_bytes)
         + _gnu_attribute_spans(rewritten_bytes, decoration_skip)
+        + _launch_bound_spans(rewritten_bytes, decoration_skip)
         + _cce_bracket_spans(rewritten_bytes, decoration_skip)
         + _decoration_macro_spans(rewritten_bytes, decoration_skip, attribute_macros)
     )

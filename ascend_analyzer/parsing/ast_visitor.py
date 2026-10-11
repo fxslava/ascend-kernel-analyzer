@@ -409,6 +409,14 @@ _BUFFER_GET_BYTE_METHODS = frozenset({"GetBufferByByte", "GetBufferAddr"})
 _SET_FLAG_NAMES = frozenset({"SetFlag", "set_flag", "SetFlagImpl"})
 _WAIT_FLAG_NAMES = frozenset({"WaitFlag", "wait_flag", "WaitFlagImpl"})
 _BARRIER_NAMES = frozenset({"PipeBarrier", "pipe_barrier"})
+#: arch35 SIMT VF dispatcher templates: ``asc_vf_call<Func>(dim3{...}, ...)``.
+#: The call is a hardware mode-switch boundary on the shared Vector ALU.
+_VF_DISPATCH_NAMES = frozenset({"asc_vf_call"})
+#: C++ cast operators whose single operand may name a tensor; unwrapping them
+#: is what lets ``reinterpret_cast<__ubuf__ T*>(t.GetPhyAddr())`` resolve.
+_CAST_CALLEE_NAMES = frozenset(
+    {"reinterpret_cast", "static_cast", "const_cast", "dynamic_cast"}
+)
 
 _EVENT_ID_RE = re.compile(r"^EVENT_ID(?P<n>\d+)$")
 
@@ -1493,11 +1501,11 @@ class _KernelWalker:
                     self.ir.buffer_sizes[buf.name] = folded
         self._truncated = False
         body = func.child_by_field_name("body")
-        header = self.v.prepared.rewritten_bytes[
-            max(0, func.start_byte - 32) : (
-                body.start_byte if body is not None else func.end_byte
-            )
-        ]
+        header = _simt_header_bytes(
+            self.v,
+            func.start_byte,
+            body.start_byte if body is not None else func.end_byte,
+        )
         self._simt_mode = b"/*SIMT_VF*/" in header
 
     # -- public -------------------------------------------------------------
@@ -2606,6 +2614,50 @@ class _KernelWalker:
             return None
         return _field_receiver_name(self.v, func)
 
+    def _getphyaddr_source(self, value_node: Node) -> Optional["TensorDecl"]:
+        """The tensor a pure ``t.GetPhyAddr()`` initializer names, casts aside.
+
+        Only an unadorned (possibly cast-wrapped) ``GetPhyAddr()`` call counts:
+        ``t.GetPhyAddr() + 16`` is a different address and must not silently
+        alias ``t``'s base.
+        """
+        node: Optional[Node] = value_node
+        for _ in range(8):
+            if node is None:
+                return None
+            if node.type == "call_expression":
+                func = node.child_by_field_name("function")
+                if func is None:
+                    return None
+                callee = _callee_base_name(self.v, func)
+                if callee in _CAST_CALLEE_NAMES:
+                    arguments = node.child_by_field_name("arguments")
+                    node = (
+                        next(
+                            (
+                                c
+                                for c in arguments.named_children
+                                if c.type != "comment"
+                            ),
+                            None,
+                        )
+                        if arguments is not None
+                        else None
+                    )
+                    continue
+                if callee == "GetPhyAddr":
+                    receiver = _field_receiver_name(self.v, func)
+                    if receiver and receiver in self.ir.tensors:
+                        return self.ir.tensors[receiver]
+                return None
+            if node.type == "parenthesized_expression":
+                node = next(
+                    (c for c in node.named_children if c.type != "comment"), None
+                )
+                continue
+            return None
+        return None
+
     def _declare_raw_pointers(
         self, node: Node, domain: PhysicalDomain, type_text: str
     ) -> None:
@@ -2624,6 +2676,16 @@ class _KernelWalker:
             offset = (
                 self.v._eval.evaluate(value_node, self._env) if value_node else None
             )
+            # ``__ubuf__ T* p = reinterpret_cast<__ubuf__ T*>(t.GetPhyAddr())``:
+            # the pointer is the same storage as ``t``, viewed differently.
+            # Adopting the source's base keeps the alias verifiable (no
+            # AKA3002/AKA1009) and marks it as intentional overlap, so no
+            # synthetic @ascend-reuse-group annotation is needed.
+            source = self._getphyaddr_source(value_node) if value_node else None
+            if source is not None:
+                # Same storage as the source: the base offset and the extent
+                # both belong to the allocation the pointer views.
+                offset = source.byte_offset
             self.ir.tensors[name] = TensorDecl(
                 name=name,
                 loc=self._loc(node),
@@ -2632,8 +2694,14 @@ class _KernelWalker:
                 dtype=dtype,
                 elem_size=elem,
                 byte_offset=offset,
+                byte_size=source.byte_size if source is not None else None,
                 scope_id=self._scope_id,
-                origin="address-space pointer",
+                origin=(
+                    f"alias of {source.name} (GetPhyAddr)"
+                    if source is not None
+                    else "address-space pointer"
+                ),
+                view_source=source.name if source is not None else None,
                 unbound=offset is None,
             )
 
@@ -2703,6 +2771,13 @@ class _KernelWalker:
             self._handle_barrier(node, func)
             return
 
+        # ``asc_vf_call<Func>(dim3{...}, ...)``: the arch35 SIMT dispatcher.
+        # Recorded as a PIPE_V dispatch boundary, then ``Func`` is walked with
+        # the payload arguments bound to its parameters.
+        if base in _VF_DISPATCH_NAMES:
+            self._handle_vf_dispatch(node, func)
+            return
+
         # TPipe::InitBuffer records the byte size backing a TBuf, which the
         # layout synthesiser turns into concrete offsets and extents.
         if base == "InitBuffer":
@@ -2730,13 +2805,79 @@ class _KernelWalker:
 
         self._inline_callee(node, base)
 
-    def _inline_callee(self, node: Node, base: str) -> bool:
+    def _handle_vf_dispatch(self, node: Node, func: Node) -> None:
+        """Model ``asc_vf_call<Func>(dim3{...}, args...)`` (arch35 SIMT VF).
+
+        The dispatch switches the physically shared Vector ALU between SIMD
+        and SIMT warp mode, which is why kernels bracket it with
+        ``PipeBarrier<PIPE_V>()`` on both sides.  Those barriers drain real
+        work: recording the call as a PIPE_V operation keeps the checker from
+        folding the pair into one "consecutive" barrier and advising its
+        removal (AKA3005).  The payload arguments after the grid become the
+        callee's parameters, and the callee body is walked in place so SIMT
+        global accesses inside the VF function are attributed to this trace.
+        """
+        arg_nodes = _argument_nodes(node)
+        reads: List[str] = []
+        writes: List[str] = []
+        refs: List[ArgRef] = []
+        for position, arg in enumerate(arg_nodes):
+            text = self._text(arg)
+            tensor_name = (
+                None if position == 0 else self._resolve_tensor_arg(arg, text)
+            )
+            refs.append(
+                ArgRef(
+                    index=position,
+                    text=" ".join(text.split())[:60],
+                    tensor=tensor_name,
+                    value=to_int(self.v._eval.evaluate(arg, self._env)),
+                )
+            )
+            if tensor_name is None:
+                continue
+            decl = self.ir.tensors.get(tensor_name)
+            # The callee's __ubuf__ arguments are its reads and writes; a
+            # __gm__ pointer is a read unless the callee body says otherwise
+            # (it is walked below and records its own accesses).
+            if decl is not None and decl.domain is PhysicalDomain.UB:
+                if tensor_name not in writes:
+                    writes.append(tensor_name)
+            if tensor_name not in reads:
+                reads.append(tensor_name)
+        self._emit(
+            ApiCallOp(
+                pipe=Pipe.V,
+                name="asc_vf_call",
+                args=tuple(refs),
+                writes=tuple(writes),
+                reads=tuple(reads),
+                text=" ".join(self._text(node).split())[:200],
+                **self._next_op_args(node),
+            )
+        )
+        for name in reads:
+            if name in self.ir.tensors:
+                self._record_use(self.ir.tensors[name], self._loc(node))
+
+        template_args = _template_arguments(self.v, func)
+        callee = template_args[0].rsplit("::", 1)[-1].strip() if template_args else ""
+        if callee:
+            self._inline_callee(node, callee, arg_nodes=arg_nodes[1:])
+
+    def _inline_callee(
+        self, node: Node, base: str, arg_nodes: Optional[List[Node]] = None
+    ) -> bool:
         """Walk an intra-TU callee's body into this trace, in call position.
 
         This is what makes a flag raised in a setup helper and consumed in the
         processing method one paired handshake instead of two orphans.  The
         callee's parameters are bound to its arguments where they fold, so an
         event id passed in still resolves.
+
+        ``arg_nodes`` overrides the call's argument list, which is how a
+        template dispatcher's payload (``asc_vf_call<F>(dim3, a, b)`` binds
+        ``a``/``b`` to ``F``'s parameters, the grid aside) reaches the callee.
 
         Not inlined: anything outside this unit, an overloaded or re-declared
         name, a call already on the inlining stack (recursion), and anything
@@ -2763,9 +2904,10 @@ class _KernelWalker:
         if self._truncated:
             return False
 
+        call_args = _argument_nodes(node) if arg_nodes is None else arg_nodes
         env = self._env.child()
         tensor_params: Dict[str, str] = {}
-        for param, arg in zip(params, _argument_nodes(node)):
+        for param, arg in zip(params, call_args):
             folded = self.v._eval.fold(arg, self._env)
             if folded is not None:
                 env.define(param, folded)
@@ -2777,9 +2919,9 @@ class _KernelWalker:
         self._tensor_param_stack.append(tensor_params)
         self._env_stack.append(env)
         previous_simt_mode = self._simt_mode
-        header = self.v.prepared.rewritten_bytes[
-            max(0, definition.start_byte - 32) : body.start_byte
-        ]
+        header = _simt_header_bytes(
+            self.v, definition.start_byte, body.start_byte
+        )
         self._simt_mode = b"/*SIMT_VF*/" in header
         try:
             self._register_parameters(definition)
@@ -3062,6 +3204,23 @@ class _KernelWalker:
             return member
         if node.type == "call_expression":
             func = node.child_by_field_name("function")
+            # ``reinterpret_cast<__ubuf__ T*>(t.GetPhyAddr())`` and friends:
+            # the operand of the cast names the tensor underneath.
+            if (
+                func is not None
+                and _callee_base_name(self.v, func) in _CAST_CALLEE_NAMES
+            ):
+                arguments = node.child_by_field_name("arguments")
+                inner = (
+                    next(
+                        (c for c in arguments.named_children if c.type != "comment"),
+                        None,
+                    )
+                    if arguments is not None
+                    else None
+                )
+                if inner is not None:
+                    return self._resolve_tensor_arg(inner, self._text(inner))
             if _callee_base_name(self.v, func) == "GetWithOffset":
                 dtype = _auto_tensor_dtype(self.v, node)
                 if dtype is not None:
@@ -3169,6 +3328,17 @@ class _KernelWalker:
         """Derive byte sizes, synthesise TPipe allocations, close scopes."""
         self._synthesize_tpipe_layout()
         self._propagate_view_offsets()
+        self._derive_tensor_extents()
+        # Sizes only settle after the derivation above (a source's extent may
+        # live in its elem_count), so alias/view sizes propagate last and the
+        # derivation runs once more for the views that just gained a size.
+        self._propagate_view_sizes()
+        self._derive_tensor_extents()
+        for scope in self.ir.scopes.values():
+            scope.end_index = max(scope.end_index, scope.start_index)
+
+    def _derive_tensor_extents(self) -> None:
+        """Fill each tensor's missing extent from the other unit and dtype."""
         for decl in self.ir.tensors.values():
             if decl.byte_size is None and decl.elem_count is not None:
                 if decl.elem_size:
@@ -3181,8 +3351,16 @@ class _KernelWalker:
                 size = to_int(decl.byte_size)
                 if size is not None and decl.elem_size:
                     decl.elem_count = Const(size // decl.elem_size)
-        for scope in self.ir.scopes.values():
-            scope.end_index = max(scope.end_index, scope.start_index)
+
+    def _propagate_view_sizes(self) -> None:
+        """A view/alias covers the same allocation as its source, so the
+        source's extent resolves the view's size once synthesised."""
+        for decl in self.ir.tensors.values():
+            if decl.view_source is None or decl.byte_size is not None:
+                continue
+            source = self.ir.tensors.get(decl.view_source)
+            if source is not None and source.byte_size is not None:
+                decl.byte_size = source.byte_size
 
     def _allocation_order(self) -> List[str]:
         """Buffer names in the order ``TPipe`` carves UB for them.
@@ -3579,6 +3757,23 @@ def _declarator_identifier(declarator: Optional[Node]) -> Optional[Node]:
             return node
         break
     return None
+
+
+def _simt_header_bytes(visitor: "ASTVisitor", start_byte: int, end_byte: int) -> bytes:
+    """The specifiers preceding a definition, cut at the previous statement.
+
+    ``__simt_vf__`` rewrites to a ``/*SIMT_VF*/`` marker ahead of the return
+    type, and blanked decorations (``__launch_bounds__(N)``) sit between the
+    two, so the window extends back to the previous ``;``/``}`` rather than a
+    fixed byte count.
+    """
+    raw = visitor.prepared.rewritten_bytes
+    begin = max(0, start_byte - 256)
+    window = raw[begin:start_byte]
+    cut = max(window.rfind(b";"), window.rfind(b"}"))
+    if cut >= 0:
+        begin += cut + 1
+    return raw[begin:end_byte]
 
 
 def _leading_identifier(text: str) -> Optional[str]:

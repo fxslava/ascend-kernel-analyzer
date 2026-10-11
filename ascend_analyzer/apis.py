@@ -558,6 +558,79 @@ def _build_table() -> Dict[str, ApiSpec]:
             doc="Mask-driven gather within UB.",
         )
     )
+    # CANN 9.2 level-0 gather and index-vector construction.  Without these,
+    # a barrier pair around a table-decode lane interleave collapses into
+    # "consecutive" and gets advised away (AKA3005) - deleting a real edge.
+    put(
+        ApiSpec(
+            name="Gather",
+            params=(
+                _p(ArgRole.DST, _UB, "dstLocal"),
+                _p(ArgRole.SRC, _UB, "srcLocal"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "srcOffset"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "srcBaseOffset"),
+                _p(ArgRole.COUNT, ANY_TENSOR, "count"),
+            ),
+            pipe=Pipe.V,
+            category="vector",
+            doc="Level-0 lane gather within UB.",
+            engine="SIMD_VECTOR",
+            latency_cycles=4,
+        )
+    )
+    put(
+        ApiSpec(
+            name="CreateVecIndex",
+            params=(_p(ArgRole.DST, _UB, "dstLocal"),),
+            pipe=Pipe.V,
+            category="vector",
+            doc="Materialise a linear index vector in UB.",
+            engine="SIMD_VECTOR",
+            latency_cycles=2,
+        )
+    )
+    # Deterministic top-k pair: Sort produces a full in-UB ordering and
+    # Extract slices lanes out of it.  Both are ordinary PIPE_V consumers, so
+    # a PipeBarrier(PIPE_V) between them resolves a real RAW dependency.
+    for name, doc, latency in (
+        ("Sort", "Full in-UB sort of a UB tensor (CANN 9.2 top-k stage).", 8),
+        ("Extract", "Extract lanes from a sorted UB tensor (CANN 9.2 top-k stage).", 2),
+    ):
+        put(
+            ApiSpec(
+                name=name,
+                params=(
+                    _p(ArgRole.DST, _UB, "dstLocal"),
+                    _p(ArgRole.SRC, _UB, "srcLocal"),
+                    _p(ArgRole.COUNT, ANY_TENSOR, "repeatTimes"),
+                    _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+                ),
+                pipe=Pipe.V,
+                category="vector",
+                doc=doc,
+                engine="SIMD_VECTOR",
+                latency_cycles=latency,
+            )
+        )
+    # The arch35 SIMT VF dispatcher.  ``asc_vf_call<Func>(dim3{...}, args...)``
+    # switches the physically shared Vector ALU into warp mode, runs ``Func``
+    # and switches back; the call is a dispatch boundary, and its payload
+    # arguments (after the grid) are the callee's parameters.  The visitor
+    # records the call itself and then walks the callee body.
+    put(
+        ApiSpec(
+            name="asc_vf_call",
+            params=(
+                _p(ArgRole.PARAMS, ANY_TENSOR, "grid"),
+                _p(ArgRole.SRC, _UB_OR_GM, "args"),
+            ),
+            pipe=Pipe.V,
+            category="simt_dispatch",
+            doc="SIMT VF dispatch on the shared Vector ALU (arch35).",
+            engine="SIMT_WARP",
+            latency_cycles=0,  # the mode switch itself; calibrated in PipeSim
+        )
+    )
 
     # -- data movement ------------------------------------------------------
     for name in ("DataCopy", "DataCopyPad"):
