@@ -60,11 +60,14 @@ _OTHER_EXTENSIONS: Tuple[str, ...] = (
     # spell it on every helper); same shape as ``__simd_vf__`` and just as
     # unknown to the grammar.
     "__simd_callee__",
+    "__simt_vf__",
     # Storage qualifier on a per-block static.
     "__BLOCK_LOCAL__",
 )
 
-_ALL_QUALIFIERS: Tuple[str, ...] = _ADDRESS_SPACES + KERNEL_ATTRIBUTES + _OTHER_EXTENSIONS
+_ALL_QUALIFIERS: Tuple[str, ...] = (
+    _ADDRESS_SPACES + KERNEL_ATTRIBUTES + _OTHER_EXTENSIONS
+)
 
 
 def _equal_length_comment(token: str) -> str:
@@ -86,7 +89,9 @@ def _equal_length_comment(token: str) -> str:
 
 
 #: token -> equal-length replacement, validated at import time.
-_REPLACEMENTS: Mapping[str, str] = {t: _equal_length_comment(t) for t in _ALL_QUALIFIERS}
+_REPLACEMENTS: Mapping[str, str] = {
+    t: _equal_length_comment(t) for t in _ALL_QUALIFIERS
+}
 
 #: The same table as bytes.  The rewrite runs over UTF-8 bytes rather than
 #: characters because tree-sitter reports every node position as a *byte*
@@ -131,9 +136,13 @@ _CCE_LOCATIONS: Tuple[str, ...] = (
 
 _CCE_BRACKET_RE_BYTES = re.compile(
     rb"\[[ \t]*"
-    + rb"(?:" + rb"|".join(t.encode("ascii") for t in _CCE_LOCATIONS) + rb")"
+    + rb"(?:"
+    + rb"|".join(t.encode("ascii") for t in _CCE_LOCATIONS)
+    + rb")"
     + rb"(?:[ \t]*,[ \t]*"
-    + rb"(?:" + rb"|".join(t.encode("ascii") for t in _CCE_LOCATIONS) + rb")"
+    + rb"(?:"
+    + rb"|".join(t.encode("ascii") for t in _CCE_LOCATIONS)
+    + rb")"
     + rb")*[ \t]*\]"
 )
 
@@ -145,18 +154,11 @@ _BLANK_BYTES = frozenset((0x20, 0x09))
 _SPACE_BYTES = frozenset((0x20, 0x09, 0x0A, 0x0D))
 
 _SUBSCRIPT_LEAD = frozenset(
-    b"_)]"
-    b"abcdefghijklmnopqrstuvwxyz"
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    b"0123456789"
+    b"_)]abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
 #: Bytes that may begin the return type following a location qualifier.
-_TYPE_START = frozenset(
-    b"_*&~:"
-    b"abcdefghijklmnopqrstuvwxyz"
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-)
+_TYPE_START = frozenset(b"_*&~:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 #: Declaration decoration that carries no meaning for this analyzer.  An
 #: object-like macro whose body is *only* these tokens is safe to blank at
@@ -180,7 +182,9 @@ def _balanced_paren_end(raw: bytes, open_at: int) -> int:
     return -1
 
 
-def _gnu_attribute_spans(raw: bytes, skip: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+def _gnu_attribute_spans(
+    raw: bytes, skip: Sequence[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
     """Spans of ``__attribute__((...))``, parentheses balanced."""
     spans: List[Tuple[int, int]] = []
     needle = b"__attribute__"
@@ -416,7 +420,9 @@ class PreparedSource:
 
     # -- qualifier lookup ---------------------------------------------------
 
-    def qualifiers_for_range(self, start_byte: int, end_byte: int) -> List[QualifierSpan]:
+    def qualifiers_for_range(
+        self, start_byte: int, end_byte: int
+    ) -> List[QualifierSpan]:
         """Qualifiers that apply to a node spanning ``[start_byte, end_byte)``.
 
         A qualifier applies when it sits *inside* the node's span (as in a cast
@@ -464,9 +470,7 @@ class PreparedSource:
             for span in self.qualifiers
         )
 
-    def has_launch_attribute_before(
-        self, start_byte: int, window: int = 160
-    ) -> bool:
+    def has_launch_attribute_before(self, start_byte: int, window: int = 160) -> bool:
         """``True`` when specifically ``__global__`` precedes ``start_byte``.
 
         ``__aicore__`` alone marks device code, which every helper and member
@@ -485,7 +489,9 @@ class PreparedSource:
     def annotations_of(self, kind: str) -> List[Annotation]:
         return [a for a in self.annotations if a.kind == kind]
 
-    def annotations_near(self, line: int, kinds: Sequence[str] = ()) -> List[Annotation]:
+    def annotations_near(
+        self, line: int, kinds: Sequence[str] = ()
+    ) -> List[Annotation]:
         """Annotations on ``line`` or the line directly above it."""
         wanted = set(kinds)
         return [
@@ -498,7 +504,9 @@ class PreparedSource:
         """Codes silenced by an ``@ascend-ignore`` annotation at ``line``."""
         out: List[str] = []
         for ann in self.annotations_near(line, ("ignore",)):
-            out.extend(tok.strip().upper() for tok in ann.body.replace(",", " ").split())
+            out.extend(
+                tok.strip().upper() for tok in ann.body.replace(",", " ").split()
+            )
         return [c for c in out if c]
 
 
@@ -785,16 +793,13 @@ def prepare_source(
     # spans recorded above - and every line and column tree-sitter reports -
     # still address the original file.
     decoration_skip = sorted(
-        _non_code_spans(rewritten_bytes)
-        + _directive_operand_spans(rewritten_bytes)
+        _non_code_spans(rewritten_bytes) + _directive_operand_spans(rewritten_bytes)
     )
     decoration_spans = (
         _cplusplus_guard_spans(rewritten_bytes)
         + _gnu_attribute_spans(rewritten_bytes, decoration_skip)
         + _cce_bracket_spans(rewritten_bytes, decoration_skip)
-        + _decoration_macro_spans(
-            rewritten_bytes, decoration_skip, attribute_macros
-        )
+        + _decoration_macro_spans(rewritten_bytes, decoration_skip, attribute_macros)
     )
     rewritten_bytes = _blank_spans(rewritten_bytes, decoration_spans)
     rewritten = rewritten_bytes.decode("utf-8")
@@ -854,7 +859,20 @@ def prepare_translation_unit(path: str, source: str) -> PreparedSource:
         if decoration_only_macro(body)
     )
 
-    prepared = prepare_source(path, result.text, attribute_macros)
+    # Keep a lexical marker for the AST visitor. A comment parses as trivia
+    # while preserving the fact that the following block is a vector scope.
+    marker_re = re.compile(
+        r"""/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:__VEC_SCOPE__|__simt_vf__)\b""",
+        re.DOTALL,
+    )
+    expanded = marker_re.sub(
+        lambda match: {
+            "__VEC_SCOPE__": "/*VEC_SCOPE*/",
+            "__simt_vf__": "/*SIMT_VF*/",
+        }.get(match.group(), match.group()),
+        result.text,
+    )
+    prepared = prepare_source(path, expanded, attribute_macros)
     prepared.original = source
     prepared.line_origins = result.line_origins
     prepared.macro_object_defs = tuple(result.object_macros.items())
@@ -869,7 +887,6 @@ def prepare_translation_unit(path: str, source: str) -> PreparedSource:
     # original lines their expanded positions map back to, so suppression
     # matching against reported locations keeps working.
     prepared.annotations = tuple(
-        replace(ann, line=result.origin_line(ann.line))
-        for ann in prepared.annotations
+        replace(ann, line=result.origin_line(ann.line)) for ann in prepared.annotations
     )
     return prepared

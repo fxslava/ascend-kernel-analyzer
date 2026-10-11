@@ -108,12 +108,17 @@ ERASED_DECORATION_MACROS: Tuple[str, ...] = (
     # identifier ahead of a ``{``, and the block it opens (every ``arch35``
     # ``vf/`` helper body) fails to attach.  In CANN it expands to nothing
     # observable here, so the block it introduces becomes a plain scope.
-    "__VEC_SCOPE__",
 )
 
 #: CCE function *location* qualifiers, erased before tokenizing.
 _CCE_LOCATIONS = (
-    "host", "aicore", "aicpu", "vector_core", "aicube", "mix", "mix_aic",
+    "host",
+    "aicore",
+    "aicpu",
+    "vector_core",
+    "aicube",
+    "mix",
+    "mix_aic",
     "mix_aiv",
 )
 _CCE_BRACKET_RE = re.compile(
@@ -121,14 +126,14 @@ _CCE_BRACKET_RE = re.compile(
     r"(?:[ \t]*,[ \t]*(?:" + "|".join(_CCE_LOCATIONS) + r"))*[ \t]*\]"
 )
 #: A bracket glued to the preceding token is a subscript, not a qualifier.
-_SUBSCRIPT_LEAD = set("_)]abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+_SUBSCRIPT_LEAD = set(
+    "_)]abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
 #: What may begin the return type that follows a location qualifier.
 _TYPE_START = set("_*&~:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 #: ``if ASCEND_IS_AIV {`` - CCE allows the condition without parentheses.
-_BARE_COND_RE = re.compile(
-    r"\b(if|while)[ \t]+(ASCEND_IS_AI[CV])[ \t]*\{"
-)
+_BARE_COND_RE = re.compile(r"\b(if|while)[ \t]+(ASCEND_IS_AI[CV])[ \t]*\{")
 
 #: A file-scope DSL block: a multi-line ALL-CAPS macro statement, which is how
 #: CANN writes a tiling-key table.  Its argument list is not valid C even as
@@ -166,11 +171,7 @@ def _rewrite_launches(line: str) -> str:
             break
         # ``<<<`` -> ``(  `` and ``>>>`` -> ``)  ``: same length either side.
         result = (
-            head
-            + "(  "
-            + result[match.end() : close]
-            + ")  "
-            + result[close + 3 :]
+            head + "(  " + result[match.end() : close] + ")  " + result[close + 3 :]
         )
     return result
 
@@ -390,7 +391,9 @@ def normalize_cce_syntax(source: str) -> str:
         keyword, condition = match.group(1), match.group(2)
         # Same length: two spaces traded for two parentheses.
         replacement = f"{keyword}({condition}){{"
-        return replacement if len(replacement) == len(match.group(0)) else match.group(0)
+        return (
+            replacement if len(replacement) == len(match.group(0)) else match.group(0)
+        )
 
     text = _BARE_COND_RE.sub(_parenthesise, text)
 
@@ -781,9 +784,7 @@ def preprocess_source(
         )
 
     total = source.count(chr(10)) + 1
-    text, origins = _consume_line_markers(
-        expanded, path, total, _include_sites(source)
-    )
+    text, origins = _consume_line_markers(expanded, path, total, _include_sites(source))
     objects, functions = _macro_bodies(engine)
 
     stats: Dict[str, int] = {

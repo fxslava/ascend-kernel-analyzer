@@ -89,6 +89,9 @@ class Code(str, enum.Enum):
     # shipped (and the shipped tests pin it there), so the bank conflict takes
     # the next free code in the 3xxx performance block.
     UB_BANK_CONFLICT = "AKA3006"
+    SIMT_DATACACHE_CONFLICT = "AKA3007"
+    REGISTER_SPILL = "AKA3008"
+    VECTOR_ALU_CONTENTION = "AKA3009"
 
     # -- 4xxx: performance model / overlap profiling ------------------------
     PERF_SYNC_STALL = "AKA4001"
@@ -130,6 +133,9 @@ CODE_TITLES: Dict[str, str] = {
     Code.UB_FRAGMENTATION.value: "Fragmented SRAM layout",
     Code.REDUNDANT_BARRIER.value: "Redundant consecutive barrier",
     Code.UB_BANK_CONFLICT.value: "UB bank conflict on Vector ALU",
+    Code.SIMT_DATACACHE_CONFLICT.value: "SIMT DataCache access conflict",
+    Code.REGISTER_SPILL.value: "Vector register spill pressure",
+    Code.VECTOR_ALU_CONTENTION.value: "SIMT and SIMD Vector ALU contention",
     Code.PERF_SYNC_STALL.value: "Exposed sync bubbles / pipeline stalls",
     Code.PERF_CUBE_UNDERUTIL.value: "Cube compute underutilization",
     Code.PARSE_ERROR.value: "Source could not be parsed cleanly",
@@ -208,7 +214,8 @@ class Diagnostic:
             "remediation": self.remediation,
             "location": self.loc.to_json(),
             "related": [
-                {"label": label, "location": loc.to_json()} for label, loc in self.related
+                {"label": label, "location": loc.to_json()}
+                for label, loc in self.related
             ],
             "details": self.details,
         }

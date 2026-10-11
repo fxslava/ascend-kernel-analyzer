@@ -576,8 +576,22 @@ ascend-analyze kernel.cpp --chip-profile my910b.json
 }
 ```
 
-The `ascend910b` profile is the one the regression suite pins; `ascend910c` and
-`ascend351x` are marked provisional.
+The `ascend910b` profile is the baseline regression target; `ascend910c` and
+`ascend351x` are marked provisional. `--chip ascend950pr` (aliases `arch35`,
+`3510`) targets the validated Ascend 950PR AIV: only `EVENT_ID0..3` are legal,
+and tensors may use at most 216 KiB of its 256 KiB UB after compiler and SIMT
+DataCache reserves. The 216 KiB ceiling applies even without a SIMT marker.
+The analyzer still reports an estimated pipeline schedule for arch35, but
+withholds timing advisories until its per-pipe latency model is calibrated.
+
+For arch35 vector functions, `__VEC_SCOPE__` blocks and `RegTensor`/`RegTile`
+values are tracked in the register file. The register audit reports peak live
+256-byte slots against the documented 32-slot VF limit (`AKA3008`) without
+charging those values to UB. CANN 9.2 reductions, broadcasts, register
+gather/scatter operations, masked arithmetic and SIMT warp collectives are
+assigned to `PIPE_V`. `AKA3007` reports statically provable SIMT DataCache
+line crossings and same-loop MTE2 contention; `AKA3009` reports SIMD/SIMT
+Vector ALU sharing. Timing descriptors for these intrinsics are estimates.
 
 ---
 
@@ -586,7 +600,7 @@ The `ascend910b` profile is the one the regression suite pins; `ascend910c` and
 ```bash
 python tests/harness.py            # the runnable harness, exits non-zero on mismatch
 python tests/harness.py --verbose  # plus the full report per fixture
-python -m pytest                   # 529 tests
+python -m pytest                   # full regression suite
 ```
 
 The harness runs every fixture and checks the findings against expectations

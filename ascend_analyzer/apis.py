@@ -57,6 +57,8 @@ ANY_TENSOR: Optional[FrozenSet[D]] = None  # sentinel: operand is not domain-che
 MX_CUBE_FEATURE = "mx_cube"
 
 _UB = frozenset({D.UB})
+_REG = frozenset({D.REG})
+_UB_OR_REG = frozenset({D.UB, D.REG})
 _L1 = frozenset({D.L1})
 _GM = frozenset({D.GM})
 _L0A = frozenset({D.L0A})
@@ -124,6 +126,10 @@ class ApiSpec:
     #: chip profile lacks cannot run there at all, so it is reported rather
     #: than modelled as if it were valid (AKA1011).
     requires_feature: Optional[str] = None
+    #: Issuing engine within PIPE_V (or the fixed non-vector pipeline).
+    engine: str = ""
+    #: Issue latency descriptor in cycles; analytical defaults, not measured.
+    latency_cycles: int = 0
 
     def param_at(self, index: int) -> Optional[ParamSpec]:
         return self.params[index] if 0 <= index < len(self.params) else None
@@ -187,23 +193,60 @@ def data_copy_pipe(dst: D, src: D) -> Optional[Pipe]:
 
 #: Element-wise vector intrinsics taking ``(dst, src0, src1, count)``.
 _VEC_BINARY = (
-    "Add", "Sub", "Mul", "Div", "Max", "Min", "And", "Or",
-    "AddRelu", "SubRelu", "FusedMulAdd", "MulAddDst", "Axpy",
+    "Add",
+    "Sub",
+    "Mul",
+    "Div",
+    "Max",
+    "Min",
+    "And",
+    "Or",
+    "AddRelu",
+    "SubRelu",
+    "FusedMulAdd",
+    "MulAddDst",
+    "Axpy",
 )
 #: Element-wise vector intrinsics taking ``(dst, src, count)``.
 _VEC_UNARY = (
-    "Abs", "Exp", "Ln", "Sqrt", "Rsqrt", "Reciprocal", "Relu", "Not",
-    "Cast", "Sign", "Floor", "Ceil", "Round", "Trunc", "Copy",
+    "Abs",
+    "Exp",
+    "Ln",
+    "Sqrt",
+    "Rsqrt",
+    "Reciprocal",
+    "Relu",
+    "Not",
+    "Cast",
+    "Sign",
+    "Floor",
+    "Ceil",
+    "Round",
+    "Trunc",
+    "Copy",
 )
 #: Vector intrinsics taking ``(dst, src, scalar, count)``.
 _VEC_SCALAR = (
-    "Adds", "Muls", "Maxs", "Mins", "Subs", "LeakyRelu", "ShiftLeft",
-    "ShiftRight", "CompareScalar",
+    "Adds",
+    "Muls",
+    "Maxs",
+    "Mins",
+    "Subs",
+    "LeakyRelu",
+    "ShiftLeft",
+    "ShiftRight",
+    "CompareScalar",
 )
 #: Reductions taking ``(dst, src, work, count)``.
 _VEC_REDUCE = (
-    "ReduceSum", "ReduceMax", "ReduceMin", "WholeReduceSum",
-    "BlockReduceSum", "BlockReduceMax", "BlockReduceMin", "RepeatReduceSum",
+    "ReduceSum",
+    "ReduceMax",
+    "ReduceMin",
+    "WholeReduceSum",
+    "BlockReduceSum",
+    "BlockReduceMax",
+    "BlockReduceMin",
+    "RepeatReduceSum",
 )
 
 
@@ -215,212 +258,396 @@ def _build_table() -> Dict[str, ApiSpec]:
 
     # -- vector unit --------------------------------------------------------
     for name in _VEC_BINARY:
-        put(ApiSpec(
-            name=name,
-            params=(
-                _p(ArgRole.DST, _UB, "dst"),
-                _p(ArgRole.SRC0, _UB, "src0"),
-                _p(ArgRole.SRC1, _UB, "src1"),
-                _p(ArgRole.COUNT, ANY_TENSOR, "count"),
-            ),
-            pipe=Pipe.V,
-            category="vector",
-            doc="Element-wise binary vector operation; all operands live in UB.",
-        ))
+        put(
+            ApiSpec(
+                name=name,
+                params=(
+                    _p(ArgRole.DST, _UB, "dst"),
+                    _p(ArgRole.SRC0, _UB, "src0"),
+                    _p(ArgRole.SRC1, _UB, "src1"),
+                    _p(ArgRole.COUNT, ANY_TENSOR, "count"),
+                ),
+                pipe=Pipe.V,
+                category="vector",
+                doc="Element-wise binary vector operation in UB.",
+                engine="SIMD_VECTOR",
+                latency_cycles=1,
+            )
+        )
     for name in _VEC_UNARY:
-        put(ApiSpec(
-            name=name,
-            params=(
-                _p(ArgRole.DST, _UB, "dst"),
-                _p(ArgRole.SRC, _UB, "src"),
-                _p(ArgRole.COUNT, ANY_TENSOR, "count"),
-            ),
-            pipe=Pipe.V,
-            category="vector",
-            doc="Element-wise unary vector operation; all operands live in UB.",
-        ))
+        put(
+            ApiSpec(
+                name=name,
+                params=(
+                    _p(ArgRole.DST, _UB, "dst"),
+                    _p(ArgRole.SRC, _UB, "src"),
+                    _p(ArgRole.COUNT, ANY_TENSOR, "count"),
+                ),
+                pipe=Pipe.V,
+                category="vector",
+                doc="Element-wise unary vector operation in UB.",
+                engine="SIMD_VECTOR",
+                latency_cycles=1,
+            )
+        )
     for name in _VEC_SCALAR:
-        put(ApiSpec(
-            name=name,
+        put(
+            ApiSpec(
+                name=name,
+                params=(
+                    _p(ArgRole.DST, _UB, "dst"),
+                    _p(ArgRole.SRC, _UB, "src"),
+                    _p(ArgRole.SCALAR, ANY_TENSOR, "scalar"),
+                    _p(ArgRole.COUNT, ANY_TENSOR, "count"),
+                ),
+                pipe=Pipe.V,
+                category="vector",
+                doc="Vector-scalar operation; tensor operands live in UB.",
+                engine="SIMD_VECTOR",
+                latency_cycles=1,
+            )
+        )
+    for name in _VEC_REDUCE:
+        put(
+            ApiSpec(
+                name=name,
+                params=(
+                    _p(ArgRole.DST, _UB, "dst"),
+                    _p(ArgRole.SRC, _UB, "src"),
+                    _p(ArgRole.OTHER, _UB, "work"),
+                    _p(ArgRole.COUNT, ANY_TENSOR, "count"),
+                ),
+                pipe=Pipe.V,
+                category="vector",
+                doc="Vector reduction; all tensor operands live in UB.",
+                engine="SIMD_VECTOR",
+                latency_cycles=4,
+            )
+        )
+
+    # CANN 9.2 reduction overloads accept a contiguous mask or uint64_t[2]
+    # lane mask, followed by repeat count and DataBlock strides.
+    for name in ("ReduceDataBlock", "ReduceRepeat", "ReducePairElem"):
+        params = (
+            _p(ArgRole.DST, _UB_OR_REG, "dst"),
+            _p(ArgRole.SRC, _UB_OR_REG, "src"),
+            _p(ArgRole.PARAMS, ANY_TENSOR, "mask"),
+            _p(ArgRole.COUNT, ANY_TENSOR, "repeatTime"),
+            _p(ArgRole.PARAMS, ANY_TENSOR, "dstRepStride"),
+            _p(ArgRole.PARAMS, ANY_TENSOR, "srcBlkStride"),
+            _p(ArgRole.PARAMS, ANY_TENSOR, "srcRepStride"),
+        )
+        if name == "ReduceRepeat":
+            params += (_p(ArgRole.PARAMS, ANY_TENSOR, "order"),)
+        put(
+            ApiSpec(
+                name=name,
+                params=params,
+                pipe=Pipe.V,
+                category="vector",
+                doc="CANN 9.2 vector reduction in UB or vector registers.",
+                engine="SIMD_VECTOR",
+                latency_cycles=4,
+            )
+        )
+
+    put(
+        ApiSpec(
+            name="Duplicate",
             params=(
                 _p(ArgRole.DST, _UB, "dst"),
-                _p(ArgRole.SRC, _UB, "src"),
                 _p(ArgRole.SCALAR, ANY_TENSOR, "scalar"),
                 _p(ArgRole.COUNT, ANY_TENSOR, "count"),
             ),
             pipe=Pipe.V,
             category="vector",
-            doc="Vector-scalar operation; tensor operands live in UB.",
-        ))
-    for name in _VEC_REDUCE:
-        put(ApiSpec(
-            name=name,
+            doc="Broadcast a scalar across a UB tensor.",
+        )
+    )
+    put(
+        ApiSpec(
+            name="Select",
             params=(
                 _p(ArgRole.DST, _UB, "dst"),
-                _p(ArgRole.SRC, _UB, "src"),
-                _p(ArgRole.OTHER, _UB, "work"),
-                _p(ArgRole.COUNT, ANY_TENSOR, "count"),
+                _p(ArgRole.SRC0, _UB, "mask"),
+                _p(ArgRole.SRC0, _UB, "src0"),
+                _p(ArgRole.SRC1, _UB, "src1"),
             ),
             pipe=Pipe.V,
             category="vector",
-            doc="Vector reduction; all tensor operands live in UB.",
-        ))
+            doc="Masked select between two UB tensors.",
+        )
+    )
+    put(
+        ApiSpec(
+            name="Compare",
+            params=(
+                _p(ArgRole.DST, _UB, "dst"),
+                _p(ArgRole.SRC0, _UB, "src0"),
+                _p(ArgRole.SRC1, _UB, "src1"),
+            ),
+            pipe=Pipe.V,
+            category="vector",
+            doc="Element-wise comparison producing a UB mask.",
+        )
+    )
+    put(
+        ApiSpec(
+            name="Transpose",
+            params=(_p(ArgRole.DST, _UB, "dst"), _p(ArgRole.SRC, _UB, "src")),
+            pipe=Pipe.V,
+            category="vector",
+            doc="In-UB block transpose.",
+        )
+    )
+    put(
+        ApiSpec(
+            name="Brcb",
+            params=(
+                _p(ArgRole.DST, _UB_OR_REG, "dst"),
+                _p(ArgRole.SRC, _UB_OR_REG, "src"),
+                _p(ArgRole.OTHER, ANY_TENSOR, "repeat"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+            ),
+            pipe=Pipe.V,
+            category="vector",
+            doc="Broadcast block within UB.",
+            engine="SIMD_VECTOR",
+            latency_cycles=2,
+        )
+    )
+    for name in ("Brcc", "DataCopyGather", "DataCopyScatter"):
+        domain = _REG if name.startswith("DataCopy") else _UB_OR_REG
+        put(
+            ApiSpec(
+                name=name,
+                params=(
+                    _p(ArgRole.DST, domain, "dst"),
+                    _p(ArgRole.SRC, domain, "src"),
+                    _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+                ),
+                pipe=Pipe.V,
+                category="vector",
+                doc="arch35 broadcast or register gather/scatter operation.",
+                engine="SIMD_VECTOR",
+                latency_cycles=2,
+            )
+        )
 
-    put(ApiSpec(
-        name="Duplicate",
-        params=(
-            _p(ArgRole.DST, _UB, "dst"),
-            _p(ArgRole.SCALAR, ANY_TENSOR, "scalar"),
-            _p(ArgRole.COUNT, ANY_TENSOR, "count"),
-        ),
-        pipe=Pipe.V,
-        category="vector",
-        doc="Broadcast a scalar across a UB tensor.",
-    ))
-    put(ApiSpec(
-        name="Select",
-        params=(
-            _p(ArgRole.DST, _UB, "dst"),
-            _p(ArgRole.SRC0, _UB, "mask"),
-            _p(ArgRole.SRC0, _UB, "src0"),
-            _p(ArgRole.SRC1, _UB, "src1"),
-        ),
-        pipe=Pipe.V,
-        category="vector",
-        doc="Masked select between two UB tensors.",
-    ))
-    put(ApiSpec(
-        name="Compare",
-        params=(
-            _p(ArgRole.DST, _UB, "dst"),
-            _p(ArgRole.SRC0, _UB, "src0"),
-            _p(ArgRole.SRC1, _UB, "src1"),
-        ),
-        pipe=Pipe.V,
-        category="vector",
-        doc="Element-wise comparison producing a UB mask.",
-    ))
-    put(ApiSpec(
-        name="Transpose",
-        params=(_p(ArgRole.DST, _UB, "dst"), _p(ArgRole.SRC, _UB, "src")),
-        pipe=Pipe.V,
-        category="vector",
-        doc="In-UB block transpose.",
-    ))
-    put(ApiSpec(
-        name="Brcb",
-        params=(
-            _p(ArgRole.DST, _UB, "dst"),
-            _p(ArgRole.SRC, _UB, "src"),
-            _p(ArgRole.OTHER, ANY_TENSOR, "repeat"),
-            _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
-        ),
-        pipe=Pipe.V,
-        category="vector",
-        doc="Broadcast block within UB.",
-    ))
-    put(ApiSpec(
-        name="GatherMask",
-        params=(
-            _p(ArgRole.DST, _UB, "dst"),
-            _p(ArgRole.SRC0, _UB, "src0"),
-            _p(ArgRole.SRC1, _UB, "src1"),
-        ),
-        pipe=Pipe.V,
-        category="vector",
-        doc="Mask-driven gather within UB.",
-    ))
+    # Register MicroAPI forms issue on PIPE_V. The mask is a scalar or
+    # uint64_t[2] descriptor, so it has no tensor-domain requirement.
+    for name in ("Add", "Mul", "Div"):
+        put(
+            ApiSpec(
+                name=f"Reg::{name}",
+                params=(
+                    _p(ArgRole.DST, _REG, "dst"),
+                    _p(ArgRole.SRC0, _REG, "src0"),
+                    _p(ArgRole.SRC1, _REG, "src1"),
+                    _p(ArgRole.PARAMS, ANY_TENSOR, "lane_mask"),
+                ),
+                pipe=Pipe.V,
+                category="vector_register",
+                doc="Masked register arithmetic on PIPE_V.",
+                engine="SIMD_VECTOR",
+                latency_cycles=4,
+            )
+        )
+    put(
+        ApiSpec(
+            name="Reg::Axpy",
+            params=(
+                _p(ArgRole.DST, _REG, "dst"),
+                _p(ArgRole.SRC, _REG, "src"),
+                _p(ArgRole.SCALAR, ANY_TENSOR, "alpha"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "lane_mask"),
+            ),
+            pipe=Pipe.V,
+            category="vector_register",
+            doc="Masked register AXPY on PIPE_V.",
+            engine="SIMD_VECTOR",
+            latency_cycles=4,
+        )
+    )
+    put(
+        ApiSpec(
+            name="Reg::Exp",
+            params=(
+                _p(ArgRole.DST, _REG, "dst"),
+                _p(ArgRole.SRC, _REG, "src"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "lane_mask"),
+            ),
+            pipe=Pipe.V,
+            category="vector_register",
+            doc="Masked register exponentiation on PIPE_V.",
+            engine="SIMD_VECTOR",
+            latency_cycles=8,
+        )
+    )
+    for name, dst_domain, src_domain in (
+        ("LoadAlign", _REG, _UB),
+        ("StoreAlign", _UB, _REG),
+    ):
+        for spelling in (f"Reg::{name}", f"asc_{name.lower()}"):
+            put(
+                ApiSpec(
+                    name=spelling,
+                    params=(
+                        _p(ArgRole.DST, dst_domain, "dst"),
+                        _p(ArgRole.SRC, src_domain, "src"),
+                    ),
+                    pipe=Pipe.V,
+                    category="vector_register",
+                    doc="Register/UB transfer on PIPE_V.",
+                    engine="SIMD_VECTOR",
+                    latency_cycles=2,
+                )
+            )
+    for name in (
+        "asc_shfl",
+        "asc_shfl_up",
+        "asc_shfl_down",
+        "asc_shfl_xor",
+        "asc_ballot",
+        "asc_vote",
+        "asc_any",
+        "asc_all",
+        "asc_activemask",
+        "WarpShuffle",
+        "WarpBallot",
+        "WarpVote",
+    ):
+        put(
+            ApiSpec(
+                name=name,
+                params=(),
+                pipe=Pipe.V,
+                category="simt_warp",
+                doc="SIMT warp collective on the shared Vector ALU.",
+                engine="SIMT_WARP",
+                latency_cycles=4,
+            )
+        )
+    put(
+        ApiSpec(
+            name="GatherMask",
+            params=(
+                _p(ArgRole.DST, _UB, "dst"),
+                _p(ArgRole.SRC0, _UB, "src0"),
+                _p(ArgRole.SRC1, _UB, "src1"),
+            ),
+            pipe=Pipe.V,
+            category="vector",
+            doc="Mask-driven gather within UB.",
+        )
+    )
 
     # -- data movement ------------------------------------------------------
     for name in ("DataCopy", "DataCopyPad"):
-        put(ApiSpec(
-            name=name,
-            params=(
-                _p(ArgRole.DST, frozenset(D) - {D.UNKNOWN}, "dst"),
-                _p(ArgRole.SRC, frozenset(D) - {D.UNKNOWN}, "src"),
-                _p(ArgRole.COUNT, ANY_TENSOR, "count"),
-                _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
-            ),
-            pipe=None,  # derived from (dst, src) domains
-            category="dma",
-            doc="DMA transfer; the issuing pipeline follows the domain pair.",
-        ))
+        put(
+            ApiSpec(
+                name=name,
+                params=(
+                    _p(ArgRole.DST, frozenset(D) - {D.UNKNOWN}, "dst"),
+                    _p(ArgRole.SRC, frozenset(D) - {D.UNKNOWN}, "src"),
+                    _p(ArgRole.COUNT, ANY_TENSOR, "count"),
+                    _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+                ),
+                pipe=None,  # derived from (dst, src) domains
+                category="dma",
+                doc="DMA transfer; the issuing pipeline follows the domain pair.",
+            )
+        )
 
     # -- cube / matmul ------------------------------------------------------
-    put(ApiSpec(
-        name="LoadData",
-        params=(
-            _p(ArgRole.DST, _L0AB, "dst"),
-            _p(ArgRole.SRC, frozenset({D.L1, D.UB}), "src"),
-            _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
-        ),
-        pipe=Pipe.MTE1,
-        category="cube",
-        doc="Fractal load from L1 into a cube input buffer.",
-    ))
-    put(ApiSpec(
-        name="LoadDataWithTranspose",
-        params=(
-            _p(ArgRole.DST, _L0AB, "dst"),
-            _p(ArgRole.SRC, _L1, "src"),
-            _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
-        ),
-        pipe=Pipe.MTE1,
-        category="cube",
-        doc="Transposing fractal load from L1 into a cube input buffer.",
-    ))
-    put(ApiSpec(
-        name="Mmad",
-        params=(
-            _p(ArgRole.DST, _L0C, "dstL0C"),
-            _p(ArgRole.SRC0, _L0A, "a"),
-            _p(ArgRole.SRC1, _L0B, "b"),
-            _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
-        ),
-        pipe=Pipe.M,
-        category="cube",
-        doc="Matrix multiply-accumulate: L0A x L0B -> L0C.",
-    ))
-    put(ApiSpec(
-        name="MmadWithSparse",
-        params=(
-            _p(ArgRole.DST, _L0C, "dstL0C"),
-            _p(ArgRole.SRC0, _L0A, "a"),
-            _p(ArgRole.SRC1, _L0B, "b"),
-            _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
-        ),
-        pipe=Pipe.M,
-        category="cube",
-        doc="Sparse matrix multiply-accumulate: L0A x L0B -> L0C.",
-    ))
-    put(ApiSpec(
-        name="InitConstValue",
-        params=(
-            _p(ArgRole.DST, _L0AB, "dst"),
-            _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
-        ),
-        pipe=Pipe.MTE1,
-        category="cube",
-        doc="Initialise a cube input buffer with a constant.",
-    ))
-    put(ApiSpec(
-        name="Fixpipe",
-        params=(
-            _p(ArgRole.DST, _UB_OR_GM, "dst"),
-            _p(ArgRole.SRC, _L0C, "srcL0C"),
-            _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
-        ),
-        pipe=Pipe.FIX,
-        category="fixpipe",
-        doc="Drain the cube accumulator (L0C) to UB or global memory.",
-    ))
-    put(ApiSpec(
-        name="SetFmatrix",
-        params=(_p(ArgRole.OTHER, ANY_TENSOR, "config"),),
-        pipe=Pipe.S,
-        category="scalar-config",
-        doc="Configure the cube feature-matrix descriptor.",
-    ))
+    put(
+        ApiSpec(
+            name="LoadData",
+            params=(
+                _p(ArgRole.DST, _L0AB, "dst"),
+                _p(ArgRole.SRC, frozenset({D.L1, D.UB}), "src"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+            ),
+            pipe=Pipe.MTE1,
+            category="cube",
+            doc="Fractal load from L1 into a cube input buffer.",
+        )
+    )
+    put(
+        ApiSpec(
+            name="LoadDataWithTranspose",
+            params=(
+                _p(ArgRole.DST, _L0AB, "dst"),
+                _p(ArgRole.SRC, _L1, "src"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+            ),
+            pipe=Pipe.MTE1,
+            category="cube",
+            doc="Transposing fractal load from L1 into a cube input buffer.",
+        )
+    )
+    put(
+        ApiSpec(
+            name="Mmad",
+            params=(
+                _p(ArgRole.DST, _L0C, "dstL0C"),
+                _p(ArgRole.SRC0, _L0A, "a"),
+                _p(ArgRole.SRC1, _L0B, "b"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+            ),
+            pipe=Pipe.M,
+            category="cube",
+            doc="Matrix multiply-accumulate: L0A x L0B -> L0C.",
+        )
+    )
+    put(
+        ApiSpec(
+            name="MmadWithSparse",
+            params=(
+                _p(ArgRole.DST, _L0C, "dstL0C"),
+                _p(ArgRole.SRC0, _L0A, "a"),
+                _p(ArgRole.SRC1, _L0B, "b"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+            ),
+            pipe=Pipe.M,
+            category="cube",
+            doc="Sparse matrix multiply-accumulate: L0A x L0B -> L0C.",
+        )
+    )
+    put(
+        ApiSpec(
+            name="InitConstValue",
+            params=(
+                _p(ArgRole.DST, _L0AB, "dst"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+            ),
+            pipe=Pipe.MTE1,
+            category="cube",
+            doc="Initialise a cube input buffer with a constant.",
+        )
+    )
+    put(
+        ApiSpec(
+            name="Fixpipe",
+            params=(
+                _p(ArgRole.DST, _UB_OR_GM, "dst"),
+                _p(ArgRole.SRC, _L0C, "srcL0C"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+            ),
+            pipe=Pipe.FIX,
+            category="fixpipe",
+            doc="Drain the cube accumulator (L0C) to UB or global memory.",
+        )
+    )
+    put(
+        ApiSpec(
+            name="SetFmatrix",
+            params=(_p(ArgRole.OTHER, ANY_TENSOR, "config"),),
+            pipe=Pipe.S,
+            category="scalar-config",
+            doc="Configure the cube feature-matrix descriptor.",
+        )
+    )
 
     # -- low-level CCE cube loaders and contraction -------------------------
     # These are the raw-intrinsic spellings from cce_aicore_intrinsics.h that
@@ -429,11 +656,13 @@ def _build_table() -> Dict[str, ApiSpec]:
     # the argument resolver must strip the (__ca__ T *) casts, and the volume
     # model stands in for the unavailable sizeof(void).
     _S4_VOLUME = TransferVolume(
-        repeat_index=4, unit_bytes=512,
+        repeat_index=4,
+        unit_bytes=512,
         basis="one packed-FP4 16x64 fractal (512 B) per repeat",
     )
     _MX_VOLUME = TransferVolume(
-        repeat_index=4, unit_bytes=32,
+        repeat_index=4,
+        unit_bytes=32,
         basis="one E8M0 scale granule (16 rows x 2 k-groups, 32 B) per repeat",
     )
     for name, dst, src, volume in (
@@ -449,62 +678,78 @@ def _build_table() -> Dict[str, ApiSpec]:
         # The MX scale-load path is DaVinci v3; v2 (910B/910C) has no
         # microscale operand format and no instruction to feed it.
         feature = MX_CUBE_FEATURE if name.endswith("_mx") else None
-        put(ApiSpec(
-            name=name,
+        put(
+            ApiSpec(
+                name=name,
+                params=(
+                    _p(ArgRole.DST, dst, "dst"),
+                    _p(ArgRole.SRC, src, "src"),
+                    # dstStride, srcStride, repeat, ... : scalar tuning knobs.
+                    _p(ArgRole.OTHER, None, "dstStride"),
+                    _p(ArgRole.OTHER, None, "srcStride"),
+                    _p(ArgRole.COUNT, None, "repeat"),
+                    _p(ArgRole.PARAMS, None, "params"),
+                ),
+                pipe=Pipe.MTE1,
+                category="cube-load",
+                doc=f"Raw CCE tile load; moves {volume.basis}.",
+                volume=volume,
+                requires_feature=feature,
+            )
+        )
+    put(
+        ApiSpec(
+            name="mad_mx",
             params=(
-                _p(ArgRole.DST, dst, "dst"),
-                _p(ArgRole.SRC, src, "src"),
-                # dstStride, srcStride, repeat, ... : scalar tuning knobs.
-                _p(ArgRole.OTHER, None, "dstStride"),
-                _p(ArgRole.OTHER, None, "srcStride"),
-                _p(ArgRole.COUNT, None, "repeat"),
-                _p(ArgRole.PARAMS, None, "params"),
+                _p(ArgRole.DST, _L0C, "dstL0C"),
+                _p(ArgRole.OTHER, None, "dstOffset"),
+                _p(ArgRole.SRC0, _L0A, "a"),
+                _p(ArgRole.OTHER, None, "aOffset"),
+                _p(ArgRole.SRC1, _L0B, "b"),
+                _p(ArgRole.OTHER, None, "bOffset"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "shape"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "control"),
             ),
-            pipe=Pipe.MTE1,
-            category="cube-load",
-            doc=f"Raw CCE tile load; moves {volume.basis}.",
-            volume=volume,
-            requires_feature=feature,
-        ))
-    put(ApiSpec(
-        name="mad_mx",
-        params=(
-            _p(ArgRole.DST, _L0C, "dstL0C"),
-            _p(ArgRole.OTHER, None, "dstOffset"),
-            _p(ArgRole.SRC0, _L0A, "a"),
-            _p(ArgRole.OTHER, None, "aOffset"),
-            _p(ArgRole.SRC1, _L0B, "b"),
-            _p(ArgRole.OTHER, None, "bOffset"),
-            _p(ArgRole.PARAMS, ANY_TENSOR, "shape"),
-            _p(ArgRole.PARAMS, ANY_TENSOR, "control"),
-        ),
-        pipe=Pipe.M,
-        category="cube",
-        doc="MX-format matrix multiply-accumulate: L0A x L0B -> L0C "
+            pipe=Pipe.M,
+            category="cube",
+            doc="MX-format matrix multiply-accumulate: L0A x L0B -> L0C "
             "(fp4x2 operands with E8M0 microscales).",
-        requires_feature=MX_CUBE_FEATURE,
-    ))
-    put(ApiSpec(
-        name="DataCacheCleanAndInvalid",
-        params=(_p(ArgRole.DST, _UB_OR_GM, "dst"),),
-        pipe=Pipe.MTE3,
-        category="dma",
-        doc="Write back and invalidate the data cache for a tensor.",
-    ))
+            requires_feature=MX_CUBE_FEATURE,
+        )
+    )
+    put(
+        ApiSpec(
+            name="DataCacheCleanAndInvalid",
+            params=(_p(ArgRole.DST, _UB_OR_GM, "dst"),),
+            pipe=Pipe.MTE3,
+            category="dma",
+            doc="Write back and invalidate the data cache for a tensor.",
+        )
+    )
 
     # -- scalar / configuration --------------------------------------------
     for name in (
-        "SetVectorMask", "SetMaskNorm", "SetMaskCount", "ResetMask",
-        "SetAtomicAdd", "SetAtomicNone", "SetAtomicMax", "SetAtomicMin",
-        "SetMMLayoutTransform", "SetLoadDataBoundary", "SetPadValue",
+        "SetVectorMask",
+        "SetMaskNorm",
+        "SetMaskCount",
+        "ResetMask",
+        "SetAtomicAdd",
+        "SetAtomicNone",
+        "SetAtomicMax",
+        "SetAtomicMin",
+        "SetMMLayoutTransform",
+        "SetLoadDataBoundary",
+        "SetPadValue",
     ):
-        put(ApiSpec(
-            name=name,
-            params=(_p(ArgRole.OTHER, ANY_TENSOR, "config"),),
-            pipe=Pipe.S,
-            category="scalar-config",
-            doc="Scalar-unit configuration write.",
-        ))
+        put(
+            ApiSpec(
+                name=name,
+                params=(_p(ArgRole.OTHER, ANY_TENSOR, "config"),),
+                pipe=Pipe.S,
+                category="scalar-config",
+                doc="Scalar-unit configuration write.",
+            )
+        )
 
     return table
 
@@ -514,7 +759,11 @@ API_TABLE: Dict[str, ApiSpec] = _build_table()
 
 def lookup_api(name: str) -> Optional[ApiSpec]:
     """Look up an intrinsic by (possibly namespace-qualified) name."""
-    return API_TABLE.get(name.rsplit("::", 1)[-1])
+    return (
+        API_TABLE.get(name)
+        or API_TABLE.get(name.removeprefix("AscendC::"))
+        or API_TABLE.get(name.rsplit("::", 1)[-1])
+    )
 
 
 def is_known_api(name: str) -> bool:

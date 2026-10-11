@@ -57,6 +57,7 @@ class ScopeKind(Enum):
     INLINE = "inline"
     #: A region guarded to one physical core (AIC or AIV).
     CORE = "core"
+    VEC_SCOPE = "vec_scope"
 
 
 class CoreView(Enum):
@@ -218,6 +219,9 @@ class TensorDecl:
     use_locs: List[SourceLoc] = field(default_factory=list)
     #: ``True`` when the declaration never received an address binding.
     unbound: bool = False
+    #: Register-file footprint (256-byte slots); zero for memory tensors.
+    register_slots: int = 0
+    declaration_index: int = 0
 
     # -- derived views ------------------------------------------------------
 
@@ -363,8 +367,10 @@ class FlagOp(Operation):
     @property
     def channel(self) -> Tuple[str, object]:
         """The ``(route, event_id)`` pair this operation synchronises on."""
-        return (self.route.name if self.route else "?",
-                self.event_id if self.event_id is not None else self.event_id_text)
+        return (
+            self.route.name if self.route else "?",
+            self.event_id if self.event_id is not None else self.event_id_text,
+        )
 
     def to_json(self) -> Dict[str, object]:
         base = super().to_json()
@@ -436,7 +442,12 @@ class ApiCallOp(Operation):
             {
                 "name": self.name,
                 "args": [
-                    {"index": a.index, "text": a.text, "tensor": a.tensor, "value": a.value}
+                    {
+                        "index": a.index,
+                        "text": a.text,
+                        "tensor": a.tensor,
+                        "value": a.value,
+                    }
                     for a in self.args
                 ],
                 "writes": list(self.writes),

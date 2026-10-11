@@ -122,6 +122,9 @@ class MemoryChecker(Checker):
         self._check_api_domains(kernel)
         self._check_vector_bank_conflicts(kernel)
         self._check_simt_datacache(kernel)
+        self._check_simt_accesses(kernel)
+        self._check_register_pressure(kernel)
+        self._check_simt_vector_contention(kernel)
         self._check_target_features(kernel)
 
         tensors = on_core
@@ -270,7 +273,9 @@ class MemoryChecker(Checker):
             )
             return
 
-        finding = self.solver.check_bounds(tensor.byte_offset, tensor.byte_size, capacity)
+        finding = self.solver.check_bounds(
+            tensor.byte_offset, tensor.byte_size, capacity
+        )
         if finding.verdict is not Verdict.VIOLATED:
             return
 
@@ -308,7 +313,8 @@ class MemoryChecker(Checker):
             # A loop-varying offset: the footprint grows per iteration, so the
             # fix is to recycle slots rather than to shrink one allocation.
             names = ", ".join(
-                f"{name} = {value}" for name, value in sorted(finding.counterexample.items())
+                f"{name} = {value}"
+                for name, value in sorted(finding.counterexample.items())
             )
             return (
                 f"The offset of {tensor.name!r} grows with the loop, so the "
@@ -347,14 +353,18 @@ class MemoryChecker(Checker):
                 if not all(
                     is_decidable(e)
                     for e in (
-                        left.byte_offset, left.byte_size,
-                        right.byte_offset, right.byte_size,
+                        left.byte_offset,
+                        left.byte_size,
+                        right.byte_offset,
+                        right.byte_size,
                     )
                 ):
                     continue  # unresolved layout; reported by _check_extent_known
                 finding = self.solver.check_disjoint(
-                    left.byte_offset, left.byte_size,
-                    right.byte_offset, right.byte_size,
+                    left.byte_offset,
+                    left.byte_size,
+                    right.byte_offset,
+                    right.byte_size,
                 )
                 if finding.verdict is Verdict.VIOLATED:
                     self._report_collision(kernel, domain, left, right, finding)
@@ -664,11 +674,7 @@ class MemoryChecker(Checker):
         """
         picked: List[tuple[str, TensorDecl]] = []
         for role in (ArgRole.SRC0, ArgRole.SRC1):
-            indices = [
-                i
-                for i, param in enumerate(spec.params)
-                if param.role is role
-            ]
+            indices = [i for i, param in enumerate(spec.params) if param.role is role]
             if len(indices) != 1 or indices[0] >= len(op.args):
                 return None
             name = op.args[indices[0]].tensor
@@ -719,22 +725,147 @@ class MemoryChecker(Checker):
 
     # -- 351x SIMD/SIMT DataCache budget (AKA1010) ---------------------------
 
+    def _check_register_pressure(self, kernel: KernelIR) -> None:
+        """Count live 256-byte register slots, excluding UB-backed tensors."""
+        registers = [
+            t for t in kernel.tensors.values() if t.domain is PhysicalDomain.REG
+        ]
+        if not registers:
+            return
+        budget = self.hw.chip.vector_register_slots
+        if budget is None:
+            return
+        peak = 0
+        peak_loc = kernel.loc
+        for op in kernel.ops:
+            live = sum(
+                t.register_slots
+                for t in registers
+                if t.first_use is not None
+                and t.declaration_index <= op.index <= (t.last_use or t.first_use)
+            )
+            if live > peak:
+                peak, peak_loc = live, op.loc
+        self.ctx.publish(
+            f"register_usage::{kernel.name}",
+            {
+                "peak_slots": peak,
+                "budget_slots": budget,
+                "slot_bytes": self.hw.chip.vector_bytes,
+            },
+        )
+        if peak > budget:
+            self.diags.add(
+                Code.REGISTER_SPILL,
+                Severity.WARNING,
+                f"{peak} live vector-register slots exceed the {budget}-slot "
+                f"arch35 VF budget; at least {peak - budget} slots may spill to UB",
+                peak_loc,
+                hardware_domain="REG",
+                remediation="Shorten register live ranges or split the vector function.",
+                peak_slots=peak,
+                budget_slots=budget,
+            )
+
+    def _check_simt_accesses(self, kernel: KernelIR) -> None:
+        if self.hw.chip.name != "ascend950pr":
+            return
+        line = self.hw.chip.simt_cache_line_bytes
+        dma_by_loop: Dict[int, List[ApiCallOp]] = {}
+        for dma in (
+            op
+            for op in kernel.api_calls()
+            if op.name in {"DataCopy", "DataCopyPad"}
+            and op.pipe is Pipe.MTE2
+            and op.loop_id is not None
+        ):
+            dma_by_loop.setdefault(dma.loop_id, []).append(dma)
+        for op in kernel.api_calls():
+            if op.name != "SIMT_GM_ACCESS":
+                continue
+            offset = op.args[1].value
+            width = op.args[2].value
+            crossing = (
+                offset is not None
+                and width is not None
+                and offset % line + width > line
+            )
+            competing_dma = op.loop_id is not None and any(
+                op.args[0].tensor in dma.reads
+                for dma in dma_by_loop.get(op.loop_id, [])
+            )
+            if not crossing and not competing_dma:
+                continue
+            reason = (
+                f"SIMT scalar access at byte {offset} spans two {line}-byte "
+                "DataCache lines"
+                if crossing
+                else "SIMT GM access and MTE2 DMA issue in the same loop"
+            )
+            self.diags.add(
+                Code.SIMT_DATACACHE_CONFLICT,
+                Severity.WARNING if crossing else Severity.INFO,
+                reason,
+                op.loc,
+                hardware_domain="GM",
+                remediation=(
+                    "Align or coalesce SIMT accesses; schedule MTE2 DMA "
+                    "outside the overlapping SIMT phase when possible."
+                ),
+                offset_bytes=offset,
+                access_bytes=width,
+                cache_line_bytes=line,
+            )
+
+    def _check_simt_vector_contention(self, kernel: KernelIR) -> None:
+        """Report loop-carried sharing of the isomorphic Vector ALU."""
+        if self.hw.chip.name != "ascend950pr":
+            return
+        simt = [
+            op
+            for op in kernel.api_calls()
+            if (
+                lookup_api(op.name) is not None
+                and lookup_api(op.name).engine == "SIMT_WARP"
+            )
+        ]
+        simd = [
+            op
+            for op in kernel.api_calls()
+            if (
+                lookup_api(op.name) is not None
+                and lookup_api(op.name).engine == "SIMD_VECTOR"
+            )
+        ]
+        for warp in simt:
+            if warp.loop_id is None:
+                continue
+            if any(vec.loop_id == warp.loop_id for vec in simd):
+                self.diags.add(
+                    Code.VECTOR_ALU_CONTENTION,
+                    Severity.INFO,
+                    "SIMT warp and SIMD vector operations share PIPE_V in this loop",
+                    warp.loc,
+                    hardware_domain="REG",
+                    remediation="Include both instruction streams when estimating Vector ALU occupancy.",
+                )
+                break
+
     def _check_simt_datacache(self, kernel: KernelIR) -> None:
-        """Enforce the 351x UB partition when SIMT execution is present.
+        """Enforce the 351x/arch35 UB partition.
 
         On 351x the Unified Buffer is strictly partitioned:
         ``DataCache = 256 KiB - StaticMem - DynamicMem - 8 KiB (compiler)``.
-        Whenever the SIMT vector path is in use, the runtime requires
-        ``DataCache >= 32 KiB``; more than 216 KiB of tensor allocation drops
-        below that floor and the hardware corrupts memory at run time.
+        The 351x provisional profile applies the floor when SIMT markers are
+        present.  Ascend950PR arch35 has a validated 216 KiB tensor ceiling
+        regardless of whether the source explicitly spells a SIMT marker.
         """
         chip = self.hw.chip
         if not chip.enforces_datacache_partition:
             return
         source = self.ctx.unit.source
-        if not any(
-            re.search(rf"\b{re.escape(marker)}\b", source)
-            for marker in _SIMT_MARKERS
+        if chip.name != "ascend950pr" and not any(
+            re.search(rf"\b{re.escape(marker)}\b", source) for marker in _SIMT_MARKERS
         ):
             return
 

@@ -58,14 +58,14 @@ class Pipe(Enum):
     ``PipeBarrier``.
     """
 
-    S = "PIPE_S"        # scalar unit
-    V = "PIPE_V"        # vector unit  (reads/writes UB)
-    M = "PIPE_M"        # cube / matmul unit (reads L0A+L0B, writes L0C)
+    S = "PIPE_S"  # scalar unit
+    V = "PIPE_V"  # vector unit  (reads/writes UB)
+    M = "PIPE_M"  # cube / matmul unit (reads L0A+L0B, writes L0C)
     MTE1 = "PIPE_MTE1"  # L1 -> L0A/L0B ("load data", fractal rearrange)
     MTE2 = "PIPE_MTE2"  # GM -> L1/UB   ("move in")
     MTE3 = "PIPE_MTE3"  # UB -> GM/L1   ("move out")
-    FIX = "PIPE_FIX"    # fixpipe: L0C -> UB/GM (quant, relu, channel split)
-    ALL = "PIPE_ALL"    # pseudo-pipe: full barrier across every pipeline
+    FIX = "PIPE_FIX"  # fixpipe: L0C -> UB/GM (quant, relu, channel split)
+    ALL = "PIPE_ALL"  # pseudo-pipe: full barrier across every pipeline
 
     @property
     def short(self) -> str:
@@ -111,14 +111,15 @@ REAL_PIPES: Tuple[Pipe, ...] = (
 class PhysicalDomain(Enum):
     """A physically distinct memory region on (or attached to) the AI Core."""
 
-    UB = "UB"      # Unified Buffer - vector unit scratchpad
-    L1 = "L1"      # L1 Buffer     - shared staging buffer
-    L0A = "L0A"    # Cube left-matrix input buffer
-    L0B = "L0B"    # Cube right-matrix input buffer
-    L0C = "L0C"    # Cube accumulator / output buffer
-    BT = "BT"      # Bias table
-    FB = "FB"      # Fixpipe parameter buffer
-    GM = "GM"      # off-core global (HBM) memory
+    UB = "UB"  # Unified Buffer - vector unit scratchpad
+    L1 = "L1"  # L1 Buffer     - shared staging buffer
+    L0A = "L0A"  # Cube left-matrix input buffer
+    L0B = "L0B"  # Cube right-matrix input buffer
+    L0C = "L0C"  # Cube accumulator / output buffer
+    BT = "BT"  # Bias table
+    FB = "FB"  # Fixpipe parameter buffer
+    GM = "GM"  # off-core global (HBM) memory
+    REG = "REG"  # vector register file, not UB SRAM
     UNKNOWN = "UNKNOWN"
 
     @property
@@ -312,9 +313,17 @@ class ChipSpec:
     block_bytes: int = 32
     #: Vector register width in bytes (one full vector instruction's footprint).
     vector_bytes: int = 256
+    #: Maximum simultaneously live 256-byte SIMD register slots in one VF.
+    vector_register_slots: Optional[int] = None
+    simt_warp_size: int = 32
+    simt_warp_schedulers: int = 4
+    simt_cache_line_bytes: int = 128
     #: ``True`` when the capacity numbers are inferred rather than documented.
     provisional: bool = False
     notes: str = ""
+    #: Whether the analytical timing model is calibrated enough to emit
+    #: performance warnings. Schedules are still reported when this is false.
+    emit_perf_advisories: bool = True
     #: Optional instruction-set features this part implements.  An intrinsic
     #: whose ``requires_feature`` is absent here cannot be issued on this chip.
     #: Empty on DaVinci v2 (910B/910C): those parts have the baseline Cube and
@@ -437,13 +446,13 @@ CHIP_PROFILES: Dict[str, ChipSpec] = {
         ),
         provisional=True,
         notes="Capacities extrapolated from the 910B profile; override with "
-              "--ub-bytes / --l1-bytes or --chip-profile when you have the "
-              "SKU datasheet.",
+        "--ub-bytes / --l1-bytes or --chip-profile when you have the "
+        "SKU datasheet.",
     ),
     "ascend351x": ChipSpec(
         name="ascend351x",
         display_name="Ascend 351x (inference series)",
-        aliases=("351x", "ascend3510", "ascend3519", "3510", "3519"),
+        aliases=("351x", "ascend3519", "3519"),
         domains=_domains(
             UB=(256 * KIB, 32, 32, 32, "Unified Buffer (vector scratchpad)"),
             L1=(512 * KIB, 32, 32, 32, "L1 Buffer (shared staging)"),
@@ -467,10 +476,32 @@ CHIP_PROFILES: Dict[str, ChipSpec] = {
         # its scale-load path, which the v2 parts above do not.
         features=frozenset({"mx_cube"}),
         notes="Capacities extrapolated; override with --chip-profile for a "
-              "specific 351x SKU. UB is partitioned: at most 216 KiB for "
-              "tensors when SIMT is in use, leaving a 32 KiB DataCache.",
+        "specific 351x SKU. UB is partitioned: at most 216 KiB for "
+        "tensors when SIMT is in use, leaving a 32 KiB DataCache.",
     ),
 }
+
+# arch35 is the Ascend 950PR AIV target (__NPU_ARCH__ == 3510).  Keep it
+# distinct from the provisional 351x inference profile: its event-ID limit is
+# a hardware restriction, not a runtime reservation.
+CHIP_PROFILES["ascend950pr"] = replace(
+    CHIP_PROFILES["ascend351x"],
+    name="ascend950pr",
+    display_name="Ascend 950PR (arch35 / DaVinci v3)",
+    aliases=("950pr", "arch35", "dav-3510", "ascend3510", "3510"),
+    reserved_event_ids=frozenset(),
+    max_event_id=3,
+    provisional=False,
+    emit_perf_advisories=False,
+    vector_register_slots=32,
+    simt_warp_size=32,
+    simt_warp_schedulers=4,
+    simt_cache_line_bytes=128,
+    notes="Validated arch35 AIV limits: EVENT_ID0..3 and 256 KiB UB, "
+    "of which at most 216 KiB is usable for tensors after the 8 KiB "
+    "compiler reserve and 32 KiB SIMT DataCache floor. Pipeline timing "
+    "remains uncalibrated, so performance advisories are withheld.",
+)
 
 
 def resolve_chip(name: str) -> ChipSpec:
@@ -537,7 +568,9 @@ class HardwareModel:
              "domains": {"UB": {"capacity_bytes": 196608, "base_alignment": 32}}}
         """
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
-        base = resolve_chip(raw["base"]) if "base" in raw else CHIP_PROFILES["ascend910b"]
+        base = (
+            resolve_chip(raw["base"]) if "base" in raw else CHIP_PROFILES["ascend910b"]
+        )
         domains = dict(base.domains)
         for dom_name, cfg in (raw.get("domains") or {}).items():
             dom = PhysicalDomain[dom_name.upper()]
@@ -562,9 +595,14 @@ class HardwareModel:
             block_bytes=int(raw.get("block_bytes", base.block_bytes)),
             vector_bytes=int(raw.get("vector_bytes", base.vector_bytes)),
             provisional=bool(raw.get("provisional", True)),
+            emit_perf_advisories=bool(
+                raw.get("emit_perf_advisories", base.emit_perf_advisories)
+            ),
             notes=str(raw.get("notes", f"loaded from {Path(path).name}")),
             ub_total_bytes=(
-                int(raw["ub_total_bytes"]) if "ub_total_bytes" in raw else base.ub_total_bytes
+                int(raw["ub_total_bytes"])
+                if "ub_total_bytes" in raw
+                else base.ub_total_bytes
             ),
             compiler_reserved_bytes=int(
                 raw.get("compiler_reserved_bytes", base.compiler_reserved_bytes)
@@ -668,6 +706,7 @@ class HardwareModel:
             "name": self.chip.name,
             "display_name": self.chip.display_name,
             "provisional": self.chip.provisional,
+            "emit_perf_advisories": self.chip.emit_perf_advisories,
             "notes": self.chip.notes,
             "block_bytes": self.chip.block_bytes,
             "max_event_id": self.chip.max_event_id,

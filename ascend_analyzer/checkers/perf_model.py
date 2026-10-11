@@ -33,6 +33,8 @@ bubbles, ``AKA4002`` for cube underutilization.
 
 from __future__ import annotations
 
+from ..apis import lookup_api
+
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -129,12 +131,8 @@ class PerfModelChecker(Checker):
         active = [p for p in pipes if p.op_count]
         total_busy = sum(p.busy_cycles for p in active)
         total_stall = sum(p.stall_cycles for p in active)
-        overlap = (
-            total_busy / (makespan * len(active)) if makespan and active else 0.0
-        )
-        critical = max(
-            active, key=lambda p: p.busy_cycles, default=None
-        )
+        overlap = total_busy / (makespan * len(active)) if makespan and active else 0.0
+        critical = max(active, key=lambda p: p.busy_cycles, default=None)
         drain = self._drain_cycles(kernel, end, makespan)
         bottleneck = self._classify(
             kernel, active, total_busy, total_stall, drain, makespan, critical
@@ -159,7 +157,7 @@ class PerfModelChecker(Checker):
             },
         )
 
-        if makespan < self.min_makespan_cycles:
+        if makespan < self.min_makespan_cycles or not self.hw.chip.emit_perf_advisories:
             return
         self._report_sync_stalls(
             kernel, active, total_busy, total_stall, stall_by_route, start, makespan
@@ -263,9 +261,12 @@ class PerfModelChecker(Checker):
                 return self._cube_cycles(kernel, op)
             bytes_moved = self._transfer_bytes(kernel, op)
             bandwidth = self.hw.pipe_bytes_per_cycle(op.pipe)
+            spec = lookup_api(op.name)
             if bandwidth is None:
-                return _ISSUE_CYCLES
-            return max(1, -(-bytes_moved // bandwidth))
+                return max(_ISSUE_CYCLES, spec.latency_cycles if spec else 0)
+            return max(
+                1, -(-bytes_moved // bandwidth), spec.latency_cycles if spec else 0
+            )
         return _ISSUE_CYCLES
 
     def _cube_cycles(self, kernel: KernelIR, op: ApiCallOp) -> int:
@@ -282,7 +283,9 @@ class PerfModelChecker(Checker):
         throughput = self.hw.chip.cube_read_bytes_per_cycle
         return max(1, -(-operands // throughput))
 
-    def _cube_shape(self, kernel: KernelIR, op: ApiCallOp) -> Optional[Tuple[int, int, int]]:
+    def _cube_shape(
+        self, kernel: KernelIR, op: ApiCallOp
+    ) -> Optional[Tuple[int, int, int]]:
         """Recover ``(M, K, N)`` from a shape argument.
 
         Cube kernels spell the tile shape as ``mmad_t::shape_t((uint16_t)M,
@@ -372,9 +375,7 @@ class PerfModelChecker(Checker):
             entry.busy_cycles += cycles[op.index]
         for entry in profiles.values():
             entry.stall_cycles = stall_by_pipe.get(entry.pipe, 0)
-            entry.utilization = (
-                entry.busy_cycles / makespan if makespan else 0.0
-            )
+            entry.utilization = entry.busy_cycles / makespan if makespan else 0.0
             entry.makespan_cycles = makespan
         order = {pipe.value: i for i, pipe in enumerate(REAL_PIPES)}
         return sorted(profiles.values(), key=lambda p: order.get(p.pipe, 99))
@@ -461,9 +462,7 @@ class PerfModelChecker(Checker):
             stall_ratio=round(ratio, 4),
             worst_pipe=worst_pipe.pipe,
             worst_pipe_stall=worst_pipe.stall_cycles,
-            stall_by_route=dict(
-                sorted(stall_by_route.items(), key=lambda kv: -kv[1])
-            ),
+            stall_by_route=dict(sorted(stall_by_route.items(), key=lambda kv: -kv[1])),
         )
 
     def _report_cube_underutil(
@@ -475,8 +474,11 @@ class PerfModelChecker(Checker):
         if cube.utilization >= self.cube_util_threshold:
             return
         first_cube = next(
-            (op for op in kernel.ops if isinstance(op, ApiCallOp)
-             and op.pipe is Pipe.M),
+            (
+                op
+                for op in kernel.ops
+                if isinstance(op, ApiCallOp) and op.pipe is Pipe.M
+            ),
             None,
         )
         loc = first_cube.loc if first_cube is not None else kernel.loc

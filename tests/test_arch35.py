@@ -1,0 +1,230 @@
+"""Ascend 950PR arch35 and CANN 9.2 regression cases."""
+
+from pathlib import Path
+
+from ascend_analyzer import AnalyzerOptions, KernelAnalyzer
+from ascend_analyzer.apis import lookup_api
+from ascend_analyzer.diagnostics import Severity
+from ascend_analyzer.hardware import HardwareModel, Pipe
+from ascend_analyzer.hardware import PhysicalDomain
+from ascend_analyzer.ir import ScopeKind
+
+from conftest import analyze, analyze_body, codes_of, find
+
+
+def test_arch35_profile_and_event_id4_is_fatal():
+    hw = HardwareModel.for_chip("arch35")
+    assert hw.chip.name == "ascend950pr"
+    assert hw.chip.max_event_id == 3
+    assert hw.chip.ub_total_bytes == 256 * 1024
+    assert hw.chip.max_usable_ub_bytes == 216 * 1024
+    result = analyze_body(
+        "AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID4);\n"
+        "AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID4);",
+        chip="ascend950pr",
+    )
+    bad = find(result, "AKA2008")
+    assert len(bad) == 2
+    assert all(d.severity is Severity.FATAL for d in bad)
+    assert "unsupported on arch35" in bad[0].message
+
+
+def test_arch35_tensor_allocation_ceiling_applies_without_simt_marker():
+    result = analyze_body(
+        """
+        AscendC::TPipe pipe;
+        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        pipe.InitBuffer(ub, 224 * 1024);
+        """,
+        chip="ascend950pr",
+    )
+    assert "AKA1010" in codes_of(result)
+
+
+def test_uncalibrated_arch35_timing_does_not_emit_perf_warnings():
+    path = Path(__file__).parent / "kernels" / "nvfp4_pipelined_dequant.cpp"
+    result = KernelAnalyzer(AnalyzerOptions(chip="ascend950pr")).analyze_file(path)
+    assert "AKA4001" not in codes_of(result)
+    assert any(key.startswith("perf_profile::") for key in result.artifacts)
+
+
+def test_cann92_reduction_between_barriers_is_not_redundant():
+    result = analyze_body(
+        """
+        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        AscendC::LocalTensor<float> a = ub.GetWithOffset<float>(64, 0);
+        AscendC::LocalTensor<float> b = ub.GetWithOffset<float>(8, 256);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::ReduceDataBlock<AscendC::ReduceType::SUM, float, float>(
+            b, a, 64, 1, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        """,
+        chip="ascend950pr",
+    )
+    assert "AKA3005" not in codes_of(result)
+    ops = result.unit.kernels[0].ops
+    assert any(
+        getattr(op, "name", "") == "ReduceDataBlock" and op.pipe is Pipe.V for op in ops
+    )
+
+
+def test_direct_get_with_offset_operand_has_ub_domain():
+    result = analyze_body(
+        """
+        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        AscendC::ReduceDataBlock<AscendC::ReduceType::SUM, float, float>(
+            ub.GetWithOffset<float>(8, 256),
+            ub.GetWithOffset<float>(64, 0), 64, 1, 1, 1, 8);
+        """,
+        chip="ascend950pr",
+    )
+    kernel = result.unit.kernels[0]
+    reduction = next(
+        op for op in kernel.ops if getattr(op, "name", "") == "ReduceDataBlock"
+    )
+    assert all(
+        kernel.tensors[a.tensor].domain.value == "UB" for a in reduction.args[:2]
+    )
+
+
+def test_member_and_parameter_global_tensor_stores_use_mte3():
+    source = """
+    #include "kernel_operator.h"
+    class Writer {
+      AscendC::GlobalTensor<half> output_;
+    public:
+      __aicore__ inline void Store(AscendC::LocalTensor<half> local) {
+        AscendC::DataCopyPad(output_[0], local, 128);
+      }
+    };
+    __aicore__ inline void StoreArg(AscendC::GlobalTensor<half> output,
+                                   AscendC::LocalTensor<half> local) {
+      AscendC::DataCopyPad(output[0], local, 128);
+    }
+    extern "C" __global__ __aicore__ void test_kernel(__gm__ half* gm) {
+      AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+      AscendC::LocalTensor<half> local = ub.GetWithOffset<half>(128, 0);
+      AscendC::GlobalTensor<half> output;
+      output.SetGlobalBuffer(gm, 128);
+      Writer writer;
+      writer.Store(local);
+      StoreArg(output, local);
+    }
+    """
+    result = analyze(source, chip="ascend950pr")
+    stores = [
+        op
+        for op in result.unit.kernels[0].ops
+        if getattr(op, "name", "") == "DataCopyPad"
+    ]
+    assert len(stores) == 2
+    assert all(op.pipe is Pipe.MTE3 for op in stores)
+    assert "AKA2010" not in codes_of(result)
+
+
+def test_vec_scope_register_microapi_has_no_false_memory_or_barrier_warning():
+    result = analyze_body(
+        """
+        __VEC_SCOPE__ {
+          AscendC::RegTensor<float> a;
+          AscendC::RegTensor<float> b;
+          AscendC::RegTensor<float> out;
+          Reg::Add(out, a, b, 0xffffffffffffffffULL);
+          AscendC::ReduceDataBlock<AscendC::ReduceType::SUM, float, float>(
+              out, a, 1);
+          AscendC::PipeBarrier<PIPE_V>();
+        }
+        """,
+        chip="ascend950pr",
+    )
+    kernel = result.unit.kernels[0]
+    assert any(s.kind is ScopeKind.VEC_SCOPE for s in kernel.scopes.values())
+    assert all(
+        kernel.tensors[n].domain is PhysicalDomain.REG for n in ("a", "b", "out")
+    )
+    assert {"AKA1009", "AKA3005"}.isdisjoint(codes_of(result))
+    assert not [d for d in result.diagnostics if d.severity is Severity.WARNING]
+
+
+def test_160_byte_get_with_offset_pitch_reaches_bank_conflict_verdict():
+    views = "\n".join(
+        f"auto a{i} = ub.GetWithOffset<half>(64, {i * 160});" for i in range(9)
+    )
+    result = analyze_body(
+        "AscendC::TBuf<AscendC::TPosition::VECCALC> ub;\n"
+        + views
+        + "\nAscendC::Add(a4, a0, a8, 64);",
+        chip="ascend950pr",
+    )
+    conflict = find(result, "AKA3006")
+    assert conflict and conflict[0].details["delta_blocks"] == 40
+
+
+def test_static_simt_cross_line_access_is_reported():
+    source = """
+    __simt_vf__ void load() {
+      __gm__ double* src = (__gm__ double*)(4);
+      double x = src[15];
+    }
+    extern "C" __global__ __aicore__ void test_kernel() {
+      load();
+    }
+    """
+    result = analyze(source, chip="ascend950pr")
+    assert "AKA3007" in codes_of(result)
+
+
+def test_register_tile_pressure_reports_spill_without_ub_domain_warning():
+    declarations = "\n".join(f"AscendC::RegTile<float, 16, 16> r{i};" for i in range(9))
+    use = "Reg::Add(" + ", ".join(f"r{i}" for i in range(9)) + ");"
+    result = analyze_body(
+        "__VEC_SCOPE__ {\n" + declarations + "\n" + use + "\n}",
+        chip="ascend950pr",
+    )
+    assert "AKA3008" in codes_of(result)
+    assert "AKA1009" not in codes_of(result)
+    usage = result.artifacts["register_usage::test_kernel"]
+    assert usage["peak_slots"] == 36
+
+
+def test_simt_warp_and_simd_issue_contend_inside_one_loop():
+    result = analyze_body(
+        """
+        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        auto a = ub.GetWithOffset<float>(64, 0);
+        auto b = ub.GetWithOffset<float>(64, 256);
+        for (int i = 0; i < 2; ++i) {
+          asc_ballot(1);
+          AscendC::Add(b, a, a, 64);
+        }
+        """,
+        chip="ascend950pr",
+    )
+    assert "AKA3009" in codes_of(result)
+
+
+def test_cann92_signatures_have_vector_engine_and_argument_roles():
+    for name in (
+        "ReduceDataBlock",
+        "ReduceRepeat",
+        "ReducePairElem",
+        "Brcb",
+        "Brcc",
+        "DataCopyGather",
+        "DataCopyScatter",
+        "Reg::Add",
+        "Reg::Mul",
+        "Reg::Div",
+        "Reg::Axpy",
+        "Reg::Exp",
+        "asc_loadalign",
+        "asc_storealign",
+    ):
+        spec = lookup_api(name)
+        assert spec is not None and spec.pipe is Pipe.V
+        assert spec.engine == "SIMD_VECTOR" and spec.latency_cycles > 0
+    assert lookup_api("ReduceDataBlock").param_at(6).name == "srcRepStride"
+    assert lookup_api("ReduceRepeat").param_at(7).name == "order"
+    assert lookup_api("Brcb").param_at(3).name == "params"
+    for name in ("asc_ballot", "asc_any", "asc_all", "asc_shfl", "asc_shfl_xor"):
+        assert lookup_api(name).engine == "SIMT_WARP"

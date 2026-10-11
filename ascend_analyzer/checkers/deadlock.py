@@ -184,15 +184,25 @@ class DeadlockChecker(Checker):
                     reserved_ids=reserved,
                 )
             elif not self.hw.is_event_id_in_range(op.event_id):
+                arch35 = self.hw.chip.name == "ascend950pr" and 4 <= op.event_id <= 7
                 self.diags.add(
                     Code.EVENT_ID_OUT_OF_RANGE,
                     Severity.FATAL,
-                    f"{op.label} uses event id {op.event_id}, outside the "
-                    f"0..{self.hw.chip.max_event_id} range the hardware provides",
+                    (
+                        f"{op.label} uses EVENT_ID{op.event_id}; event IDs >= 4 "
+                        "are unsupported on arch35 (only available on v200)"
+                        if arch35
+                        else f"{op.label} uses event id {op.event_id}, outside the "
+                        f"0..{self.hw.chip.max_event_id} range the hardware provides"
+                    ),
                     op.loc,
                     hardware_domain=op.pipe.value,
-                    remediation=f"Use EVENT_ID0..EVENT_ID{self.hw.chip.max_event_id}, "
-                    f"excluding the reserved {reserved}.",
+                    remediation=(
+                        "Use EVENT_ID0..EVENT_ID3 on arch35."
+                        if arch35
+                        else f"Use EVENT_ID0..EVENT_ID{self.hw.chip.max_event_id}, "
+                        f"excluding the reserved {reserved}."
+                    ),
                     event_id=op.event_id,
                 )
 
@@ -312,9 +322,7 @@ class DeadlockChecker(Checker):
         return views
 
     @classmethod
-    def _co_resident(
-        cls, op: FlagOp, others: Sequence[FlagOp]
-    ) -> List[FlagOp]:
+    def _co_resident(cls, op: FlagOp, others: Sequence[FlagOp]) -> List[FlagOp]:
         """The operations in *others* that run on a core *op* also runs on."""
         return [other for other in others if op.core_view.overlaps(other.core_view)]
 
@@ -364,12 +372,14 @@ class DeadlockChecker(Checker):
             # A set whose waits all sit on the opposite core (and vice versa) is
             # a cross-core hand-off, not an orphan.
             orphan_sets = [
-                op for op in entry.sets
+                op
+                for op in entry.sets
                 if not self._co_resident(op, entry.waits)
                 and not self._crosses_cores(op, entry.waits)
             ]
             orphan_waits = [
-                op for op in entry.waits
+                op
+                for op in entry.waits
                 if not self._co_resident(op, entry.sets)
                 and not self._crosses_cores(op, entry.sets)
             ]
@@ -589,7 +599,9 @@ class DeadlockChecker(Checker):
         for channel, entry in stats.items():
             regions = set(entry.sets_by_loop) | set(entry.waits_by_loop)
             for loop_id in regions:
-                sets = sorted(entry.sets_by_loop.get(loop_id, []), key=lambda o: o.index)
+                sets = sorted(
+                    entry.sets_by_loop.get(loop_id, []), key=lambda o: o.index
+                )
                 waits = sorted(
                     entry.waits_by_loop.get(loop_id, []), key=lambda o: o.index
                 )
@@ -674,17 +686,21 @@ class DeadlockChecker(Checker):
                 continue
             route, event_id = edge.channel
             waiter = edge.waiter
-            loop = kernel.loops.get(waiter.loop_id) if waiter.loop_id is not None else None
+            loop = (
+                kernel.loops.get(waiter.loop_id) if waiter.loop_id is not None else None
+            )
             loop_line = loop.loc.line if loop else waiter.loc.line
             closes = self._cycle_containing(cycles, edge.setter.index, waiter.index)
             cycle_note = (
                 " This wait also closes a circular wait across "
                 + ", ".join(
-                    sorted({
-                        op.pipe.value
-                        for op in kernel.ops
-                        if op.index in closes and op.pipe.is_real
-                    })
+                    sorted(
+                        {
+                            op.pipe.value
+                            for op in kernel.ops
+                            if op.index in closes and op.pipe.is_real
+                        }
+                    )
                 )
                 + "."
                 if closes

@@ -25,7 +25,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from math import gcd as _gcd
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Dict, FrozenSet, Iterator, List, Optional, Sequence, Set, Tuple
 
 from tree_sitter import Language, Node, Parser
 
@@ -84,6 +84,9 @@ __all__ = ["ASTVisitor", "parse_source", "parse_file", "VisitorOptions"]
 _TENSOR_TYPE_RE = re.compile(
     r"\b(?P<kind>LocalTensor|GlobalTensor)\s*<\s*(?P<dtype>[A-Za-z_][\w:]*)\s*>"
 )
+_REGISTER_TYPE_RE = re.compile(
+    r"\b(?P<kind>RegTensor|RegTile)\s*<\s*(?P<dtype>[A-Za-z_][\w:]*)"
+)
 #: Bound on nested single-return helper folding.
 _MAX_HELPER_DEPTH = 8
 #: Bound on call-graph inlining depth.
@@ -99,7 +102,9 @@ _QUEUE_DEPTH_RE = re.compile(
 
 #: ``hidden_``, ``this->hidden_`` and ``obj.hidden_`` all name one member; a
 #: subscript or call target is not a scalar member and is rejected.
-_MEMBER_TARGET_RE = re.compile(r"^(?:this\s*->\s*|[A-Za-z_]\w*\s*\.\s*)?([A-Za-z_]\w*)$")
+_MEMBER_TARGET_RE = re.compile(
+    r"^(?:this\s*->\s*|[A-Za-z_]\w*\s*\.\s*)?([A-Za-z_]\w*)$"
+)
 
 
 def _strip_template_args(name: str) -> str:
@@ -244,7 +249,11 @@ _CUBE_DOMAINS = frozenset(
 
 #: Receiver spellings a kernel uses to reach its tiling struct.
 _TILING_RECEIVERS = (
-    "tilingData", "tiling_data", "tiling", "tilingDataPtr", "tilingPtr",
+    "tilingData",
+    "tiling_data",
+    "tiling",
+    "tilingDataPtr",
+    "tilingPtr",
 )
 
 #: Accessors that hand out storage from a TPipe-managed buffer, and the
@@ -286,16 +295,47 @@ class PipeBuffer:
     def total_bytes(self) -> Optional[Expr]:
         if self.block_bytes is None:
             return None
-        return mul(self.block_bytes, Const(self.depth)) if self.depth > 1 else self.block_bytes
+        return (
+            mul(self.block_bytes, Const(self.depth))
+            if self.depth > 1
+            else self.block_bytes
+        )
+
+
 _LEADING_IDENT_RE = re.compile(r"^\s*\(*\s*(?:[A-Za-z_]\w*::)*(?P<name>[A-Za-z_]\w*)")
 
 #: Scalar type words that may appear as the operand of a C-style cast.
-_BUILTIN_TYPE_WORDS = frozenset({
-    "void", "bool", "char", "int", "float", "double", "half", "long", "short",
-    "signed", "unsigned", "size_t", "uintptr_t", "intptr_t", "ptrdiff_t",
-    "auto", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32",
-    "uint64", "bfloat16", "int4b_t", "uint4b_t",
-})
+_BUILTIN_TYPE_WORDS = frozenset(
+    {
+        "void",
+        "bool",
+        "char",
+        "int",
+        "float",
+        "double",
+        "half",
+        "long",
+        "short",
+        "signed",
+        "unsigned",
+        "size_t",
+        "uintptr_t",
+        "intptr_t",
+        "ptrdiff_t",
+        "auto",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "bfloat16",
+        "int4b_t",
+        "uint4b_t",
+    }
+)
 _TYPE_NAME_RE = re.compile(r"^(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*$")
 
 
@@ -343,6 +383,7 @@ def _strip_leading_casts(text: str) -> str:
         changed = True
     return cleaned
 
+
 #: Methods that bind a tensor's base byte offset.
 _SET_OFFSET_METHODS = frozenset({"SetAddr", "SetBufferAddr", "SetAddrByByte"})
 #: Methods that bind a tensor's length in *elements*.
@@ -356,7 +397,9 @@ _USE_METHODS = frozenset(
     {"GetValue", "SetValue", "GetPhyAddr", "GetSize", "GetLength", "Get", "operator[]"}
 )
 #: Factory calls that yield a fully specified local tensor.
-_TENSOR_FACTORIES = frozenset({"GetLocalTensor", "CreateLocalTensor", "MakeLocalTensor"})
+_TENSOR_FACTORIES = frozenset(
+    {"GetLocalTensor", "CreateLocalTensor", "MakeLocalTensor"}
+)
 #: Buffer accessor methods returning a sub-tensor at a byte offset.
 #: Byte-first buffer accessors: the single argument is a byte offset.
 #: (``GetWithOffset`` is NOT here: its CANN signature is
@@ -369,8 +412,9 @@ _BARRIER_NAMES = frozenset({"PipeBarrier", "pipe_barrier"})
 
 _EVENT_ID_RE = re.compile(r"^EVENT_ID(?P<n>\d+)$")
 
-_LOOP_NODE_TYPES = frozenset({"for_statement", "while_statement", "do_statement",
-                              "for_range_loop"})
+_LOOP_NODE_TYPES = frozenset(
+    {"for_statement", "while_statement", "do_statement", "for_range_loop"}
+)
 
 
 @dataclass
@@ -472,6 +516,8 @@ class ASTVisitor:
         #: size its ``InitBuffer`` reserves.  Unit-wide because the declaration,
         #: the sizing call and the ``Get<T>()`` live in different scopes.
         self._pipe_buffers: Dict[str, "PipeBuffer"] = {}
+        #: GlobalTensor fields remain in the GM domain across member methods.
+        self._global_tensor_members: Dict[str, str] = {}
 
     # -- entry point --------------------------------------------------------
 
@@ -488,6 +534,7 @@ class ASTVisitor:
         self._collect_helper_functions(root)
         self._collect_scalar_members(root)
         self._collect_pipe_buffers(root)
+        self._collect_global_tensor_members(root)
         if self.opts.infer_tiling_roles:
             # Between the two buffer phases: inference needs each
             # buffer's TPosition, and the sizing phase needs the values
@@ -539,7 +586,9 @@ class ASTVisitor:
     # -- shared helpers used by the per-kernel walker -----------------------
 
     def text(self, node: Node) -> str:
-        return self._source_bytes[node.start_byte : node.end_byte].decode("utf-8", "replace")
+        return self._source_bytes[node.start_byte : node.end_byte].decode(
+            "utf-8", "replace"
+        )
 
     def loc(self, node: Node) -> SourceLoc:
         start_row, start_col = node.start_point
@@ -616,8 +665,9 @@ class ASTVisitor:
         for event_id in range(self.hw.chip.max_event_id + 1):
             self._global_env.define(f"EVENT_ID{event_id}", event_id)
         for name, body in self.prepared.macro_object_defs:
-            value = collect_define_value(self._eval, self._parser, body,
-                                         self._global_env)
+            value = collect_define_value(
+                self._eval, self._parser, body, self._global_env
+            )
             if value is not None:
                 self._global_env.define(name, value)
 
@@ -809,9 +859,7 @@ class ASTVisitor:
         domain = self.hw.domain_of(buffer.position)
         return _CUBE_MIN_FRACTAL if domain in _CUBE_DOMAINS else _VECTOR_MIN_TILE
 
-    def _tiling_aliases(
-        self, root: Node, pointers: Set[str]
-    ) -> Dict[str, Set[str]]:
+    def _tiling_aliases(self, root: Node, pointers: Set[str]) -> Dict[str, Set[str]]:
         """``{name: tiling accesses that flow into it}`` for single assignments.
 
         A name written more than once anywhere in the unit is excluded: it may
@@ -988,7 +1036,8 @@ class ASTVisitor:
         env = self._global_env.child()
         function = call
         while function is not None and function.type not in {
-            "function_definition", "lambda_expression"
+            "function_definition",
+            "lambda_expression",
         }:
             function = function.parent
         if function is None:
@@ -1078,7 +1127,9 @@ class ASTVisitor:
                 if depth is None:
                     depth = 1  # InitBuffer(que, num, len) overrides this
             else:
-                match = _TBUF_TYPE_RE.search(type_text) or _TBUF_TYPE_RE.search(decl_text)
+                match = _TBUF_TYPE_RE.search(type_text) or _TBUF_TYPE_RE.search(
+                    decl_text
+                )
                 if match is None:
                     continue
                 position = TPosition.parse(match.group("pos"))
@@ -1103,6 +1154,22 @@ class ASTVisitor:
 
         for name in ambiguous:
             self._pipe_buffers.pop(name, None)
+
+    def _collect_global_tensor_members(self, root: Node) -> None:
+        """Index GlobalTensor class fields for each method walker."""
+        for node in _walk(root):
+            if node.type != "field_declaration":
+                continue
+            type_node = node.child_by_field_name("type")
+            match = _TENSOR_TYPE_RE.search(self.text(type_node)) if type_node else None
+            if match is None or match.group("kind") != "GlobalTensor":
+                continue
+            for declarator in node.children_by_field_name("declarator"):
+                name_node = _declarator_identifier(declarator)
+                if name_node is not None:
+                    self._global_tensor_members[self.text(name_node)] = match.group(
+                        "dtype"
+                    )
 
     def _size_pipe_buffers(self, root: Node) -> None:
         """Evaluate every ``InitBuffer``/``InitQueue`` extent.
@@ -1183,9 +1250,7 @@ class ASTVisitor:
             if node.type == "function_definition":
                 # Still visit the signature, just not the body.
                 body = node.child_by_field_name("body")
-                stack.extend(
-                    reversed([c for c in node.children if c is not body])
-                )
+                stack.extend(reversed([c for c in node.children if c is not body]))
                 continue
             stack.extend(reversed(node.children))
 
@@ -1277,7 +1342,8 @@ class ASTVisitor:
         would report nothing at all.
         """
         launches = [
-            f for f in functions
+            f
+            for f in functions
             if self.prepared.has_launch_attribute_before(f.start_byte)
         ]
         if not launches:
@@ -1295,7 +1361,9 @@ class ASTVisitor:
             # Only suppress a definition some call site actually resolves to;
             # otherwise it would be dropped from the report without ever being
             # inlined anywhere.
-            if self.resolve_callee(name, owner) is not self._functions.get((owner, name)):
+            if self.resolve_callee(name, owner) is not self._functions.get(
+                (owner, name)
+            ):
                 continue
             covered.add(func)
         return covered
@@ -1420,11 +1488,30 @@ class _KernelWalker:
                 if folded is not None:
                     self.ir.buffer_sizes[buf.name] = folded
         self._truncated = False
+        body = func.child_by_field_name("body")
+        header = self.v.prepared.rewritten_bytes[
+            max(0, func.start_byte - 32) : (
+                body.start_byte if body is not None else func.end_byte
+            )
+        ]
+        self._simt_mode = b"/*SIMT_VF*/" in header
 
     # -- public -------------------------------------------------------------
 
     def build(self) -> KernelIR:
         body = self.func.child_by_field_name("body")
+        for name, dtype in self.v._global_tensor_members.items():
+            self.ir.tensors[name] = TensorDecl(
+                name=name,
+                loc=self._loc(self.func),
+                position=TPosition.GM,
+                domain=PhysicalDomain.GM,
+                dtype=dtype,
+                elem_size=dtype_size(dtype),
+                scope_id=0,
+                origin="GlobalTensor member",
+                unbound=True,
+            )
         self._register_parameters()
         if body is not None:
             self._visit_block(body, ScopeKind.KERNEL)
@@ -1505,9 +1592,9 @@ class _KernelWalker:
 
     # -- parameters ---------------------------------------------------------
 
-    def _register_parameters(self) -> None:
-        """Register ``__gm__`` pointer parameters as global-memory tensors."""
-        declarator = self.func.child_by_field_name("declarator")
+    def _register_parameters(self, func: Optional[Node] = None) -> None:
+        """Register GM pointer and GlobalTensor parameters of a function."""
+        declarator = (func or self.func).child_by_field_name("declarator")
         if declarator is None:
             return
         params = declarator.child_by_field_name("parameters")
@@ -1525,17 +1612,32 @@ class _KernelWalker:
             domain = self.v.prepared.address_space_for_range(
                 param.start_byte, param.end_byte
             )
-            is_gm_addr = "GM_ADDR" in type_text or domain is PhysicalDomain.GM
-            if not is_gm_addr:
+            is_gm_addr = (
+                "GM_ADDR" in type_text
+                or domain is PhysicalDomain.GM
+                or "GlobalTensor" in type_text
+            )
+            is_reg = bool(_REGISTER_TYPE_RE.search(type_text))
+            if not is_gm_addr and not is_reg:
                 continue
+            raw_tokens = re.sub(
+                r"\b(?:const|volatile|__gm__|GM_ADDR|AscendC)\b|[*&:]",
+                " ",
+                type_text,
+            ).split()
+            dtype = _template_dtype(type_text) or (
+                raw_tokens[-1] if raw_tokens else None
+            )
             self.ir.tensors[name] = TensorDecl(
                 name=name,
                 loc=self._loc(param),
-                position=TPosition.GM,
-                domain=PhysicalDomain.GM,
-                dtype=_template_dtype(type_text),
+                position=TPosition.GM if is_gm_addr else None,
+                domain=PhysicalDomain.GM if is_gm_addr else PhysicalDomain.REG,
+                dtype=dtype,
+                elem_size=dtype_size(dtype),
                 scope_id=0,
                 origin="kernel parameter",
+                register_slots=1 if is_reg else 0,
             )
 
     # -- statement dispatch -------------------------------------------------
@@ -1552,7 +1654,13 @@ class _KernelWalker:
         kind = node.type
 
         if kind == "compound_statement":
-            self._visit_block(node, ScopeKind.BLOCK)
+            prefix = self.v.prepared.rewritten_bytes[
+                max(0, node.start_byte - 128) : node.start_byte
+            ].decode("utf-8", errors="ignore")
+            vec_scope = bool(re.search(r"/\*VEC_SCOPE\*/\s*$", prefix))
+            self._visit_block(
+                node, ScopeKind.VEC_SCOPE if vec_scope else ScopeKind.BLOCK
+            )
             return
         if kind == "declaration":
             self._handle_declaration(node)
@@ -1598,7 +1706,9 @@ class _KernelWalker:
         # core at all: for any other `#ifdef` both arms stay resident on both,
         # since the complement of "both cores" is "neither" and would silently
         # drop the else arm of every unrelated conditional.
-        otherwise = selected.complement if selected is not CoreView.BOTH else CoreView.BOTH
+        otherwise = (
+            selected.complement if selected is not CoreView.BOTH else CoreView.BOTH
+        )
         self._conditional_depth += 1
         try:
             for child in node.named_children:
@@ -1735,7 +1845,9 @@ class _KernelWalker:
 
     # -- three-phase loop peeling -------------------------------------------
 
-    def _plan_peeling(self, loop: LoopInfo, body: Optional[Node]) -> Optional[_PeeledPlan]:
+    def _plan_peeling(
+        self, loop: LoopInfo, body: Optional[Node]
+    ) -> Optional[_PeeledPlan]:
         """Plan a head / steady-state / tail traversal for a long loop.
 
         Full unrolling explodes past ``unroll_trip_limit`` iterations, but a
@@ -1797,9 +1909,7 @@ class _KernelWalker:
         end = start + (loop.trip_count - 1) * step
         reachable = {v for v in switches if start <= v <= end}
         early = {v for v in reachable if (v - start) // step <= window}
-        late = {
-            v for v in reachable if (end - v) // step <= window and v not in early
-        }
+        late = {v for v in reachable if (end - v) // step <= window and v not in early}
         if reachable - early - late:
             # A condition flips mid-loop: the prologue/steady/epilogue model
             # does not apply, so keep the exact symbolic treatment.
@@ -1878,17 +1988,19 @@ class _KernelWalker:
         if slope < 0:
             # Normalise to a positive slope by negating the comparison.
             slope, intercept = -slope, -intercept
-            op = {"<": ">", ">": "<", "<=": ">=", ">=": "<=", "==": "==", "!=": "!="}[op]
+            op = {"<": ">", ">": "<", "<=": ">=", ">=": "<=", "==": "==", "!=": "!="}[
+                op
+            ]
 
         # The condition reads slope*t + intercept <op> 0 with slope > 0.
-        ceil_r = -(-(-intercept) // slope)   # ceil((-intercept) / slope)
-        floor_r = (-intercept) // slope      # floor((-intercept) / slope)
+        ceil_r = -(-(-intercept) // slope)  # ceil((-intercept) / slope)
+        floor_r = (-intercept) // slope  # floor((-intercept) / slope)
         if op == ">=":
-            return {ceil_r}                  # false -> true at ceil_r
+            return {ceil_r}  # false -> true at ceil_r
         if op == ">":
             return {floor_r + 1}
         if op == "<":
-            return {ceil_r}                  # true -> false at ceil_r
+            return {ceil_r}  # true -> false at ceil_r
         if op == "<=":
             return {floor_r + 1}
         # Point conditions flip on at v and flip back off at v + 1.
@@ -1970,7 +2082,9 @@ class _KernelWalker:
         update = node.child_by_field_name("update")
 
         if init is None or condition is None:
-            init, condition, update = _scan_for_header_parts(node, init, condition, update)
+            init, condition, update = _scan_for_header_parts(
+                node, init, condition, update
+            )
 
         start = 0
         start_known = False
@@ -2061,7 +2175,9 @@ class _KernelWalker:
         condition = node.child_by_field_name("condition")
         if condition is not None:
             self._scan_for_ops(condition)
-        folded = self.v._eval.fold(condition, self._env) if condition is not None else None
+        folded = (
+            self.v._eval.fold(condition, self._env) if condition is not None else None
+        )
         if folded is not None:
             # A compile-time-constant condition selects its arm for every
             # execution; walking only the taken branch keeps the trace exact
@@ -2154,6 +2270,11 @@ class _KernelWalker:
             self._declare_tensors(node, tensor_match)
             self._scan_for_ops(node)
             return
+        register_match = _REGISTER_TYPE_RE.search(type_text)
+        if register_match is not None:
+            self._declare_registers(node, register_match, type_text)
+            self._scan_for_ops(node)
+            return
 
         # ``auto x = que.AllocTensor<T>();`` / ``auto y = buf.Get<T>();`` --
         # the initializer's template argument names the element type, so the
@@ -2188,7 +2309,11 @@ class _KernelWalker:
                 declarator.child_by_field_name("declarator")
             )
             value_node = declarator.child_by_field_name("value")
-            if name_node is None or name_node.type != "identifier" or value_node is None:
+            if (
+                name_node is None
+                or name_node.type != "identifier"
+                or value_node is None
+            ):
                 continue
             folded = self.v._eval.fold(value_node, self._env)
             if folded is not None:
@@ -2225,6 +2350,40 @@ class _KernelWalker:
                 self._bind_from_initializer(decl, value_node)
             self.ir.tensors[name] = decl
 
+    def _declare_registers(self, node: Node, match: re.Match, type_text: str) -> None:
+        """Represent VF register values separately from UB-backed tensors."""
+        dtype = match.group("dtype").rsplit("::", 1)[-1]
+        slots = 2 if "RegTraitNumTwo" in type_text else 1
+        if match.group("kind") == "RegTile":
+            shape = re.search(r"RegTile\s*<[^,>]+,\s*(\d+)\s*,\s*(\d+)", type_text)
+            if shape and dtype_size(dtype):
+                slots = max(
+                    slots,
+                    -(
+                        -int(shape.group(1))
+                        * int(shape.group(2))
+                        * dtype_size(dtype)
+                        // self.v.hw.chip.vector_bytes
+                    ),
+                )
+        for declarator in node.children_by_field_name("declarator"):
+            name_node = _declarator_identifier(declarator)
+            if name_node is None:
+                continue
+            name = self._text(name_node)
+            self.ir.tensors[name] = TensorDecl(
+                name=name,
+                loc=self._loc(declarator),
+                position=None,
+                domain=PhysicalDomain.REG,
+                dtype=dtype,
+                elem_size=dtype_size(dtype),
+                scope_id=self._scope_id,
+                origin=f"{match.group('kind')} declaration",
+                register_slots=slots,
+                declaration_index=self._index,
+            )
+
     def _declare_auto_tensors(self, node: Node) -> bool:
         """Declare ``auto x = <tensor accessor call>();`` locals as tensors.
 
@@ -2239,9 +2398,15 @@ class _KernelWalker:
         for declarator in node.children_by_field_name("declarator"):
             if declarator.type != "init_declarator":
                 continue
-            name_node = _declarator_identifier(declarator.child_by_field_name("declarator"))
+            name_node = _declarator_identifier(
+                declarator.child_by_field_name("declarator")
+            )
             value_node = declarator.child_by_field_name("value")
-            if name_node is None or name_node.type != "identifier" or value_node is None:
+            if (
+                name_node is None
+                or name_node.type != "identifier"
+                or value_node is None
+            ):
                 continue
             dtype = _auto_tensor_dtype(self.v, value_node)
             if dtype is None:
@@ -2353,6 +2518,13 @@ class _KernelWalker:
                 decl.origin = "alias"
             return
 
+        if value.type == "field_expression":
+            source = self.ir.tensors.get(_member_target_name(self._text(value)) or "")
+            if source is not None:
+                self._alias_from(decl, source, element_offset=None)
+                decl.origin = "member alias"
+            return
+
         if value.type == "subscript_expression":
             argument = value.child_by_field_name("argument")
             index = _subscript_index(value)
@@ -2379,9 +2551,7 @@ class _KernelWalker:
                 self._assign_position(decl, self._buffer_positions[receiver])
                 self._tensor_buffers[decl.name] = receiver
                 decl.source_buffer = receiver
-                decl.view_element_offset = self.v._eval.evaluate(
-                    index, self._env
-                )
+                decl.view_element_offset = self.v._eval.evaluate(index, self._env)
                 decl.unbound = True
                 decl.origin = "buffer view"
             return
@@ -2440,7 +2610,9 @@ class _KernelWalker:
                 if declarator.type == "init_declarator"
                 else None
             )
-            offset = self.v._eval.evaluate(value_node, self._env) if value_node else None
+            offset = (
+                self.v._eval.evaluate(value_node, self._env) if value_node else None
+            )
             self.ir.tensors[name] = TensorDecl(
                 name=name,
                 loc=self._loc(node),
@@ -2464,6 +2636,43 @@ class _KernelWalker:
         """Emit operations for every recognised call in ``node``, in order."""
         for call in _call_expressions(node):
             self._handle_call(call)
+        if self._simt_mode:
+            for access in _walk(node):
+                if access.type == "subscript_expression":
+                    self._record_simt_access(access)
+
+    def _record_simt_access(self, node: Node) -> None:
+        base_node = node.child_by_field_name("argument")
+        index_node = _subscript_index(node)
+        if base_node is None or index_node is None:
+            return
+        name = self._resolve_tensor_arg(base_node, self._text(base_node))
+        tensor = self.ir.tensors.get(name or "")
+        if tensor is None or tensor.domain is not PhysicalDomain.GM:
+            return
+        element = to_int(self.v._eval.evaluate(index_node, self._env))
+        offset = (
+            element * tensor.elem_size
+            if element is not None and tensor.elem_size
+            else None
+        )
+        if offset is not None and tensor.offset_value is not None:
+            offset += tensor.offset_value
+        self._emit(
+            ApiCallOp(
+                pipe=Pipe.V,
+                name="SIMT_GM_ACCESS",
+                args=(
+                    ArgRef(0, name or "", tensor=name),
+                    ArgRef(1, self._text(index_node), value=offset),
+                    ArgRef(2, "element_bytes", value=tensor.elem_size),
+                ),
+                reads=(name or "",),
+                text=self._text(node),
+                **self._next_op_args(node),
+            )
+        )
+        self._record_use(tensor, self._loc(node))
 
     def _handle_call(self, node: Node) -> None:
         func = node.child_by_field_name("function")
@@ -2489,9 +2698,18 @@ class _KernelWalker:
             self._handle_init_buffer(node)
             return
 
-        spec = lookup_api(base)
+        qualified = self._text(func)
+        api_name = f"Reg::{base}" if re.search(r"\bReg\s*::", qualified) else base
+        if api_name == base and lookup_api(f"Reg::{base}") is not None:
+            if any(
+                (tensor_name := self._resolve_tensor_arg(arg, self._text(arg)))
+                and self.ir.tensors[tensor_name].domain is PhysicalDomain.REG
+                for arg in _argument_nodes(node)
+            ):
+                api_name = f"Reg::{base}"
+        spec = lookup_api(api_name)
         if spec is not None:
-            self._handle_api_call(node, base, spec)
+            self._handle_api_call(node, api_name, spec)
             return
 
         receiver = _field_receiver_name(self.v, func)
@@ -2542,9 +2760,16 @@ class _KernelWalker:
 
         self._inline_stack.append(base)
         self._env_stack.append(env)
+        previous_simt_mode = self._simt_mode
+        header = self.v.prepared.rewritten_bytes[
+            max(0, definition.start_byte - 32) : body.start_byte
+        ]
+        self._simt_mode = b"/*SIMT_VF*/" in header
         try:
+            self._register_parameters(definition)
             self._visit_block(body, ScopeKind.INLINE)
         finally:
+            self._simt_mode = previous_simt_mode
             self._env_stack.pop()
             self._inline_stack.pop()
         self.ir.inlined.append(base)
@@ -2667,9 +2892,7 @@ class _KernelWalker:
                 parsed = Pipe.parse(self._text(args[0]))
                 if parsed is not None:
                     target = parsed
-        self._emit(
-            BarrierOp(pipe=target, target=target, **self._next_op_args(node))
-        )
+        self._emit(BarrierOp(pipe=target, target=target, **self._next_op_args(node)))
 
     # -- tensor methods -----------------------------------------------------
 
@@ -2813,10 +3036,36 @@ class _KernelWalker:
         candidate = _leading_identifier(_strip_leading_casts(text))
         if candidate and candidate in self.ir.tensors:
             return candidate
+        member = _member_target_name(text)
+        if member and member in self.ir.tensors:
+            return member
+        if node.type == "call_expression":
+            func = node.child_by_field_name("function")
+            if _callee_base_name(self.v, func) == "GetWithOffset":
+                dtype = _auto_tensor_dtype(self.v, node)
+                if dtype is not None:
+                    name = f"__accessor_{node.start_byte}"
+                    if name not in self.ir.tensors:
+                        decl = TensorDecl(
+                            name=name,
+                            loc=self._loc(node),
+                            position=None,
+                            domain=PhysicalDomain.UNKNOWN,
+                            dtype=dtype,
+                            elem_size=dtype_size(dtype),
+                            scope_id=self._scope_id,
+                            origin="direct buffer accessor",
+                            unbound=True,
+                        )
+                        self._bind_from_initializer(decl, node)
+                        self.ir.tensors[name] = decl
+                    return name
+        if node.type == "subscript_expression":
+            argument = node.child_by_field_name("argument")
+            if argument is not None:
+                return self._resolve_tensor_arg(argument, self._text(argument))
         if node.type == "parenthesized_expression":
-            inner = next(
-                (c for c in node.named_children if c.type != "comment"), None
-            )
+            inner = next((c for c in node.named_children if c.type != "comment"), None)
             if inner is not None:
                 return self._resolve_tensor_arg(inner, self._text(inner))
         if node.type == "cast_expression":
@@ -2903,7 +3152,11 @@ class _KernelWalker:
             if decl.byte_size is None and decl.elem_count is not None:
                 if decl.elem_size:
                     decl.byte_size = mul(decl.elem_count, Const(decl.elem_size))
-            if decl.elem_count is None and decl.byte_size is not None and decl.elem_size:
+            if (
+                decl.elem_count is None
+                and decl.byte_size is not None
+                and decl.elem_size
+            ):
                 size = to_int(decl.byte_size)
                 if size is not None and decl.elem_size:
                     decl.elem_count = Const(size // decl.elem_size)
