@@ -325,12 +325,13 @@ def _build_table() -> Dict[str, ApiSpec]:
             )
         )
 
-    # CANN 9.2 reduction overloads accept a contiguous mask or uint64_t[2]
-    # lane mask, followed by repeat count and DataBlock strides.
+    # CANN 9.2 LocalTensor overloads accept a contiguous mask or uint64_t[2]
+    # lane mask, followed by repeat count and DataBlock strides.  Both tensor
+    # operands must reside in UB; RegTensor has a distinct MicroAPI overload.
     for name in ("ReduceDataBlock", "ReduceRepeat", "ReducePairElem"):
         params = (
-            _p(ArgRole.DST, _UB_OR_REG, "dst"),
-            _p(ArgRole.SRC, _UB_OR_REG, "src"),
+            _p(ArgRole.DST, _UB, "dst"),
+            _p(ArgRole.SRC, _UB, "src"),
             _p(ArgRole.PARAMS, ANY_TENSOR, "mask"),
             _p(ArgRole.COUNT, ANY_TENSOR, "repeatTime"),
             _p(ArgRole.PARAMS, ANY_TENSOR, "dstRepStride"),
@@ -345,11 +346,27 @@ def _build_table() -> Dict[str, ApiSpec]:
                 params=params,
                 pipe=Pipe.V,
                 category="vector",
-                doc="CANN 9.2 vector reduction in UB or vector registers.",
+                doc="CANN 9.2 LocalTensor vector reduction in UB.",
                 engine="SIMD_VECTOR",
                 latency_cycles=4,
             )
         )
+
+    put(
+        ApiSpec(
+            name="Reg::ReduceDataBlock",
+            params=(
+                _p(ArgRole.DST, _REG, "dstReg"),
+                _p(ArgRole.SRC, _REG, "srcReg"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "mask"),
+            ),
+            pipe=Pipe.V,
+            category="vector",
+            doc="RegTensor DataBlock reduction MicroAPI.",
+            engine="SIMD_VECTOR",
+            latency_cycles=4,
+        )
+    )
 
     put(
         ApiSpec(
@@ -404,10 +421,10 @@ def _build_table() -> Dict[str, ApiSpec]:
         ApiSpec(
             name="Brcb",
             params=(
-                _p(ArgRole.DST, _UB_OR_REG, "dst"),
-                _p(ArgRole.SRC, _UB_OR_REG, "src"),
-                _p(ArgRole.OTHER, ANY_TENSOR, "repeat"),
-                _p(ArgRole.PARAMS, ANY_TENSOR, "params"),
+                _p(ArgRole.DST, _UB, "dstLocal"),
+                _p(ArgRole.SRC, _UB, "src0Local"),
+                _p(ArgRole.COUNT, ANY_TENSOR, "repeatTimes"),
+                _p(ArgRole.PARAMS, ANY_TENSOR, "repeatParams"),
             ),
             pipe=Pipe.V,
             category="vector",

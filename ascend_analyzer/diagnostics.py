@@ -119,7 +119,7 @@ CODE_TITLES: Dict[str, str] = {
     Code.UNSUPPORTED_INTRINSIC.value: "Intrinsic unsupported on target architecture",
     Code.UNMATCHED_SET_FLAG.value: "SetFlag without matching WaitFlag",
     Code.UNMATCHED_WAIT_FLAG.value: "WaitFlag without matching SetFlag",
-    Code.RESERVED_EVENT_ID.value: "Reserved EVENT_ID used",
+    Code.RESERVED_EVENT_ID.value: "Reserved or unavailable EVENT_ID used",
     Code.DEADLOCK_CYCLE.value: "Pipeline deadlock (circular wait)",
     Code.UNPRIMED_LOOP_WAIT.value: "Unprimed loop-carried WaitFlag",
     Code.LOOP_FLAG_IMBALANCE.value: "SetFlag/WaitFlag imbalance in loop body",

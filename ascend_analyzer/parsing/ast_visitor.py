@@ -1468,6 +1468,10 @@ class _KernelWalker:
         self._buffer_blocks: Dict[str, Expr] = {}
         #: Callees currently being inlined, innermost last; the recursion guard.
         self._inline_stack: List[str] = []
+        #: Callee tensor parameter -> caller tensor, scoped to each inline.
+        #: Keeping the caller binding preserves TBuf accessor offsets across
+        #: SIMT helpers instead of creating an unlocated parameter tensor.
+        self._tensor_param_stack: List[Dict[str, str]] = []
         #: Core whose binary the region being walked belongs to.
         self._core_view_current: CoreView = CoreView.BOTH
         #: Class owning the function being walked, so an unqualified call
@@ -2284,6 +2288,13 @@ class _KernelWalker:
             if self._declare_auto_tensors(node):
                 return
 
+        # GM_ADDR is a pointer typedef, so a local alias has no literal '*'
+        # for the raw address-space pointer branch below to recognise.
+        if re.search(r"\bGM_ADDR\b", type_text):
+            self._declare_raw_pointers(node, PhysicalDomain.GM, type_text)
+            self._scan_for_ops(node)
+            return
+
         # ``constexpr``/``const`` scalars feed the folding environment.
         self.v._collect_constexpr(node, self._env)
 
@@ -2753,12 +2764,17 @@ class _KernelWalker:
             return False
 
         env = self._env.child()
+        tensor_params: Dict[str, str] = {}
         for param, arg in zip(params, _argument_nodes(node)):
             folded = self.v._eval.fold(arg, self._env)
             if folded is not None:
                 env.define(param, folded)
+            tensor_name = self._resolve_tensor_arg(arg, self._text(arg))
+            if tensor_name is not None:
+                tensor_params[param] = tensor_name
 
         self._inline_stack.append(base)
+        self._tensor_param_stack.append(tensor_params)
         self._env_stack.append(env)
         previous_simt_mode = self._simt_mode
         header = self.v.prepared.rewritten_bytes[
@@ -2771,6 +2787,7 @@ class _KernelWalker:
         finally:
             self._simt_mode = previous_simt_mode
             self._env_stack.pop()
+            self._tensor_param_stack.pop()
             self._inline_stack.pop()
         self.ir.inlined.append(base)
         return True
@@ -3034,6 +3051,10 @@ class _KernelWalker:
     def _resolve_tensor_arg(self, node: Node, text: str) -> Optional[str]:
         """Map an argument expression back to a declared tensor name."""
         candidate = _leading_identifier(_strip_leading_casts(text))
+        if candidate:
+            for aliases in reversed(self._tensor_param_stack):
+                if candidate in aliases:
+                    return aliases[candidate]
         if candidate and candidate in self.ir.tensors:
             return candidate
         member = _member_target_name(text)

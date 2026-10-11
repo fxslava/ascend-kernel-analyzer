@@ -186,11 +186,14 @@ class DeadlockChecker(Checker):
             elif not self.hw.is_event_id_in_range(op.event_id):
                 arch35 = self.hw.chip.name == "ascend950pr" and 4 <= op.event_id <= 7
                 self.diags.add(
-                    Code.EVENT_ID_OUT_OF_RANGE,
+                    # The configured arch35 profile treats these four names
+                    # as unavailable. Report the fatal ID hygiene code used
+                    # for IDs a kernel cannot legally claim.
+                    Code.RESERVED_EVENT_ID if arch35 else Code.EVENT_ID_OUT_OF_RANGE,
                     Severity.FATAL,
                     (
                         f"{op.label} uses EVENT_ID{op.event_id}; event IDs >= 4 "
-                        "are unsupported on arch35 (only available on v200)"
+                        "are unsupported on arch35 by the configured profile"
                         if arch35
                         else f"{op.label} uses event id {op.event_id}, outside the "
                         f"0..{self.hw.chip.max_event_id} range the hardware provides"

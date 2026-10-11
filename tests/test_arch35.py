@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from ascend_analyzer import AnalyzerOptions, KernelAnalyzer
 from ascend_analyzer.apis import lookup_api
 from ascend_analyzer.diagnostics import Severity
@@ -12,18 +14,20 @@ from ascend_analyzer.ir import ScopeKind
 from conftest import analyze, analyze_body, codes_of, find
 
 
-def test_arch35_profile_and_event_id4_is_fatal():
+@pytest.mark.parametrize("chip", ["ascend950pr", "dav-3510"])
+@pytest.mark.parametrize("event_id", range(4, 8))
+def test_arch35_profile_and_unavailable_event_ids_are_fatal(chip, event_id):
     hw = HardwareModel.for_chip("arch35")
     assert hw.chip.name == "ascend950pr"
     assert hw.chip.max_event_id == 3
     assert hw.chip.ub_total_bytes == 256 * 1024
     assert hw.chip.max_usable_ub_bytes == 216 * 1024
     result = analyze_body(
-        "AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID4);\n"
-        "AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID4);",
-        chip="ascend950pr",
+        f"AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID{event_id});\n"
+        f"AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID{event_id});",
+        chip=chip,
     )
-    bad = find(result, "AKA2008")
+    bad = find(result, "AKA2003")
     assert len(bad) == 2
     assert all(d.severity is Severity.FATAL for d in bad)
     assert "unsupported on arch35" in bad[0].message
@@ -39,6 +43,33 @@ def test_arch35_tensor_allocation_ceiling_applies_without_simt_marker():
         chip="ascend950pr",
     )
     assert "AKA1010" in codes_of(result)
+
+
+@pytest.mark.parametrize("marker", ["asc_call_vf", "__simt_vf__"])
+@pytest.mark.parametrize("allocation_kib, rejected", [(216, False), (217, True)])
+def test_simt_datacache_reserves_32_kib_at_ub_boundary(marker, allocation_kib, rejected):
+    call = "vf(local);" if marker == "__simt_vf__" else "asc_call_vf(local, 0);"
+    helper = (
+        "__simt_vf__ void vf(AscendC::LocalTensor<half> t) { asc_ballot(1); }"
+        if marker == "__simt_vf__"
+        else ""
+    )
+    source = f"""
+    {helper}
+    extern "C" __global__ __aicore__ void test_kernel() {{
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+    pipe.InitBuffer(ub, {allocation_kib} * 1024);
+    auto local = ub.GetWithOffset<half>(64, 0);
+    {call}
+    }}
+    """
+    result = analyze(source, chip="ascend950pr")
+    bad = find(result, "AKA1010")
+    assert bool(bad) is rejected
+    if rejected:
+        assert bad[0].severity is Severity.FATAL
+        assert bad[0].details["required_bytes"] == 32 * 1024
 
 
 def test_uncalibrated_arch35_timing_does_not_emit_perf_warnings():
@@ -66,6 +97,24 @@ def test_cann92_reduction_between_barriers_is_not_redundant():
     assert any(
         getattr(op, "name", "") == "ReduceDataBlock" and op.pipe is Pipe.V for op in ops
     )
+
+
+def test_reduction_followed_by_pipe_v_barrier_has_zero_warnings():
+    result = analyze_body(
+        """
+        AscendC::TPipe pipe;
+        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        pipe.InitBuffer(ub, 512);
+        auto src = ub.GetWithOffset<float>(64, 0);
+        auto dst = ub.GetWithOffset<float>(8, 256);
+        AscendC::ReduceDataBlock<AscendC::ReduceType::SUM, float, float>(
+            dst, src, 64, 1, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        """,
+        chip="ascend950pr",
+    )
+    assert not [d for d in result.diagnostics if d.severity is Severity.WARNING]
+    assert "AKA3005" not in codes_of(result)
 
 
 def test_direct_get_with_offset_operand_has_ub_domain():
@@ -122,6 +171,54 @@ def test_member_and_parameter_global_tensor_stores_use_mte3():
     assert "AKA2010" not in codes_of(result)
 
 
+def test_member_global_tensor_initialized_from_gm_addr_stays_on_mte3():
+    source = """
+    class Writer {
+      AscendC::GlobalTensor<half> output_;
+    public:
+      __aicore__ inline void Init(GM_ADDR gm) {
+        output_.SetGlobalBuffer((__gm__ half*)gm, 128);
+      }
+      __aicore__ inline void Store(AscendC::LocalTensor<half> local) {
+        AscendC::DataCopyPad(output_[0], local, 128);
+      }
+    };
+    extern "C" __global__ __aicore__ void test_kernel(GM_ADDR gm) {
+      AscendC::TPipe pipe;
+      AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+      pipe.InitBuffer(ub, 256);
+      auto local = ub.GetWithOffset<half>(128, 0);
+      Writer writer;
+      writer.Init(gm);
+      writer.Store(local);
+    }
+    """
+    result = analyze(source, chip="ascend950pr")
+    stores = [op for op in result.unit.kernels[0].ops if getattr(op, "name", "") == "DataCopyPad"]
+    assert len(stores) == 1 and stores[0].pipe is Pipe.MTE3
+    assert "AKA2010" not in codes_of(result)
+
+
+def test_gm_addr_passed_to_store_helper_stays_on_mte3():
+    source = """
+    __aicore__ inline void Store(GM_ADDR dst, AscendC::LocalTensor<half> src) {
+      GM_ADDR target = dst;
+      AscendC::DataCopyPad(target, src, 128);
+    }
+    extern "C" __global__ __aicore__ void test_kernel(GM_ADDR gm) {
+      AscendC::TPipe pipe;
+      AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+      pipe.InitBuffer(ub, 256);
+      auto local = ub.GetWithOffset<half>(128, 0);
+      Store(gm, local);
+    }
+    """
+    result = analyze(source, chip="ascend950pr")
+    stores = [op for op in result.unit.kernels[0].ops if getattr(op, "name", "") == "DataCopyPad"]
+    assert len(stores) == 1 and stores[0].pipe is Pipe.MTE3
+    assert "AKA2010" not in codes_of(result)
+
+
 def test_vec_scope_register_microapi_has_no_false_memory_or_barrier_warning():
     result = analyze_body(
         """
@@ -158,6 +255,28 @@ def test_160_byte_get_with_offset_pitch_reaches_bank_conflict_verdict():
     )
     conflict = find(result, "AKA3006")
     assert conflict and conflict[0].details["delta_blocks"] == 40
+
+
+def test_get_with_offset_arguments_keep_bank_offsets_in_hybrid_simt_helper():
+    source = """
+    __simt_vf__ void vector_kernel(AscendC::LocalTensor<float> lhs,
+                                   AscendC::LocalTensor<float> rhs) {
+      asc_ballot(1);
+      AscendC::Add(rhs, lhs, rhs, 64);
+    }
+    extern "C" __global__ __aicore__ void test_kernel() {
+      AscendC::TPipe pipe;
+      AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+      pipe.InitBuffer(ub, 512);
+      vector_kernel(ub.GetWithOffset<float>(64, 0),
+                    ub.GetWithOffset<float>(64, 256));
+    }
+    """
+    result = analyze(source, chip="ascend950pr")
+    conflict = find(result, "AKA3006")
+    assert len(conflict) == 1
+    assert conflict[0].details["delta_blocks"] == 8
+    assert result.artifacts["bank_conflict_coverage::test_kernel"]["evaluated"] == 1
 
 
 def test_static_simt_cross_line_access_is_reported():
@@ -225,6 +344,13 @@ def test_cann92_signatures_have_vector_engine_and_argument_roles():
         assert spec.engine == "SIMD_VECTOR" and spec.latency_cycles > 0
     assert lookup_api("ReduceDataBlock").param_at(6).name == "srcRepStride"
     assert lookup_api("ReduceRepeat").param_at(7).name == "order"
-    assert lookup_api("Brcb").param_at(3).name == "params"
+    assert lookup_api("Brcb").param_at(3).name == "repeatParams"
+    for name in ("ReduceDataBlock", "ReduceRepeat", "ReducePairElem", "Brcb"):
+        spec = lookup_api(name)
+        assert spec.params[0].allowed == frozenset({PhysicalDomain.UB})
+        assert spec.params[1].allowed == frozenset({PhysicalDomain.UB})
+    assert lookup_api("Reg::ReduceDataBlock").params[0].allowed == frozenset(
+        {PhysicalDomain.REG}
+    )
     for name in ("asc_ballot", "asc_any", "asc_all", "asc_shfl", "asc_shfl_xor"):
         assert lookup_api(name).engine == "SIMT_WARP"
