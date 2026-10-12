@@ -18,7 +18,7 @@
  *       lands off a 32-byte boundary.                        -> AKA1002
  *   [4] The loop-carried V_MTE2 / MTE3_V handshakes are never
  *       primed before the loop, so iteration 0 waits on flags
- *       nothing has raised: a hard hang.           -> AKA2005 / AKA2004
+ *       nothing has raised: a hard hang.           -> AKA2005 / AKA2002
  *
  * Two further smells are deliberate: EVENT_ID6 is reserved by the runtime
  * (-> AKA2003) and the trailing PipeBarrier(PIPE_ALL) throws away the

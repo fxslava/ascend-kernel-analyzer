@@ -560,7 +560,7 @@ def _build_table() -> Dict[str, ApiSpec]:
     )
     # CANN 9.2 level-0 gather and index-vector construction.  Without these,
     # a barrier pair around a table-decode lane interleave collapses into
-    # "consecutive" and gets advised away (AKA3005) - deleting a real edge.
+    # "consecutive" and gets advised away (AKA3012) - deleting a real edge.
     put(
         ApiSpec(
             name="Gather",
@@ -787,6 +787,28 @@ def _build_table() -> Dict[str, ApiSpec]:
                 requires_feature=feature,
             )
         )
+    # CANN 9.1.0 950PR C API: all four overload families have the same
+    # positional contract; unlike mad_mx there are no address-offset args.
+    for name in ("asc_mmad", "asc_mmad_sync", "asc_mmad_mx", "asc_mmad_mx_sync"):
+        put(ApiSpec(
+            name=name,
+            params=(
+                _p(ArgRole.DST, _L0C, "c_matrix"),
+                _p(ArgRole.SRC0, _L0A, "a_matrix"),
+                _p(ArgRole.SRC1, _L0B, "b_matrix"),
+                _p(ArgRole.SCALAR, None, "left_height"),
+                _p(ArgRole.SCALAR, None, "n_dim"),
+                _p(ArgRole.SCALAR, None, "right_width"),
+                _p(ArgRole.SCALAR, None, "unit_flag"),
+                _p(ArgRole.SCALAR, None, "disable_gemv"),
+                _p(ArgRole.SCALAR, None, "c_matrix_source"),
+                _p(ArgRole.SCALAR, None, "c_matrix_init_val"),
+            ),
+            pipe=Pipe.M,
+            category="cube",
+            requires_feature=MX_CUBE_FEATURE if "_mx" in name else None,
+            doc="CANN 9.1.0 C matrix multiply: L0A x L0B -> L0C.",
+        ))
     put(
         ApiSpec(
             name="mad_mx",

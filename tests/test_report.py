@@ -35,7 +35,7 @@ def ub_tensor(name: str, offset, count, pos: str = "VECIN") -> str:
 
 # Three contiguous tiles.  Note this layout's source pair (0, 512) is a real
 # UB bank collision (16 blocks = 0 mod 8), so the Add below now warns with
-# AKA3006; it stays for memory-map geometry tests, which only read the layout.
+# AKA3003; it stays for memory-map geometry tests, which only read the layout.
 LAYOUT = (
     ub_tensor("a", 0, 256)
     + ub_tensor("b", 512, 256)

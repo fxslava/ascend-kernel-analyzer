@@ -128,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
             "the architecture-minimal dimension (16 Cube / 64 Vector), a "
             "DataCopy stride gets the 32-byte block, and a field compared "
             "with GetBlockIdx() is left symbolic. Unblocks the TPipe layout, "
-            "and with it AKA3006, on queue-managed kernels"
+            "and with it AKA3003, on queue-managed kernels"
         ),
     )
     analysis.add_argument(

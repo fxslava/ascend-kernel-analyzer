@@ -29,10 +29,12 @@ from typing import Dict, List, Optional, Sequence, Set
 from ..apis import TRANSFER_PIPE, ArgRole, lookup_api
 from ..diagnostics import Code, Severity
 from ..hardware import PhysicalDomain, Pipe
+from ..models.memory import ASCEND_950PR_POSITIONS, UBPartition
 from ..ir import ApiCallOp, KernelIR, TensorDecl
 from ..solver import Finding, MemorySolver, Verdict, make_solver
 from ..symbolic import is_decidable, render, to_int
 from .base import Checker, CheckerContext
+from .source_utils import code_only, source_loc, constant_int, split_arguments
 
 __all__ = ["MemoryChecker", "DomainUsage"]
 
@@ -123,6 +125,8 @@ class MemoryChecker(Checker):
         self._check_aliasing(kernel, on_core)
         self._check_api_domains(kernel)
         self._check_vector_bank_conflicts(kernel)
+        self._check_950pr_positions(kernel)
+        self._check_allocator_invariant(kernel)
         self._check_simt_datacache(kernel)
         self._check_simt_accesses(kernel)
         self._check_register_pressure(kernel)
@@ -186,6 +190,87 @@ class MemoryChecker(Checker):
             tensor=tensor.name,
             offset_expr=render(tensor.byte_offset),
             size_expr=render(tensor.byte_size),
+        )
+
+    def _check_950pr_positions(self, kernel: KernelIR) -> None:
+        if self.hw.chip.name != "ascend950pr":
+            return
+        source = code_only(kernel.source_text)
+        base = code_only(self.ctx.unit.source).find(source)
+        for match in re.finditer(
+            r"\bTPosition\s*::\s*(?P<position>[A-Za-z_]\w*)\b", source
+        ):
+            position = match.group("position")
+            if position in ASCEND_950PR_POSITIONS:
+                continue
+            loc = (
+                source_loc(self.ctx.unit.path, self.ctx.unit.source, base + match.start())
+                if base >= 0
+                else kernel.loc
+            )
+            self.diags.add(
+                Code.DOMAIN_MISMATCH,
+                Severity.FATAL,
+                f"TPosition::{position} is not a valid Ascend 950PR tensor "
+                "allocation domain; use VECIN, VECOUT, GM, or TSCM as appropriate",
+                loc,
+                hardware_domain="UB",
+                remediation=(
+                    f"Replace TPosition::{position} with VECIN, VECOUT, GM, or "
+                    "TSCM according to the tensor's function."
+                ),
+                position=position,
+                valid_positions=("VECIN", "VECOUT", "GM", "TSCM"),
+            )
+
+        # Includes class members and buffers reached through inlined helpers.
+        represented = set(re.findall(r"TPosition\s*::\s*(\w+)", source))
+        placements = [(t.name, t.position, t.loc) for t in kernel.tensors.values()]
+        placements.extend((name, pos, kernel.loc) for name, pos in kernel.buffer_positions.items())
+        for name, pos, loc in placements:
+            if pos is None or pos.value in represented or self.hw.valid_allocation_position(pos):
+                continue
+            # Raw __ca__/__cb__/__cc__ pointers get synthetic logical positions;
+            # the allocation restriction does not prohibit physical Cube SRAM.
+            tensor = kernel.tensors.get(name)
+            if tensor is not None and (
+                "pointer" in tensor.origin or tensor.origin == "kernel parameter"
+            ):
+                continue
+            self.diags.add(Code.DOMAIN_MISMATCH, Severity.FATAL,
+                           f"{name}: TPosition::{pos.value} is not a valid Ascend 950PR allocation domain",
+                           loc, hardware_domain=self.hw.domain_of(pos).value,
+                           remediation="Use VECIN, VECOUT, GM, or TSCM.")
+
+    def _check_allocator_invariant(self, kernel: KernelIR) -> None:
+        if self.hw.chip.name != "ascend950pr":
+            return
+        source = code_only(self.ctx.unit.source)
+        kernel_source = code_only(kernel.source_text)
+        external_arrays = list(re.finditer(
+            r"\bextern\b[^;{}]*\b__ubuf__\s+(?:const\s+)?"
+            r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*\s*"
+            r"(?P<name>[A-Za-z_]\w*)\s*\[[^\]]*\]", source,
+        ))
+        if not any(re.search(rf"\b{re.escape(m.group('name'))}\b", kernel_source)
+                   for m in external_arrays):
+            return
+        if not kernel.local_ub_allocations:
+            return
+        location = kernel.local_ub_allocations[0][1]
+        self.diags.add(
+            Code.BUFFER_COLLISION,
+            Severity.FATAL,
+            "extern __ubuf__ arrays and LocalMemAllocator::Alloc share the "
+            "dynamic UB region and cannot be used for overlapping storage",
+            location,
+            hardware_domain="UB",
+            remediation=(
+                "Use either extern __ubuf__ dynamic arrays or "
+                "LocalMemAllocator::Alloc for the overlapping dynamic region, "
+                "not both."
+            ),
+            allocator="extern __ubuf__ + LocalMemAllocator::Alloc",
         )
 
     def _check_alignment(self, tensor: TensorDecl) -> None:
@@ -583,10 +668,10 @@ class MemoryChecker(Checker):
         tensor = kernel.tensors.get(name)
         return tensor.domain if tensor is not None else PhysicalDomain.UNKNOWN
 
-    # -- vector ALU bank conflicts (AKA3006) ---------------------------------
+    # -- vector ALU bank conflicts (AKA3003) ---------------------------------
 
     def _check_vector_bank_conflicts(self, kernel: KernelIR) -> None:
-        """Flag dual-operand vector reads that share one UB bank (AKA3006).
+        """Flag dual-operand vector reads that share one UB bank (AKA3003).
 
         The Unified Buffer is an interleaved 8-bank structure addressed in
         32-byte quantization blocks.  When one Vector ALU instruction reads
@@ -857,7 +942,7 @@ class MemoryChecker(Checker):
         """Enforce the 351x/arch35 UB partition.
 
         On 351x the Unified Buffer is strictly partitioned:
-        ``DataCache = 256 KiB - StaticMem - DynamicMem - 8 KiB (compiler)``.
+        ``DataCache = min(256 KiB - static - dynamic - 8 KiB, 128 KiB)``.
         The 351x provisional profile applies the floor when SIMT markers are
         present.  Ascend950PR arch35 has a validated 216 KiB tensor ceiling
         regardless of whether the source explicitly spells a SIMT marker.
@@ -871,14 +956,32 @@ class MemoryChecker(Checker):
         ):
             return
 
-        allocated = self._ub_allocation_bytes(kernel)
+        dynamic = self._dynamic_ub_bytes(kernel)
+        allocated = self._ub_allocation_bytes(kernel, dynamic)
+        partition = UBPartition(allocated - dynamic, dynamic)
         available = self.hw.simt_datacache_available(allocated)
+        if chip.name == "ascend950pr":
+            available = partition.datacache_bytes
+        self.ctx.publish(f"ub_partition::{kernel.name}", {
+            "static_bytes": partition.static_bytes,
+            "dynamic_bytes": partition.dynamic_bytes,
+            "datacache_bytes": available,
+        })
         assert available is not None  # guarded by enforces_datacache_partition
-        if available >= (chip.min_datacache_bytes or 0):
+        over_limit = (
+            chip.max_usable_ub_bytes is not None
+            and allocated > chip.max_usable_ub_bytes
+        )
+        if available >= (chip.min_datacache_bytes or 0) and not over_limit:
             return
 
+        code = (
+            Code.SRAM_OVERFLOW
+            if chip.name == "ascend950pr"
+            else Code.INSUFFICIENT_DATACACHE
+        )
         self.diags.add(
-            Code.INSUFFICIENT_DATACACHE,
+            code,
             Severity.FATAL,
             f"Insufficient UB DataCache headroom for {chip.name} SIMT "
             f"execution (available: {available} B, required: >= "
@@ -888,7 +991,7 @@ class MemoryChecker(Checker):
             hardware_domain="UB",
             remediation=(
                 f"Free at least {chip.min_datacache_bytes - available} B of UB: "
-                f"keep static + dynamic (InitBuffer) allocations at or below "
+                f"keep static (including InitBuffer) + dynamic allocations at or below "
                 f"{chip.max_usable_ub_bytes} B "
                 f"({chip.max_usable_ub_bytes // 1024} KiB) so the SIMT DataCache "
                 f"keeps its {chip.min_datacache_bytes // 1024} KiB hardware "
@@ -896,12 +999,18 @@ class MemoryChecker(Checker):
             ),
             allocated_bytes=allocated,
             available_bytes=available,
+            static_plus_dynamic_bytes=allocated,
+            capacity_equation=(
+                "min(262144 - static_bytes - dynamic_bytes - 8192, 131072)"
+            ),
+            static_bytes=partition.static_bytes,
+            dynamic_bytes=partition.dynamic_bytes,
             required_bytes=chip.min_datacache_bytes,
             ub_total_bytes=chip.ub_total_bytes,
             compiler_reserved_bytes=chip.compiler_reserved_bytes,
         )
 
-    def _ub_allocation_bytes(self, kernel: KernelIR) -> int:
+    def _ub_allocation_bytes(self, kernel: KernelIR, dynamic: int) -> int:
         """Total static + dynamic UB allocation, each storage counted once.
 
         ``TPipe::InitBuffer`` / ``LocalMemAllocator`` extents are counted per
@@ -909,19 +1018,121 @@ class MemoryChecker(Checker):
         own byte size, with identical ``(offset, size)`` ranges (two views of
         one raw region) deduplicated so deliberate reuse is not double-billed.
         """
-        counted: Set[tuple[Optional[int], int]] = set()
+        counted = set()
         total = 0
         for tensor in kernel.tensors.values():
             if tensor.domain is not PhysicalDomain.UB or tensor.size_value is None:
                 continue
             if tensor.source_buffer is not None:
                 continue  # billed through its InitBuffer below
-            key = (tensor.offset_value, tensor.size_value)
+            key = (tensor.offset_value if tensor.offset_value is not None else tensor.name, tensor.size_value)
             if key in counted:
                 continue
             counted.add(key)
             total += tensor.size_value
-        return total + sum(kernel.buffer_sizes.values())
+        return (
+            total
+            + self._ub_buffer_bytes(kernel)
+            + sum(size for size in kernel.static_ub_arrays.values() if size is not None)
+            + self._global_static_ub_bytes(kernel)
+            + dynamic
+        )
+
+    def _global_static_ub_bytes(self, kernel: KernelIR) -> int:
+        total = 0
+        names = {**self.ctx.unit.constants, **kernel.constants}
+        for match in re.finditer(
+            r"\b(?P<extern>extern\s+)?__ubuf__\s+(?P<type>[\w:]+)\s+"
+            r"(?P<name>\w+)\s*\[(?P<count>[^\]]+)\]",
+            code_only(self.ctx.unit.source),
+        ):
+            name = match["name"]
+            if (match["extern"] or name in kernel.static_ub_arrays
+                    or name in kernel.tensors
+                    or not re.search(rf"\b{re.escape(name)}\b", kernel.source_text)):
+                continue
+            count = constant_int(match["count"], names)
+            width = self._element_size(match["type"])
+            if count is None or width is None:
+                self._unknown_allocation(kernel, name)
+            else:
+                total += count * width
+        return total
+
+    def _ub_buffer_bytes(self, kernel: KernelIR) -> int:
+        if self.hw.chip.name != "ascend950pr":
+            return sum(kernel.buffer_sizes.values())
+        return sum(
+            size
+            for name, size in kernel.buffer_sizes.items()
+            if (
+                (position := kernel.buffer_positions.get(name)) is None
+                or self.hw.domain_of(position) is PhysicalDomain.UB
+            )
+        )
+
+    def _dynamic_ub_bytes(self, kernel: KernelIR) -> int:
+        # Extern arrays alias one base; a launch reservation already includes
+        # storage obtained through LocalMemAllocator, so never add it twice.
+        external = max((size or 0 for size in kernel.dynamic_ub_arrays.values()), default=0)
+        names = {**self.ctx.unit.constants, **kernel.constants}
+        source = code_only(self.ctx.unit.source)
+        unknown_external = False
+        for match in re.finditer(
+            r"\bextern\s+__ubuf__\s+(?P<type>[\w:]+)\s+"
+            r"(?P<name>\w+)\s*\[(?P<count>[^\]]*)\]", source,
+        ):
+            if not re.search(rf"\b{re.escape(match['name'])}\b", kernel.source_text):
+                continue
+            count = constant_int(match['count'], names)
+            width = self._element_size(match['type'])
+            if count is not None and width is not None:
+                external = max(external, count * width)
+            elif match['count'].strip():
+                self._unknown_allocation(kernel, match['count'])
+            else:
+                unknown_external = True
+        reserved = 0
+        found_launch = False
+        for match in re.finditer(rf"\b{re.escape(kernel.name)}\s*<<<(.*?)>>>", source, re.DOTALL):
+            args = split_arguments(match.group(1))
+            if len(args) < 2:
+                continue
+            found_launch = True
+            size = 0 if args[1] == "nullptr" else constant_int(args[1], names)
+            if size is None:
+                self._unknown_allocation(kernel, args[1])
+            else:
+                reserved = max(reserved, size)
+        allocated = self._local_allocator_bytes(kernel)
+        if not found_launch and (unknown_external or any(size is None for size in kernel.dynamic_ub_arrays.values())):
+            self._unknown_allocation(kernel, "extern __ubuf__ extent / launch reservation")
+        return max(reserved, allocated, external)
+
+    def _local_allocator_bytes(self, kernel: KernelIR) -> int:
+        total = 0
+        for size, loc in kernel.local_ub_allocations:
+            if size is not None:
+                total += size
+            else:
+                self._unknown_allocation(kernel, f"LocalMemAllocator::Alloc at {loc.short}")
+        for name, size in kernel.static_ub_arrays.items():
+            if size is None:
+                self._unknown_allocation(kernel, name)
+        return total
+
+    def _unknown_allocation(self, kernel: KernelIR, expression: str) -> None:
+        self.diags.add(
+            Code.SYMBOLIC_OFFSET, Severity.INFO,
+            f"UB allocation is not statically bounded: {expression}", kernel.loc,
+            hardware_domain="UB",
+            remediation="Supply constant extents and the host dynamic UB reservation to prove the budget.",
+        )
+
+    @staticmethod
+    def _element_size(dtype: str) -> Optional[int]:
+        from ..symbolic import dtype_size
+        return dtype_size(dtype.rsplit("::", 1)[-1])
 
     # -- aggregate footprint ------------------------------------------------
 

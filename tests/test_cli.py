@@ -191,7 +191,7 @@ class TestInformationalCommands:
     def test_list_codes(self, capsys):
         assert main(["--list-codes"]) == 0
         out = capsys.readouterr().out
-        for code in ("AKA1001", "AKA1003", "AKA2004", "AKA2005", "AKA3001"):
+        for code in ("AKA1001", "AKA1003", "AKA2002", "AKA2005", "AKA3001"):
             assert code in out
 
     def test_version(self, capsys):

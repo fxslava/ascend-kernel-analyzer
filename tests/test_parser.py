@@ -293,7 +293,7 @@ class TestSubTensorViews:
     after the walk, so the view records its provenance and the offset is
     completed then.  Until the ``subscript_argument_list`` extraction was
     fixed, every view kept ``byte_offset=None`` - which is what locked 793 of
-    the fleet's 1,064 AKA3006 candidates in ``chunk_kda_fwd.cpp``.
+    the fleet's 1,064 AKA3003 candidates in ``chunk_kda_fwd.cpp``.
     """
 
     BODY = """

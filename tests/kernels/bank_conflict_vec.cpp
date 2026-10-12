@@ -1,5 +1,5 @@
 /*
- * Vector ALU UB bank-conflict fixture (WARNING AKA3006).
+ * Vector ALU UB bank-conflict fixture (WARNING AKA3003).
  *
  * The Unified Buffer is an interleaved 8-bank structure addressed in 32-byte
  * quantization blocks; a dual-operand vector instruction that reads both
@@ -10,13 +10,9 @@
  *   * the CONTROL case reads aGood (0x400) and bGood (0x420): the 32-byte
  *     (one-block) skew puts them 9 blocks apart = 1 mod 8 -> distinct banks.
  *
- * Code note: this check is specified as "AKA3003", but that code was already
- * assigned to SYMBOLIC_EVENT_ID when the analyzer shipped, so the bank
- * conflict carries AKA3006, the next free code in the 3xxx performance
- * block.  The finding is a performance warning; the kernel is still
- * functionally correct and the verdict is accepted_with_warnings.
+ * Bank conflicts use AKA3003 from the skill diagnostic registry.
  *
- * @ascend-expect: AKA3006
+ * @ascend-expect: AKA3003
  * @ascend-expect-fatal: 0
  */
 #include "kernel_operator.h"

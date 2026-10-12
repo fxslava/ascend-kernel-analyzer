@@ -29,12 +29,12 @@ path for the report.
 
 What this catches
 -----------------
-* ``SetFlag``/``WaitFlag`` that are not one-to-one (``AKA2001``/``AKA2002``),
+* ``SetFlag``/``WaitFlag`` that are not one-to-one (``AKA2001``/``AKA2001``),
   including per-loop-body imbalance (``AKA2006``) that drifts the semaphore.
 * Reserved ``EVENT_ID`` 6 and 7, which the runtime owns (``AKA2003``).
 * Loop-carried waits with no prologue priming: iteration 0 blocks for ever
   (``AKA2005``) - the single most common double-buffering hang.
-* Circular waits across pipelines (``AKA2004``).
+* Circular waits across pipelines (``AKA2002``).
 * ``PipeBarrier(PIPE_ALL)`` as a performance antipattern (``AKA3001``).
 """
 

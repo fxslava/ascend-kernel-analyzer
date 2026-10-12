@@ -32,7 +32,7 @@ def ub(name: str, offset: int, size: int = 256, position: str = "VECIN") -> str:
     )
 
 
-#: Offsets chosen 17 blocks apart so the bank-conflict check (AKA3006) stays
+#: Offsets chosen 17 blocks apart so the bank-conflict check (AKA3003) stays
 #: quiet and these tests only ever see hazard findings.
 DECLS = ub("a", 0) + ub("b", 544) + ub("c", 1088)
 GLOBAL = (

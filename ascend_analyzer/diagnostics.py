@@ -47,9 +47,9 @@ class Code(str, enum.Enum):
     """Stable diagnostic identifiers.
 
     The numeric blocks are: ``1xxx`` memory layout, ``2xxx`` synchronisation
-    and pipeline, ``3xxx`` performance and analyzability, ``4xxx`` the
-    analytical performance model (overlap profiling), ``9xxx`` analyzer
-    infrastructure.
+    and launch validation, ``3xxx`` performance and analyzability, ``4xxx``
+    matmul constraints, and ``9xxx``
+    analyzer infrastructure.
     """
 
     # -- 1xxx: memory layout ------------------------------------------------
@@ -58,44 +58,57 @@ class Code(str, enum.Enum):
     BUFFER_COLLISION = "AKA1003"
     DOMAIN_MISMATCH = "AKA1004"
     SIZE_MISALIGNED = "AKA1005"
-    INVALID_EXTENT = "AKA1006"
-    STRIDE_MISALIGNED = "AKA1007"
-    NEGATIVE_OFFSET = "AKA1008"
+    BROADCAST_TMP_MISSING = "AKA1006"
+    BROADCAST_COPY_UNCHECKED = "AKA1007"
+    BROADCAST_COEF_STRIDE = "AKA1008"
+    INVALID_EXTENT = "AKA1012"
+    STRIDE_MISALIGNED = "AKA1013"
+    NEGATIVE_OFFSET = "AKA1014"
     UNKNOWN_DOMAIN = "AKA1009"
     # 351x SIMD/SIMT DataCache headroom below the 32 KiB hardware minimum.
     INSUFFICIENT_DATACACHE = "AKA1010"
     UNSUPPORTED_INTRINSIC = "AKA1011"
 
     # -- 2xxx: synchronisation / pipeline ----------------------------------
-    UNMATCHED_SET_FLAG = "AKA2001"
-    UNMATCHED_WAIT_FLAG = "AKA2002"
+    UNPAIRED_FLAG = "AKA2001"
+    UNMATCHED_SET_FLAG = "AKA2001"  # compatibility names
+    UNMATCHED_WAIT_FLAG = "AKA2001"
     RESERVED_EVENT_ID = "AKA2003"
-    DEADLOCK_CYCLE = "AKA2004"
+    DEADLOCK_CYCLE = "AKA2002"
+    PIPE_ROUTE_MISMATCH = "AKA2004"
     UNPRIMED_LOOP_WAIT = "AKA2005"
     LOOP_FLAG_IMBALANCE = "AKA2006"
     FLAG_DOUBLE_SET = "AKA2007"
     EVENT_ID_OUT_OF_RANGE = "AKA2008"
     SELF_ROUTE_SYNC = "AKA2009"
     MISSING_SYNC = "AKA2010"
+    DEPRECATED_VF_DISPATCH = "AKA2011"
+    INVALID_LAUNCH_BOUNDS = "AKA2012"
 
     # -- 3xxx: performance / analyzability ---------------------------------
     GLOBAL_BARRIER = "AKA3001"
     SYMBOLIC_OFFSET = "AKA3002"
-    SYMBOLIC_EVENT_ID = "AKA3003"
-    UB_FRAGMENTATION = "AKA3004"
-    REDUNDANT_BARRIER = "AKA3005"
-    # NOTE: the UB bank-conflict check is specified as "AKA3003", but that
-    # code was already assigned to SYMBOLIC_EVENT_ID when the analyzer first
-    # shipped (and the shipped tests pin it there), so the bank conflict takes
-    # the next free code in the 3xxx performance block.
-    UB_BANK_CONFLICT = "AKA3006"
+    RAGGED_TAIL_OVERLAP = "AKA3004"
+    VF_SWITCHING = "AKA3005"
+    SYMBOLIC_EVENT_ID = "AKA3010"
+    UB_FRAGMENTATION = "AKA3011"
+    REDUNDANT_BARRIER = "AKA3012"
+    UB_BANK_CONFLICT = "AKA3003"
     SIMT_DATACACHE_CONFLICT = "AKA3007"
     REGISTER_SPILL = "AKA3008"
     VECTOR_ALU_CONTENTION = "AKA3009"
 
-    # -- 4xxx: performance model / overlap profiling ------------------------
-    PERF_SYNC_STALL = "AKA4001"
-    PERF_CUBE_UNDERUTIL = "AKA4002"
+    PERF_SYNC_STALL = "AKA3013"
+    PERF_CUBE_UNDERUTIL = "AKA3014"
+
+    # -- 4xxx: advanced matmul ----------------------------------------------
+    MISSING_SET_TAIL = "AKA4001"
+    ASYNC_WORKSPACE_MISSING = "AKA4002"
+    MISSING_WAIT_ITERATE_ALL = "AKA4003"
+    QUANT_CONFIG_MISMATCH = "AKA4004"
+    TSCM_RESIDENCY = "AKA4005"
+    UNSUPPORTED_SPARSE_MATMUL = "AKA4006"
+    INVALID_MATMUL_TYPE = "AKA4011"
 
     # -- 9xxx: analyzer infrastructure -------------------------------------
     PARSE_ERROR = "AKA9001"
@@ -106,6 +119,16 @@ class Code(str, enum.Enum):
 
 #: One-line human titles for each code, used in report headers.
 CODE_TITLES: Dict[str, str] = {
+    Code.BROADCAST_TMP_MISSING.value: "Missing broadcast temporary buffer",
+    Code.BROADCAST_COPY_UNCHECKED.value: "Unchecked broadcast DataCopy",
+    Code.BROADCAST_COEF_STRIDE.value: "Broadcast coefficient stride alignment",
+    Code.PIPE_ROUTE_MISMATCH.value: "Inter-pipe route mismatch",
+    Code.RAGGED_TAIL_OVERLAP.value: "Ragged tail overlap non-idempotency",
+    Code.VF_SWITCHING.value: "Excessive VF switching",
+    Code.MISSING_SET_TAIL.value: "Missing SetTail",
+    Code.ASYNC_WORKSPACE_MISSING.value: "Unregistered asynchronous workspace",
+    Code.MISSING_WAIT_ITERATE_ALL.value: "Missing WaitIterateAll",
+    Code.QUANT_CONFIG_MISMATCH.value: "Quantization configuration mismatch",
     Code.SRAM_OVERFLOW.value: "SRAM capacity overflow",
     Code.BASE_MISALIGNED.value: "Base address alignment violation",
     Code.BUFFER_COLLISION.value: "Buffer aliasing / address collision",
@@ -117,8 +140,9 @@ CODE_TITLES: Dict[str, str] = {
     Code.UNKNOWN_DOMAIN.value: "Undetermined memory domain",
     Code.INSUFFICIENT_DATACACHE.value: "Insufficient UB DataCache headroom (351x SIMT)",
     Code.UNSUPPORTED_INTRINSIC.value: "Intrinsic unsupported on target architecture",
-    Code.UNMATCHED_SET_FLAG.value: "SetFlag without matching WaitFlag",
-    Code.UNMATCHED_WAIT_FLAG.value: "WaitFlag without matching SetFlag",
+    Code.DEPRECATED_VF_DISPATCH.value: "Deprecated SIMT VF dispatch",
+    Code.INVALID_LAUNCH_BOUNDS.value: "Invalid SIMT VF signature or launch bounds",
+    Code.UNPAIRED_FLAG.value: "Unpaired SetFlag / WaitFlag",
     Code.RESERVED_EVENT_ID.value: "Reserved or unavailable EVENT_ID used",
     Code.DEADLOCK_CYCLE.value: "Pipeline deadlock (circular wait)",
     Code.UNPRIMED_LOOP_WAIT.value: "Unprimed loop-carried WaitFlag",
@@ -138,6 +162,9 @@ CODE_TITLES: Dict[str, str] = {
     Code.VECTOR_ALU_CONTENTION.value: "SIMT and SIMD Vector ALU contention",
     Code.PERF_SYNC_STALL.value: "Exposed sync bubbles / pipeline stalls",
     Code.PERF_CUBE_UNDERUTIL.value: "Cube compute underutilization",
+    Code.TSCM_RESIDENCY.value: "Invalid TSCM full residency",
+    Code.UNSUPPORTED_SPARSE_MATMUL.value: "Unsupported sparse matmul mode",
+    Code.INVALID_MATMUL_TYPE.value: "Invalid matmul type or GEMV configuration",
     Code.PARSE_ERROR.value: "Source could not be parsed cleanly",
     Code.UNRESOLVED_TENSOR.value: "Tensor argument could not be resolved",
     Code.NO_KERNEL_FOUND.value: "No kernel entry point found",

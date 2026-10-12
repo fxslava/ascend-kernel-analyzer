@@ -3,7 +3,7 @@
 Covers the three layers of the 4xxx block: the hardware latency model
 (bandwidths, cube contraction cycles, hand-off penalty), the ASAP schedule
 over the acyclic dependency DAG (makespan, busy/idle/stall, overlap ratio,
-bottleneck classification), and the AKA4001 / AKA4002 advisories - including
+bottleneck classification), and the AKA3013 / AKA3014 advisories - including
 the guarantee that correct, well-pipelined kernels stay silent.
 """
 
@@ -284,7 +284,7 @@ class TestClassification:
         )
         profile = result.artifacts["perf_profile::vec_add_pingpong_broken"]
         assert "skipped" in profile
-        assert "AKA4001" not in codes_of(result)
+        assert "AKA3013" not in codes_of(result)
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +301,7 @@ class TestNvfp4PipelineA:
         return analyze_fixture()
 
     def test_reports_exposed_sync_stalls(self, result):
-        stalls = find(result, "AKA4001")
+        stalls = find(result, "AKA3013")
         assert len(stalls) == 2  # one per kernel
         assert all(d.severity is Severity.WARNING for d in stalls)
         assert result.fatal_count == 0
@@ -311,11 +311,11 @@ class TestNvfp4PipelineA:
         assert profile["stall_by_route"]["M_FIX"] >= 400
         assert any(
             "M_FIX" in d.message and "M_FIX 647 cycles" in d.message
-            for d in find(result, "AKA4001")
+            for d in find(result, "AKA3013")
         )
 
     def test_small_tiles_underutilise_the_cube(self, result):
-        diags = find(result, "AKA4002")
+        diags = find(result, "AKA3014")
         assert len(diags) == 2
         assert all(d.details["cube_utilization"] < 0.5 for d in diags)
         assert all(d.severity is Severity.WARNING for d in diags)
@@ -339,7 +339,7 @@ class TestNvfp4PipelineB:
     def test_reports_serialized_execution(self, result):
         profile = profile_of(result, "nvfp4_dequant_serial")
         assert profile["bottleneck"] == "SYNC_BOUND"
-        assert "AKA4001" in codes_of(result)
+        assert "AKA3013" in codes_of(result)
 
     def test_overlap_is_worse_than_the_pipelined_variant(self, result):
         a = profile_of(result, "nvfp4_dequant_overlap")
@@ -369,7 +369,7 @@ class TestAdvisoryDiscipline:
         # A tiny kernel can have a terrible stall ratio (see COPY_AND_ADD)
         # without warranting advice: short kernels are inherently fill/drain.
         result = analyze_body(COPY_AND_ADD)
-        assert "AKA4001" not in codes_of(result)
+        assert "AKA3013" not in codes_of(result)
 
     def test_advisory_thresholds_are_class_attributes(self):
         # Tuning surface for the model, pinned so changes are deliberate.
@@ -440,8 +440,8 @@ class TestReporting:
 
         assert main(["--list-codes"]) == 0
         out = capsys.readouterr().out
-        assert "AKA4001  Exposed sync bubbles / pipeline stalls" in out
-        assert "AKA4002  Cube compute underutilization" in out
+        assert "AKA3013  Exposed sync bubbles / pipeline stalls" in out
+        assert "AKA3014  Cube compute underutilization" in out
 
     def test_perf_checker_can_be_disabled(self):
         result = KernelAnalyzer(

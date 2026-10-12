@@ -69,8 +69,8 @@ class TestEventIds:
             }
             """
         result = analyze_body(body)
-        assert "AKA3003" in codes_of(result)
-        assert all(d.severity is Severity.WARNING for d in find(result, "AKA3003"))
+        assert "AKA3010" in codes_of(result)
+        assert all(d.severity is Severity.WARNING for d in find(result, "AKA3010"))
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ class TestPairing:
         assert "WaitFlag" in diag.remediation
 
     def test_wait_without_set_is_fatal(self):
-        diag = only(analyze_body(wait_flag("MTE2_V")), "AKA2002")
+        diag = only(analyze_body(wait_flag("MTE2_V")), "AKA2001")
         assert diag.severity is Severity.FATAL
         assert "hang" in diag.message
 
@@ -98,12 +98,12 @@ class TestPairing:
         # Setting id 0 does not satisfy a wait on id 1.
         result = analyze_body(set_flag("MTE2_V", 0) + wait_flag("MTE2_V", 1))
         assert "AKA2001" in codes_of(result)
-        assert "AKA2002" in codes_of(result)
+        assert "AKA2001" in codes_of(result)
 
     def test_routes_are_separate_channels(self):
         result = analyze_body(set_flag("MTE2_V") + wait_flag("V_MTE3"))
         assert "AKA2001" in codes_of(result)
-        assert "AKA2002" in codes_of(result)
+        assert "AKA2001" in codes_of(result)
 
     def test_double_set_without_an_intervening_wait_warns(self):
         body = set_flag("MTE2_V") + set_flag("MTE2_V") + wait_flag("MTE2_V")
@@ -224,7 +224,7 @@ class TestDeadlock:
         graph = sync_graph(result)
         assert graph["acyclic"]
         assert graph["topological_order"] is not None
-        assert "AKA2004" not in codes_of(result)
+        assert "AKA2002" not in codes_of(result)
 
     def test_unprimed_cycle_is_detected_in_the_graph(self):
         body = """
@@ -244,7 +244,7 @@ class TestDeadlock:
              + wait_flag("MTE2_V") + set_flag("V_MTE2") + "}\n"
         result = analyze_body(body)
         assert len(find(result, "AKA2005")) == 1
-        assert "AKA2004" not in codes_of(result)
+        assert "AKA2002" not in codes_of(result)
         assert result.artifacts.get("suppressed_cycles::test_kernel", 0) >= 1
 
     def test_priming_removes_the_cycle(self):
@@ -312,7 +312,7 @@ class TestBarriers:
 
     def test_consecutive_identical_barriers_report_the_duplicate(self):
         body = "AscendC::PipeBarrier<PIPE_V>();\nAscendC::PipeBarrier<PIPE_V>();\n"
-        diags = find(analyze_body(body), "AKA3005")
+        diags = find(analyze_body(body), "AKA3012")
         assert diags and diags[0].severity is Severity.INFO
 
     def test_barrier_participates_in_pipeline_ordering(self):
@@ -397,7 +397,7 @@ class TestCoreSplit:
             + "}\n"
         )
         assert not find(result, "AKA2001")
-        assert not find(result, "AKA2002")
+        assert not find(result, "AKA2001")
 
     def test_loop_balance_is_counted_per_core(self):
         # One set on the Cube core and one wait on the Vector core: merged
@@ -430,4 +430,4 @@ class TestCoreSplit:
         )
         assert not find(result, "AKA2006")
         assert not find(result, "AKA2001")
-        assert not find(result, "AKA2002")
+        assert not find(result, "AKA2001")

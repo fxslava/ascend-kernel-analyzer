@@ -6,14 +6,11 @@ Covers the three upgraded capabilities end to end:
   head / steady-state representative cycle / peeled tail traversal, and the
   symbolic trip-count fallback (`ast_visitor.py`);
 * **Vector ALU UB bank conflicts** - the 8-bank / 32-byte-block delta model
-  (AKA3006, `checkers/memory.py`);
+  (AKA3003, `checkers/memory.py`);
 * **351x SIMD/SIMT Unified Buffer budgeting** - the DataCache floor guard
   (AKA1010, `hardware.py` + `checkers/memory.py`).
 
-Code-numbering note: the bank conflict is specified as "AKA3003", but that
-code already belongs to ``SYMBOLIC_EVENT_ID`` and is pinned there by
-``test_deadlock.py``; the bank conflict therefore carries ``AKA3006``, the
-next free code in the 3xxx performance block.
+The bank-conflict diagnostic follows the skill registry: AKA3003.
 """
 
 from __future__ import annotations
@@ -356,11 +353,11 @@ class TestLongPipelineFixture:
         kernel = result.unit.kernels[0]
         assert kernel.flag_ops()
         assert all(op.event_id is not None for op in kernel.flag_ops())
-        assert "AKA3003" not in codes_of(result)
+        assert "AKA3010" not in codes_of(result)
 
 
 # ---------------------------------------------------------------------------
-# Task 2: Vector ALU UB bank conflicts (AKA3006)
+# Task 2: Vector ALU UB bank conflicts (AKA3003)
 # ---------------------------------------------------------------------------
 
 
@@ -378,7 +375,7 @@ class TestVectorBankConflicts:
         result = KernelAnalyzer(AnalyzerOptions()).analyze_file(
             KERNEL_DIR / "bank_conflict_vec.cpp"
         )
-        diag = only(result, "AKA3006")
+        diag = only(result, "AKA3003")
         assert diag.severity is Severity.WARNING
         assert result.fatal_count == 0
         assert result.verdict == "accepted_with_warnings"
@@ -387,7 +384,7 @@ class TestVectorBankConflicts:
         result = KernelAnalyzer(AnalyzerOptions()).analyze_file(
             KERNEL_DIR / "bank_conflict_vec.cpp"
         )
-        diag = only(result, "AKA3006")
+        diag = only(result, "AKA3003")
         assert diag.details == {
             **diag.details,
             "api": "Add",
@@ -406,7 +403,7 @@ class TestVectorBankConflicts:
         result = KernelAnalyzer(AnalyzerOptions()).analyze_file(
             KERNEL_DIR / "bank_conflict_vec.cpp"
         )
-        remediation = only(result, "AKA3006").remediation
+        remediation = only(result, "AKA3003").remediation
         assert "+32 bytes" in remediation
         assert "bank-orthogonal" in remediation
 
@@ -415,7 +412,7 @@ class TestVectorBankConflicts:
             KERNEL_DIR / "bank_conflict_vec.cpp"
         )
         # Exactly one finding: the skewed (aGood, bGood) pair stays silent.
-        conflicts = find(result, "AKA3006")
+        conflicts = find(result, "AKA3003")
         assert len(conflicts) == 1
         assert conflicts[0].details["src0"] == "aBad"
 
@@ -424,7 +421,7 @@ class TestVectorBankConflicts:
         # no second bank to collide with (and this is the shape every
         # ping-pong fixture computes with).
         result = analyze_body(_ub("x", 0) + _ub("y", 512) + "AscendC::Add(y, x, x, 128);\n")
-        assert "AKA3006" not in codes_of(result)
+        assert "AKA3003" not in codes_of(result)
 
     @pytest.mark.parametrize(
         "offset, conflicts",
@@ -437,7 +434,7 @@ class TestVectorBankConflicts:
             + _ub("dst", 4096, pos="VECOUT")
             + "AscendC::Add(dst, a, b, 128);\n"
         )
-        assert ("AKA3006" in codes_of(result)) is conflicts
+        assert ("AKA3003" in codes_of(result)) is conflicts
 
     def test_unresolved_offsets_are_not_speculated_about(self):
         result = analyze_body(
@@ -446,7 +443,7 @@ class TestVectorBankConflicts:
             + _ub("dst", 4096, pos="VECOUT")
             + "AscendC::Add(dst, a, b, 128);\n"
         )
-        assert "AKA3006" not in codes_of(result)
+        assert "AKA3003" not in codes_of(result)
 
 
 # ---------------------------------------------------------------------------

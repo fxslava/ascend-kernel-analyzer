@@ -59,6 +59,13 @@ DTYPE_SIZES: Mapping[str, int] = {
     "signed char": 1,
     "unsigned char": 1,
     "int4b_t": 1,  # packed; one nibble, rounded up for sizing purposes
+    # FP4x2 is a byte containing TWO FP4 values; sizeof is one byte.
+    "fp4x2_e1m2_t": 1,
+    "fp4x2_e2m1_t": 1,
+    "fp8_e4m3fn_t": 1,
+    "fp8_e5m2_t": 1,
+    "fp8_e8m0_t": 1,
+    "hifloat8_t": 1,
     "half": 2,
     "float16": 2,
     "fp16": 2,

@@ -424,6 +424,8 @@ class ApiCallOp(Operation):
     reads: Tuple[str, ...] = ()
     #: Raw source text of the whole call.
     text: str = ""
+    #: SIMT dim3 product, folded in the dispatch's lexical environment.
+    launch_threads: Optional[int] = None
 
     @property
     def kind(self) -> str:
@@ -463,6 +465,8 @@ class KernelIR:
 
     name: str
     loc: SourceLoc
+    #: Original function spelling, retained for source-level architecture checks.
+    source_text: str = ""
     #: Ordered operation trace in source program order.
     ops: List[Operation] = field(default_factory=list)
     #: Tensor symbol table, keyed by source identifier.
@@ -476,6 +480,14 @@ class KernelIR:
     #: declarations when budgeting architectures that partition the Unified
     #: Buffer (351x SIMD/SIMT DataCache).
     buffer_sizes: Dict[str, int] = field(default_factory=dict)
+    #: Logical positions for buffers, used to exclude L1/L0 allocations from
+    #: Unified Buffer partition accounting.
+    buffer_positions: Dict[str, TPosition] = field(default_factory=dict)
+    #: Raw __ubuf__ array declarations; extern arrays share one dynamic base.
+    static_ub_arrays: Dict[str, Optional[int]] = field(default_factory=dict)
+    dynamic_ub_arrays: Dict[str, Optional[int]] = field(default_factory=dict)
+    #: LocalMemAllocator extents folded at each call site (bytes, location).
+    local_ub_allocations: List[Tuple[Optional[int], SourceLoc]] = field(default_factory=list)
     #: ``True`` when the function carried ``__global__``/``__aicore__``.
     is_kernel_entry: bool = True
     #: Callees whose bodies were walked into this trace, in call order.
@@ -549,6 +561,9 @@ class KernelIR:
             ],
             "constants": self.constants,
             "buffer_sizes": self.buffer_sizes,
+            "buffer_positions": {
+                name: position.value for name, position in self.buffer_positions.items()
+            },
         }
 
 

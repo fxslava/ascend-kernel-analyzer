@@ -955,7 +955,7 @@ class ASTVisitor:
           the one that matters: an unresolved extent blocks the ``TPipe`` bump
           allocation for its whole domain, and every tensor the allocator
           hands out afterwards loses its offset, which silences the
-          bank-conflict check (AKA3006) along with the rest.
+          bank-conflict check (AKA3003) along with the rest.
         * the parameter block of ``DataCopy``/``DataCopyPad``, or any
           ``*Params`` aggregate - a DMA stride or gap, bound to the 32-byte
           DaVinci block.
@@ -1451,6 +1451,7 @@ class _KernelWalker:
         self.ir = KernelIR(
             name=self._function_name(func),
             loc=visitor.loc(func),
+            source_text=visitor.text(func),
             is_kernel_entry=is_entry,
         )
         self._index = 0
@@ -1461,6 +1462,8 @@ class _KernelWalker:
         self._env_stack: List[ConstEnv] = [visitor._global_env.child()]
         self._conditional_depth = 0
         self._buffer_positions: Dict[str, TPosition] = {}
+        self._dim3_values: Dict[str, Optional[int]] = {}
+        self._local_allocators: Set[str] = set()
         #: Byte sizes recorded by ``TPipe::InitBuffer``.
         self._buffer_sizes: Dict[str, Expr] = {}
         #: LocalTensor name -> the TBuf it was obtained from via ``.Get()``.
@@ -1492,6 +1495,7 @@ class _KernelWalker:
         # ``Init()``.  A same-function InitBuffer still overwrites these.
         for buf in visitor._pipe_buffers.values():
             self._buffer_positions[buf.name] = buf.position
+            self.ir.buffer_positions[buf.name] = buf.position
             total = buf.total_bytes
             if total is not None:
                 self._buffer_sizes[buf.name] = total
@@ -2238,6 +2242,37 @@ class _KernelWalker:
         type_text = self._text(type_node) if type_node is not None else ""
         decl_text = self._text(node)
 
+        if re.search(r"\bLocalMemAllocator\b", type_text):
+            for declarator in node.children_by_field_name("declarator"):
+                identifier = _declarator_identifier(declarator)
+                if identifier is not None:
+                    self._local_allocators.add(self._text(identifier))
+
+        if _bare_type_name(type_text) == "dim3":
+            for declarator in node.children_by_field_name("declarator"):
+                identifier = _declarator_identifier(declarator)
+                if identifier is not None:
+                    value = declarator.child_by_field_name("value")
+                    self._dim3_values[self._text(identifier)] = self._dim3_threads(value)
+
+        # Unlike a pointer, a raw UB array reserves storage. Preserve its
+        # folded byte extent even though qualifier rewriting hides __ubuf__.
+        domain = self.v.prepared.address_space_for_range(node.start_byte, node.end_byte)
+        if domain is PhysicalDomain.UB:
+            for declarator in node.children_by_field_name("declarator"):
+                if declarator.type != "array_declarator":
+                    continue
+                identifier = _declarator_identifier(declarator)
+                if identifier is None:
+                    continue
+                size_node = declarator.child_by_field_name("size")
+                count = self.v._eval.fold(size_node, self._env) if size_node else None
+                width = dtype_size(type_text)
+                size = count * width if count is not None and width is not None else None
+                arrays = (self.ir.dynamic_ub_arrays if re.search(r"\bextern\b", decl_text)
+                          else self.ir.static_ub_arrays)
+                arrays[self._text(identifier)] = size
+
         # Buffer objects carrying an explicit TPosition template argument.
         # Prefer the AST template-argument parse (handles named depth
         # constants and multi-line declarations); fall back to the legacy
@@ -2248,7 +2283,9 @@ class _KernelWalker:
                 for declarator in node.children_by_field_name("declarator"):
                     name_node = _declarator_identifier(declarator)
                     if name_node is not None:
-                        self._buffer_positions[self._text(name_node)] = buf_info[0]
+                        name = self._text(name_node)
+                        self._buffer_positions[name] = buf_info[0]
+                        self.ir.buffer_positions[name] = buf_info[0]
             return
         tbuf = _TBUF_TYPE_RE.search(type_text) or _TBUF_TYPE_RE.search(decl_text)
         if tbuf is not None:
@@ -2256,7 +2293,9 @@ class _KernelWalker:
             for declarator in node.children_by_field_name("declarator"):
                 name_node = _declarator_identifier(declarator)
                 if name_node is not None and position is not None:
-                    self._buffer_positions[self._text(name_node)] = position
+                    name = self._text(name_node)
+                    self._buffer_positions[name] = position
+                    self.ir.buffer_positions[name] = position
             return
 
         # Class-typed locals (``CubeStage cube;`` / ``StageA a;``): remember
@@ -2761,6 +2800,21 @@ class _KernelWalker:
         if base is None:
             return
 
+        if base == "Alloc":
+            receiver = _field_receiver_name(self.v, func)
+            if receiver in self._local_allocators or "LocalMemAllocator::" in self._text(func):
+                args = _argument_nodes(node)
+                types = _template_arguments(self.v, func)
+                count = self.v._eval.fold(args[0], self._env) if len(args) == 1 else None
+                width = dtype_size(types[0]) if types else None
+                size = count * width if count is not None and width is not None else None
+                # Loop peeling visits representative iterations, which cannot
+                # establish the total reserved by a bump allocator in a loop.
+                if self._loop_stack:
+                    size = None
+                self.ir.local_ub_allocations.append((size, self._loc(node)))
+                return
+
         if base in _SET_FLAG_NAMES:
             self._handle_flag(node, func, FlagKind.SET, isasi=base == "set_flag")
             return
@@ -2805,6 +2859,33 @@ class _KernelWalker:
 
         self._inline_callee(node, base)
 
+    def _dim3_threads(self, node: Optional[Node]) -> Optional[int]:
+        if node is None:
+            return None
+        if node.type == "identifier":
+            return self._dim3_values.get(self._text(node))
+        if node.type == "compound_literal_expression":
+            node = node.child_by_field_name("value")
+        elif node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is None or self._text(function) != "dim3":
+                return None
+            node = node.child_by_field_name("arguments")
+        if node is None or node.type not in {"initializer_list", "argument_list"}:
+            return None
+        dimensions = [child for child in node.named_children if child.type != "comment"]
+        if len(dimensions) > 3:
+            return 0
+        product = 1
+        for dimension in dimensions:
+            value = self.v._eval.fold(dimension, self._env)
+            if value is None:
+                return None
+            if value <= 0:
+                return 0
+            product *= value
+        return product
+
     def _handle_vf_dispatch(self, node: Node, func: Node) -> None:
         """Model ``asc_vf_call<Func>(dim3{...}, args...)`` (arch35 SIMT VF).
 
@@ -2813,7 +2894,7 @@ class _KernelWalker:
         ``PipeBarrier<PIPE_V>()`` on both sides.  Those barriers drain real
         work: recording the call as a PIPE_V operation keeps the checker from
         folding the pair into one "consecutive" barrier and advising its
-        removal (AKA3005).  The payload arguments after the grid become the
+        removal (AKA3012).  The payload arguments after the grid become the
         callee's parameters, and the callee body is walked in place so SIMT
         global accesses inside the VF function are attributed to this trace.
         """
@@ -2849,6 +2930,7 @@ class _KernelWalker:
             ApiCallOp(
                 pipe=Pipe.V,
                 name="asc_vf_call",
+                launch_threads=self._dim3_threads(arg_nodes[0]) if arg_nodes else None,
                 args=tuple(refs),
                 writes=tuple(writes),
                 reads=tuple(reads),

@@ -123,7 +123,7 @@ class HazardChecker(Checker):
                         self._report(tensor, write, read)
 
         # Published whether or not anything was found, for the same reason as
-        # the AKA3006 coverage artifact: silence must not read as "checked".
+        # the AKA3003 coverage artifact: silence must not read as "checked".
         self.ctx.publish(
             f"hazard_coverage::{kernel.name}",
             {

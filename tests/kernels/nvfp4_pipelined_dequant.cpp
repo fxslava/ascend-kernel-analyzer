@@ -1,6 +1,6 @@
 /*
  * nvfp4_pipelined_dequant.cpp -- fixture for the analytical pipeline
- * performance & overlap profiler (WARNING AKA4001 / AKA4002).
+ * performance & overlap profiler (WARNING AKA3013 / AKA3014).
  *
  * Two kernels do the same NVFP4 dequant-and-GEMM work per tile -
  * MTE2 moves packed fp4 A/B tiles GM -> L1, MTE1 fractal-loads them
@@ -12,7 +12,7 @@
  *   (16x128x16, 1 KiB per operand).  The cube contraction itself is only 8
  *   cycles, so nothing amortises the fixed ~30-cycle M_FIX hand-off or the
  *   per-tile fill/drain bubbles: the profiler must flag the exposed sync
- *   stalls (AKA4001) with the M_FIX route carrying a large share.
+ *   stalls (AKA3013) with the M_FIX route carrying a large share.
  *
  *   Pipeline B (nvfp4_dequant_serial) runs the identical stages one tile at
  *   a time behind five SetFlag/WaitFlag handshakes with single buffers: load,
@@ -28,7 +28,7 @@
  * than being judged against 910B, which cannot issue it (AKA1011).
  *
  * @ascend-chip: ascend351x
- * @ascend-expect: AKA4001 AKA4002
+ * @ascend-expect: AKA3013 AKA3014
  * @ascend-expect-fatal: 0
  */
 #include "kernel_operator.h"

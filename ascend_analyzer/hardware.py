@@ -145,6 +145,7 @@ class TPosition(Enum):
     """Ascend C logical tensor position (``AscendC::TPosition``)."""
 
     GM = "GM"
+    UB = "UB"
     A1 = "A1"
     B1 = "B1"
     C1 = "C1"
@@ -176,6 +177,7 @@ class TPosition(Enum):
 #: Logical ``TPosition`` -> physical SRAM domain.
 TPOSITION_TO_DOMAIN: Mapping[TPosition, PhysicalDomain] = {
     TPosition.GM: PhysicalDomain.GM,
+    TPosition.UB: PhysicalDomain.UB,
     TPosition.A1: PhysicalDomain.L1,
     TPosition.B1: PhysicalDomain.L1,
     TPosition.C1: PhysicalDomain.L1,
@@ -488,7 +490,7 @@ CHIP_PROFILES["ascend950pr"] = replace(
     CHIP_PROFILES["ascend351x"],
     name="ascend950pr",
     display_name="Ascend 950PR (arch35 / DaVinci v3)",
-    aliases=("950pr", "arch35", "dav-3510", "ascend3510", "3510"),
+    aliases=("950pr", "arch35", "arch_3510", "dav-3510", "dav-c310", "ascend3510", "3510"),
     reserved_event_ids=frozenset(),
     max_event_id=3,
     provisional=False,
@@ -643,6 +645,16 @@ class HardwareModel:
     def domain_of(self, position: TPosition) -> PhysicalDomain:
         return TPOSITION_TO_DOMAIN.get(position, PhysicalDomain.UNKNOWN)
 
+    def valid_allocation_position(self, position: TPosition) -> bool:
+        """Logical allocation policy, distinct from physical address spaces."""
+        from .models.memory import ASCEND_950PR_POSITIONS
+
+        return (
+            position.value in ASCEND_950PR_POSITIONS
+            if self.chip.name == "ascend950pr"
+            else position in TPOSITION_TO_DOMAIN
+        )
+
     def capacity(self, domain: PhysicalDomain) -> Optional[int]:
         spec = self.chip.domain_spec(domain)
         return None if spec is None else spec.capacity_bytes
@@ -671,13 +683,16 @@ class HardwareModel:
     def simt_datacache_available(self, allocated_bytes: int) -> Optional[int]:
         """DataCache bytes left after *allocated_bytes* of tensor memory.
 
-        ``DataCache = ub_total - StaticMem + DynamicMem - compiler_reserved``.
+        ``DataCache = min(ub_total - allocated - compiler_reserved, 128 KiB)``.
         ``None`` on architectures that do not partition the Unified Buffer.
         """
         chip = self.chip
         if chip.ub_total_bytes is None:
             return None
-        return chip.ub_total_bytes - allocated_bytes - chip.compiler_reserved_bytes
+        return min(
+            chip.ub_total_bytes - allocated_bytes - chip.compiler_reserved_bytes,
+            128 * KIB,
+        )
 
     def pipe_bytes_per_cycle(self, pipe: Pipe) -> Optional[int]:
         """Modeled sustained throughput of one engine, in bytes per cycle.

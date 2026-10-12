@@ -37,12 +37,12 @@ def test_arch35_tensor_allocation_ceiling_applies_without_simt_marker():
     result = analyze_body(
         """
         AscendC::TPipe pipe;
-        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        AscendC::TBuf<AscendC::TPosition::VECIN> ub;
         pipe.InitBuffer(ub, 224 * 1024);
         """,
         chip="ascend950pr",
     )
-    assert "AKA1010" in codes_of(result)
+    assert "AKA1001" in codes_of(result)
 
 
 @pytest.mark.parametrize("marker", ["asc_call_vf", "__simt_vf__"])
@@ -58,14 +58,14 @@ def test_simt_datacache_reserves_32_kib_at_ub_boundary(marker, allocation_kib, r
     {helper}
     extern "C" __global__ __aicore__ void test_kernel() {{
     AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+    AscendC::TBuf<AscendC::TPosition::VECIN> ub;
     pipe.InitBuffer(ub, {allocation_kib} * 1024);
     auto local = ub.GetWithOffset<half>(64, 0);
     {call}
     }}
     """
     result = analyze(source, chip="ascend950pr")
-    bad = find(result, "AKA1010")
+    bad = find(result, "AKA1001")
     assert bool(bad) is rejected
     if rejected:
         assert bad[0].severity is Severity.FATAL
@@ -75,14 +75,14 @@ def test_simt_datacache_reserves_32_kib_at_ub_boundary(marker, allocation_kib, r
 def test_uncalibrated_arch35_timing_does_not_emit_perf_warnings():
     path = Path(__file__).parent / "kernels" / "nvfp4_pipelined_dequant.cpp"
     result = KernelAnalyzer(AnalyzerOptions(chip="ascend950pr")).analyze_file(path)
-    assert "AKA4001" not in codes_of(result)
+    assert "AKA3013" not in codes_of(result)
     assert any(key.startswith("perf_profile::") for key in result.artifacts)
 
 
 def test_cann92_reduction_between_barriers_is_not_redundant():
     result = analyze_body(
         """
-        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        AscendC::TBuf<AscendC::TPosition::VECIN> ub;
         AscendC::LocalTensor<float> a = ub.GetWithOffset<float>(64, 0);
         AscendC::LocalTensor<float> b = ub.GetWithOffset<float>(8, 256);
         AscendC::PipeBarrier<PIPE_V>();
@@ -92,7 +92,7 @@ def test_cann92_reduction_between_barriers_is_not_redundant():
         """,
         chip="ascend950pr",
     )
-    assert "AKA3005" not in codes_of(result)
+    assert "AKA3012" not in codes_of(result)
     ops = result.unit.kernels[0].ops
     assert any(
         getattr(op, "name", "") == "ReduceDataBlock" and op.pipe is Pipe.V for op in ops
@@ -103,7 +103,7 @@ def test_reduction_followed_by_pipe_v_barrier_has_zero_warnings():
     result = analyze_body(
         """
         AscendC::TPipe pipe;
-        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        AscendC::TBuf<AscendC::TPosition::VECIN> ub;
         pipe.InitBuffer(ub, 512);
         auto src = ub.GetWithOffset<float>(64, 0);
         auto dst = ub.GetWithOffset<float>(8, 256);
@@ -114,13 +114,13 @@ def test_reduction_followed_by_pipe_v_barrier_has_zero_warnings():
         chip="ascend950pr",
     )
     assert not [d for d in result.diagnostics if d.severity is Severity.WARNING]
-    assert "AKA3005" not in codes_of(result)
+    assert "AKA3012" not in codes_of(result)
 
 
 def test_direct_get_with_offset_operand_has_ub_domain():
     result = analyze_body(
         """
-        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        AscendC::TBuf<AscendC::TPosition::VECIN> ub;
         AscendC::ReduceDataBlock<AscendC::ReduceType::SUM, float, float>(
             ub.GetWithOffset<float>(8, 256),
             ub.GetWithOffset<float>(64, 0), 64, 1, 1, 1, 8);
@@ -151,7 +151,7 @@ def test_member_and_parameter_global_tensor_stores_use_mte3():
       AscendC::DataCopyPad(output[0], local, 128);
     }
     extern "C" __global__ __aicore__ void test_kernel(__gm__ half* gm) {
-      AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+      AscendC::TBuf<AscendC::TPosition::VECIN> ub;
       AscendC::LocalTensor<half> local = ub.GetWithOffset<half>(128, 0);
       AscendC::GlobalTensor<half> output;
       output.SetGlobalBuffer(gm, 128);
@@ -185,7 +185,7 @@ def test_member_global_tensor_initialized_from_gm_addr_stays_on_mte3():
     };
     extern "C" __global__ __aicore__ void test_kernel(GM_ADDR gm) {
       AscendC::TPipe pipe;
-      AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+      AscendC::TBuf<AscendC::TPosition::VECIN> ub;
       pipe.InitBuffer(ub, 256);
       auto local = ub.GetWithOffset<half>(128, 0);
       Writer writer;
@@ -207,7 +207,7 @@ def test_gm_addr_passed_to_store_helper_stays_on_mte3():
     }
     extern "C" __global__ __aicore__ void test_kernel(GM_ADDR gm) {
       AscendC::TPipe pipe;
-      AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+      AscendC::TBuf<AscendC::TPosition::VECIN> ub;
       pipe.InitBuffer(ub, 256);
       auto local = ub.GetWithOffset<half>(128, 0);
       Store(gm, local);
@@ -239,7 +239,7 @@ def test_vec_scope_register_microapi_has_no_false_memory_or_barrier_warning():
     assert all(
         kernel.tensors[n].domain is PhysicalDomain.REG for n in ("a", "b", "out")
     )
-    assert {"AKA1009", "AKA3005"}.isdisjoint(codes_of(result))
+    assert {"AKA1009", "AKA3012"}.isdisjoint(codes_of(result))
     assert not [d for d in result.diagnostics if d.severity is Severity.WARNING]
 
 
@@ -248,12 +248,12 @@ def test_160_byte_get_with_offset_pitch_reaches_bank_conflict_verdict():
         f"auto a{i} = ub.GetWithOffset<half>(64, {i * 160});" for i in range(9)
     )
     result = analyze_body(
-        "AscendC::TBuf<AscendC::TPosition::VECCALC> ub;\n"
+        "AscendC::TBuf<AscendC::TPosition::VECIN> ub;\n"
         + views
         + "\nAscendC::Add(a4, a0, a8, 64);",
         chip="ascend950pr",
     )
-    conflict = find(result, "AKA3006")
+    conflict = find(result, "AKA3003")
     assert conflict and conflict[0].details["delta_blocks"] == 40
 
 
@@ -266,14 +266,14 @@ def test_get_with_offset_arguments_keep_bank_offsets_in_hybrid_simt_helper():
     }
     extern "C" __global__ __aicore__ void test_kernel() {
       AscendC::TPipe pipe;
-      AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+      AscendC::TBuf<AscendC::TPosition::VECIN> ub;
       pipe.InitBuffer(ub, 512);
       vector_kernel(ub.GetWithOffset<float>(64, 0),
                     ub.GetWithOffset<float>(64, 256));
     }
     """
     result = analyze(source, chip="ascend950pr")
-    conflict = find(result, "AKA3006")
+    conflict = find(result, "AKA3003")
     assert len(conflict) == 1
     assert conflict[0].details["delta_blocks"] == 8
     assert result.artifacts["bank_conflict_coverage::test_kernel"]["evaluated"] == 1
@@ -309,7 +309,7 @@ def test_register_tile_pressure_reports_spill_without_ub_domain_warning():
 def test_simt_warp_and_simd_issue_contend_inside_one_loop():
     result = analyze_body(
         """
-        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        AscendC::TBuf<AscendC::TPosition::VECIN> ub;
         auto a = ub.GetWithOffset<float>(64, 0);
         auto b = ub.GetWithOffset<float>(64, 256);
         for (int i = 0; i < 2; ++i) {
@@ -370,7 +370,7 @@ def test_cann92_gather_vecindex_sort_extract_are_pipe_v():
 def test_cann92_topk_stages_between_barriers_are_not_redundant():
     result = analyze_body(
         """
-        AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+        AscendC::TBuf<AscendC::TPosition::VECIN> ub;
         auto keys = ub.GetWithOffset<float>(64, 0);
         auto order = ub.GetWithOffset<float>(64, 256);
         auto top = ub.GetWithOffset<float>(8, 512);
@@ -384,7 +384,7 @@ def test_cann92_topk_stages_between_barriers_are_not_redundant():
         """,
         chip="ascend950pr",
     )
-    assert "AKA3005" not in codes_of(result)
+    assert "AKA3012" not in codes_of(result)
     names = {getattr(op, "name", "") for op in result.unit.kernels[0].ops}
     assert {"CreateVecIndex", "Sort", "Extract", "Gather"} <= names
 
@@ -405,7 +405,7 @@ def _vf_dispatch_source(marker: str = "__simt_vf__") -> str:
     {{
         __gm__ const uint32_t *tile = (__gm__ const uint32_t *)(tiling);
         AscendC::TPipe pipe;
-        AscendC::TQue<AscendC::TPosition::VECCALC, 2> q;
+        AscendC::TQue<AscendC::TPosition::VECIN, 2> q;
         pipe.InitBuffer(q, 2, 256);
         AscendC::LocalTensor<float> stage = q.AllocTensor<float>();
         AscendC::PipeBarrier<PIPE_V>();
@@ -422,8 +422,10 @@ def _vf_dispatch_source(marker: str = "__simt_vf__") -> str:
 
 def test_vf_dispatch_barriers_are_not_redundant():
     result = analyze(_vf_dispatch_source(), chip="ascend950pr")
-    assert "AKA3005" not in codes_of(result)
-    assert not [d for d in result.diagnostics if d.severity is Severity.WARNING]
+    assert "AKA3012" not in codes_of(result)
+    spill = [d for d in result.diagnostics if d.code.value == "AKA3008"]
+    assert len(spill) == 1
+    assert spill[0].details["register_budget"] == 32
     dispatch = [
         op
         for op in result.unit.kernels[0].ops
@@ -455,7 +457,7 @@ def test_simd_vf_helper_is_traced_when_called():
     }
     extern "C" __global__ __aicore__ void test_kernel() {
       AscendC::TPipe pipe;
-      AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+      AscendC::TBuf<AscendC::TPosition::VECIN> ub;
       pipe.InitBuffer(ub, 512);
       auto a = ub.GetWithOffset<half>(64, 0);
       auto b = ub.GetWithOffset<half>(64, 256);
@@ -477,7 +479,7 @@ def test_getphyaddr_ubuf_pointer_alias_keeps_source_layout():
     }
     extern "C" __global__ __aicore__ void test_kernel(__gm__ half* gm) {
       AscendC::TPipe pipe;
-      AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+      AscendC::TBuf<AscendC::TPosition::VECIN> ub;
       pipe.InitBuffer(ub, 512);
       AscendC::LocalTensor<float> xf32 = ub.GetWithOffset<float>(64, 0);
       __ubuf__ float* raw = reinterpret_cast<__ubuf__ float*>(xf32.GetPhyAddr());
@@ -516,20 +518,23 @@ def test_stage1_fleet_kernels_audit_clean_without_pragmas(source):
     mandatory ``PipeBarrier<PIPE_V>`` pair, ``__simt_vf__``/``__launch_bounds__``
     helpers and ``reinterpret_cast<__ubuf__ T*>(t.GetPhyAddr())`` aliases, and
     carry neither ``@ascend-ignore`` nor ``@ascend-reuse-group`` annotations.
-    They must audit with zero fatal findings and zero warnings.
+    They must audit without fatal findings; the register heuristic may report
+    its expected per-thread budget warning for blocks over 256 threads.
     """
     path = Path(__file__).parent / "kernels" / source
     text = path.read_text(encoding="utf-8")
     assert "@ascend-ignore" not in text
     assert "@ascend-reuse-group" not in text
     result = KernelAnalyzer(AnalyzerOptions(chip="ascend950pr")).analyze_file(path)
-    assert "AKA3005" not in codes_of(result)
+    assert "AKA3012" not in codes_of(result)
     assert not [
         d for d in result.diagnostics if d.severity is Severity.FATAL
     ]
-    assert not [
-        d for d in result.diagnostics if d.severity is Severity.WARNING
-    ]
+    assert all(
+        d.code.value == "AKA3008"
+        for d in result.diagnostics
+        if d.severity is Severity.WARNING
+    )
     # The dispatch itself must be visible to the barrier checker.
     ops = result.unit.kernels[0].ops
     assert any(getattr(op, "name", "") == "asc_vf_call" for op in ops)

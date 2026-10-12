@@ -61,6 +61,7 @@ _OTHER_EXTENSIONS: Tuple[str, ...] = (
     # unknown to the grammar.
     "__simd_callee__",
     "__simt_vf__",
+    "__simt_callee__",
     # Storage qualifier on a per-block static.
     "__BLOCK_LOCAL__",
 )

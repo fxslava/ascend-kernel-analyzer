@@ -59,7 +59,7 @@ extern "C" __global__ __aicore__ void ker01_mhc_pre_norm_sinkhorn(
     pipe.InitBuffer(inQue, 2, MHC_ELEMS * sizeof(half));
     pipe.InitBuffer(outQue, 2, MHC_ELEMS * sizeof(half));
 
-    AscendC::TBuf<AscendC::TPosition::VECCALC> scratch;
+    AscendC::TBuf<AscendC::TPosition::VECIN> scratch;
     pipe.InitBuffer(scratch, SCRATCH_BYTES);
 
     AscendC::GlobalTensor<half> gmX;

@@ -15,6 +15,8 @@ from .checkers.base import CheckerContext
 from .checkers.deadlock import DeadlockChecker
 from .checkers.hazard import HazardChecker
 from .checkers.memory import MemoryChecker
+from .checkers.matmul import MatmulChecker
+from .checkers.pipeline import PipelineChecker
 from .checkers.perf_model import PerfModelChecker
 from .diagnostics import Diagnostic, DiagnosticCollector, Severity
 from .hardware import HardwareModel, PhysicalDomain
@@ -32,6 +34,8 @@ AVAILABLE_CHECKERS: Tuple[str, ...] = (
     DeadlockChecker.name,
     HazardChecker.name,
     PerfModelChecker.name,
+    PipelineChecker.name,
+    MatmulChecker.name,
 )
 
 
@@ -173,6 +177,10 @@ class KernelAnalyzer:
         disabled = {name.strip().lower() for name in self.options.disable}
         if MemoryChecker.name not in disabled:
             MemoryChecker(context, solver=self._solver).run_all()
+        if PipelineChecker.name not in disabled:
+            PipelineChecker(context).run_all()
+        if MatmulChecker.name not in disabled:
+            MatmulChecker(context).run_all()
         if DeadlockChecker.name not in disabled:
             DeadlockChecker(context).run_all()
         if HazardChecker.name not in disabled:

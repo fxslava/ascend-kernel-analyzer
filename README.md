@@ -40,34 +40,40 @@ $ ascend-analyze vec_add.cpp --chip ascend910b
 
 | Code | Finding | Why it is fatal |
 |---|---|---|
-| `AKA1001` | SRAM capacity overflow | The tile leaves UB/L1/L0x. With a loop-varying offset the solver names the iteration that first escapes. |
+| `AKA1001` | SRAM / 950PR DataCache capacity overflow | The tile leaves UB/L1/L0x, or 950PR static + dynamic UB exceeds 221184 B / DataCache falls below 32768 B. With a loop-varying offset the solver names the iteration that first escapes. |
 | `AKA1002` | Base address misaligned | DaVinci addresses SRAM in 32-byte blocks; a misaligned base makes the DMA engine touch the wrong bytes. |
 | `AKA1005` | Allocation size misaligned | The tail block is transferred *whole*, so a ragged length silently clobbers whatever follows it. |
 | `AKA1003` | Buffer aliasing / collision | Two tensors live at the same time in one domain must be disjoint. This is where ping/pong and in/out bugs surface. |
 | `AKA1004` | Memory domain mismatch | `LocalTensor<T>` hides the address space, so handing a UB tensor to a Cube API that reads L0A type-checks in C++ and fails on hardware. |
-| `AKA1010` | Insufficient UB DataCache headroom (351x SIMT) | On 351x the 256 KiB UB is partitioned: `DataCache = 256 KiB − allocations − 8 KiB (compiler reserved)`, and the SIMT runtime requires `DataCache ≥ 32 KiB`. More than 216 KiB of tensor allocation corrupts memory at run time. |
-| `AKA1007`/`AKA1008`/`AKA1009` | Stride alignment, negative offset, undetermined domain | |
+| `AKA1010` | Insufficient UB DataCache headroom (351x SIMT) | On 351x the 256 KiB UB is partitioned: `DataCache = 256 KiB − allocations − 8 KiB (compiler reserved)`, and the SIMT runtime requires `DataCache ≥ 32 KiB`. More than 216 KiB violates the compiler verification budget. |
+| `AKA1013`/`AKA1014`/`AKA1009` | Stride alignment, negative offset, undetermined domain | |
 
 ### Pipeline deadlocks and synchronisation
 
 | Code | Finding | Why it is fatal |
 |---|---|---|
 | `AKA2005` | Unprimed loop-carried `WaitFlag` | Iteration 0 waits on a flag only the *previous* iteration raises. The single most common double-buffering hang. |
-| `AKA2004` | Circular wait | A token-free cycle in the pipeline dependency graph. The report prints the full cycle path. |
-| `AKA2001`/`AKA2002` | `SetFlag` with no `WaitFlag`, or the reverse | An unconsumed flag leaks an event slot; an unraised one blocks for ever. |
+| `AKA2002` | Circular wait | A token-free cycle in the pipeline dependency graph. The report prints the full cycle path. |
+| `AKA2001` | `SetFlag` with no `WaitFlag`, or the reverse | An unconsumed flag leaks an event slot; an unraised one blocks for ever. |
 | `AKA2006` | `SetFlag`/`WaitFlag` imbalance in a loop body | The semaphore drifts one count per iteration until it overflows or underflows. |
 | `AKA2003` | Reserved `EVENT_ID` 6 or 7 | The runtime owns these and may consume or raise them behind your back. |
 | `AKA2007`/`AKA2008`/`AKA2009` | Double set, out-of-range id, same-pipeline route | |
 | `AKA2010` | Cross-pipeline hazard with no handshake | Warning. A tensor written on one pipe and read on another, with no `SetFlag`/`WaitFlag` pair on that channel and no global barrier between them. The pipelines run concurrently, so the read races the write - and may win by timing on every run, which is why it is worth naming. Same-pipe pairs, `TQue`-managed storage (the runtime raises those flags where the analyzer cannot see them) and pairs split across the AIC/AIV views of a mix kernel are deliberately not flagged. Specified as "AKA2007", but that code already belongs to `FLAG_DOUBLE_SET`. |
+| `AKA2011` | Deprecated VF dispatch | Warning. `asc_call_vf` should be migrated to `asc_vf_call<funcPtr>(dim3, args...)`. |
+| `AKA2012` | Invalid VF signature or launch bounds | Fatal. The VF dispatch must pass a `dim3` first argument; `__launch_bounds__(N)` must be a multiple of 32 in 1..2048 and cover the dispatched block. |
 | `AKA3001` | `PipeBarrier(PIPE_ALL)` antipattern | Warning. Drains every pipeline, discarding the overlap double buffering exists to create. The fix names the two pipelines that actually share data. |
-| `AKA3006` | UB bank conflict on Vector ALU | Warning. UB is an interleaved 8-bank structure in 32-byte blocks; a dual-operand instruction (`Add`, `Mul`, `Sub`, `Max`, `Min`, ...) whose two sources sit `8k` blocks apart reads both from the same bank and stalls the read ports. Pad one source by +32 bytes (one DaVinci block) for bank-orthogonal bases. Note: this check was specified as "AKA3003", but that code already belongs to `SYMBOLIC_EVENT_ID` and is pinned there by the shipped tests, so the bank conflict carries the next free code in the 3xxx performance block. |
+| `AKA3003` | UB bank conflict on Vector ALU | Warning. UB is an interleaved 8-bank structure in 32-byte blocks; a dual-operand instruction (`Add`, `Mul`, `Sub`, `Max`, `Min`, ...) whose two sources sit `8k` blocks apart reads both from the same bank and stalls the read ports. Pad one source by +32 bytes (one DaVinci block) for bank-orthogonal bases. |
+| `AKA3008` | SIMT register spill risk | Warning. The per-thread register budget drops from 127 to 64 above 256 threads, to 32 above 512, and to 16 above 1024. |
 
 ### Performance model and overlap profiling
 
 | Code | Finding | What it means |
 |---|---|---|
-| `AKA4001` | Exposed sync bubbles / pipeline stalls | Warning. Cross-queue `SetFlag`/`WaitFlag` hand-offs each cost ~30 cycles; when they exceed a third of the kernel's issued work, the pipelines are stalling more than computing. The message names the two worst hand-off routes. |
-| `AKA4002` | Cube compute underutilization | Warning. The cube unit is busy under half the modeled makespan while the move engines feed it - the contraction is not the critical path, the feeding chain is. |
+| `AKA3013` | Exposed sync bubbles / pipeline stalls | Warning. Cross-queue `SetFlag`/`WaitFlag` hand-offs each cost ~30 cycles; when they exceed a third of the kernel's issued work, the pipelines are stalling more than computing. The message names the two worst hand-off routes. |
+| `AKA3014` | Cube compute underutilization | Warning. The cube unit is busy under half the modeled makespan while the move engines feed it - the contraction is not the critical path, the feeding chain is. |
+| `AKA4005` | TSCM full residency violation | Fatal. TSCM allocations must fit in 512 KiB and cannot be filled a partial tile at a time inside a loop. |
+| `AKA4006` | Unsupported structured sparse matmul | Fatal. Ascend 950PR does not support `SparseMatmulType` or `SetSparse(true)`; use MxMatmul/MXMODE. |
+| `AKA4011` | Invalid 950PR matmul type or GEMV configuration | Fatal. Only audited low-bit type combinations are accepted, and GEMV must not be disabled when `left_height == 1`. |
 
 `ascend-analyze --list-codes` prints the full table.
 
@@ -412,12 +418,18 @@ strictly partitioned:
 DataCache = 256 KiB − StaticMem − DynamicMem − 8 KiB (compiler reserved)
 ```
 
-Whenever the SIMT path is present — `__simt_vf__`, `__simt_callee__` or
-`asc_call_vf` appears in the translation unit — the runtime requires
+Whenever the SIMT path is present — `__simt_vf__`, `__simt_callee__`,
+`asc_vf_call`, or the deprecated `asc_call_vf` appears in the translation unit — the runtime requires
 `DataCache ≥ 32 KiB`. The analyzer sums static tensor allocations and dynamic
 `TPipe::InitBuffer` extents (each storage counted once) against the profile's
-`max_usable_ub_bytes` (216 KiB) and raises `AKA1010` when the floor would be
-breached. Other profiles do not partition the UB and are unaffected.
+`max_usable_ub_bytes` (216 KiB). The 351x profile raises `AKA1010`; Ascend 950PR
+raises `AKA1001` when the floor would be breached. Other profiles do not
+partition the UB and are unaffected.
+
+On Ascend 950PR, the exact partition is
+`DataCache = min(262144 - static_bytes - dynamic_bytes - 8192, 131072)`.
+`AKA1001` is fatal when DataCache is below 32768 B or static + dynamic UB
+exceeds 221184 B. `TPosition::UB` is rejected in favor of VECIN/VECOUT/GM/TSCM.
 
 ### The analytical performance model
 
@@ -443,7 +455,7 @@ terminal report prints the summary with ASCII utilization bars per pipeline,
 and the JSON report carries the full profile (`--disable perf` skips it;
 `--no-perf-summary` hides the section).
 
-Advisories (`AKA4001`, `AKA4002`) are gated on a modeled makespan of at least
+Advisories (`AKA3013`, `AKA3014`) are gated on a modeled makespan of at least
 500 cycles so short kernels' inherent fill/drain bubbles are not nagged - the
 negative-control fixtures stay silent. `tests/kernels/
 nvfp4_pipelined_dequant.cpp` demonstrates both ends: its double-buffered
@@ -626,10 +638,10 @@ PASSED  all 5 fixtures match their declarations
 | `ub_overflow.cpp` | A loop-varying offset that overflows UB at iteration 24; exercises the solver's counterexample path. |
 | `domain_mismatch.cpp` | Cube "phantom type" errors: UB tensors handed to L0A-reading APIs, an illegal GM→L0B transfer. |
 | `isasi_raw.cpp` | Raw `__ubuf__` pointers, ISASI `set_flag`/`wait_flag`, and `@ascend-layout` annotations. |
-| `bank_conflict_vec.cpp` | A dual-operand `Add` whose sources sit 8 blocks (256 B) apart — same UB bank, `AKA3006` — next to a control pair skewed by one 32-byte block. |
+| `bank_conflict_vec.cpp` | A dual-operand `Add` whose sources sit 8 blocks (256 B) apart — same UB bank, `AKA3003` — next to a control pair skewed by one 32-byte block. |
 | `loop_peeling_long.cpp` | A four-channel pipelined kernel with `T = 512` and ping-pong parity: three-phase peeling keeps the sync graph at 32 nodes and the analysis far under 200 ms, with zero findings. |
 | `simt_ub_budget_351x.cpp` | 220 KiB of UB tensors plus `asc_call_vf` calls: fatal `AKA1010` DataCache starvation on `--chip ascend351x` (plain `AKA1001` overflow on the default 910B profile). |
-| `nvfp4_pipelined_dequant.cpp` | The performance-profiler fixture: Pipeline A is double-buffered but its small NVFP4 tiles cannot amortise the `M_FIX` hand-off (`AKA4001`, `AKA4002`), while Pipeline B serializes the identical stages behind five handshakes at half the overlap ratio. |
+| `nvfp4_pipelined_dequant.cpp` | The performance-profiler fixture: Pipeline A is double-buffered but its small NVFP4 tiles cannot amortise the `M_FIX` hand-off (`AKA3013`, `AKA3014`), while Pipeline B serializes the identical stages behind five handshakes at half the overlap ratio. |
 
 ---
 
@@ -721,3 +733,6 @@ ascend_analyzer/
 ## License
 
 Apache-2.0.
+
+The [950PR audit and diagnostic migration notes](docs/ascend-950pr-audit.md)
+describe the CANN 9.1.0 checks, code changes, and analysis limits.

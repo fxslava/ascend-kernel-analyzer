@@ -96,7 +96,7 @@ extern "C" __global__ __aicore__ void ker05_mxfp4_expert_gemv(
     pipe.InitBuffer(xQue, 2, GEMV_K * sizeof(half));
     pipe.InitBuffer(yQue, 2, GEMV_ROWS * sizeof(half));
 
-    AscendC::TBuf<AscendC::TPosition::VECCALC> scratch;
+    AscendC::TBuf<AscendC::TPosition::VECIN> scratch;
     pipe.InitBuffer(scratch, GEMV_SCRATCH_BYTES);
 
     AscendC::GlobalTensor<half> gmXVec;

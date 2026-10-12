@@ -4,7 +4,7 @@ A kernel that sizes its queues from a host tiling struct resolves nothing
 without that struct: the ``InitBuffer`` extent will not fold, so the buffer
 never takes part in the ``TPipe`` bump allocation, so every tensor the
 allocator hands out loses its offset, so every offset-dependent check - the
-UB bank-conflict check (AKA3006) above all - silently does not run.
+UB bank-conflict check (AKA3003) above all - silently does not run.
 
 Inference closes that gap by reading the *role* each field plays at its use
 sites, never its name.  The guard rails are the point: only fields reached
@@ -21,7 +21,7 @@ from ascend_analyzer.analyzer import AnalyzerOptions, KernelAnalyzer
 # manager sizes three queues from the tiling struct, and the tensors come out
 # of AllocTensor.  Two VECIN queues of depth 4 x 64 B reserve 256 B each, so
 # the bump allocator puts their first blocks 256 B = 8 UB blocks apart - the
-# same bank - which is exactly the conflict AKA3006 exists to find.  None of
+# same bank - which is exactly the conflict AKA3003 exists to find.  None of
 # that is visible until ``t->tileBytes`` has a value.
 QUEUED_KERNEL = """
 #include "kernel_operator.h"
@@ -81,7 +81,7 @@ def coverage(result) -> dict:
 
 
 class TestActivation:
-    """The headline claim: inference makes AKA3006 reach a verdict."""
+    """The headline claim: inference makes AKA3003 reach a verdict."""
 
     def test_without_inference_the_check_cannot_run(self):
         result = analyze(QUEUED_KERNEL)
@@ -99,7 +99,7 @@ class TestActivation:
     def test_with_inference_the_real_conflict_is_found(self):
         """Two depth-4 x 64 B queues land 8 UB blocks apart: one bank."""
         result = analyze(QUEUED_KERNEL, infer_tiling_roles=True)
-        assert "AKA3006" in result.codes()
+        assert "AKA3003" in result.codes()
         assert coverage(result)["conflicts"] >= 1
 
     def test_inference_does_not_reject_the_kernel(self):

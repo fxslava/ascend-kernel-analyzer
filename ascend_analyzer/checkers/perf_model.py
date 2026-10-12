@@ -27,8 +27,8 @@ efficiency** (overlap ratio) and a bottleneck classification:
 (hand-off bubbles dominate), ``MEMORY_BOUND`` (a move engine drives the
 critical path) or ``COMPUTE_BOUND`` (the cube/vector unit does).
 
-Findings are advisories in the 4xxx block: ``AKA4001`` for exposed sync
-bubbles, ``AKA4002`` for cube underutilization.
+Findings are advisories in the 4xxx block: ``AKA3013`` for exposed sync
+bubbles, ``AKA3014`` for cube underutilization.
 """
 
 from __future__ import annotations
